@@ -1,0 +1,256 @@
+# 调度模式（dispatch-mode）agent preset 声明。
+#
+# 本文件与 cordis.patch.yml 同属我们的 bundle patch 数组的第二项，由
+# dsh-web-app 的 presets/*.patch.yml 同款机制加载（preset 由 bundle 声明，
+# 所以官方升级不会动它）。
+#
+# ── 插件行来源 ────────────────────────────────────────────────────────────────
+# 除最后一条 `dispatch-preset` 外，本 preset 的行是**「极简灰度模式」的全量行**
+# （profile 的 cordis.patch.yml 里 preset-minimal-grayscale 的 plugins 列表）
+# 的原样复制——官方不支持 preset 之间的继承，复制是官方唯一支持的组合方式。
+# `tools/drift-check.cjs` 会逐行比对两者，防止官方或用户改了极简灰度后本 preset 悄悄落后。
+#
+# ── 与极简灰度的两处差异 ──────────────────────────────────────────────────────
+# 1) 新增一行 `dispatch-preset`（紧跟 persona）：调度模式的提示词 + 控制面（`/team` 命令与
+#    enable_agent_team / disable_agent_team 两个开关工具）。控制面注册在**本 preset 的作用域**里，
+#    所以只有选了「调度模式」的会话能看到它们（别的 preset 看不到 /team，也开不了本插件的团队）。
+#    九个团队工具**不在这里**——它们由 host 半在「团队已开启」时按 agent 作用域安装，
+#    所以「默认不开团队」是真的。**没有 `/team-off`**：关闭团队走 disable_agent_team 工具。
+# 2) persona 文本与 includeRuntimeContext 与极简灰度完全一致（保持不降智的极简身份）；
+#    调度模式的全部方法论文本由 dispatch-preset 自己注册的 prompt 段承载。
+#
+# ── 队员的能力面由插件在运行期收窄，不改本文件 ────────────────────────────────
+# 队员的 preset 硬编码继承父 agent 的实时 preset（官方 dsh-subagent child-agent.js:113/158，
+# 没有 per-child preset 参数），所以「队员少几个工具」只能靠官方 `ctx.tools.restrict({deny})`
+# 在 agent/created 时按作用域收窄：官方 `applyChildComposition` 给子代理装 toolFilter 用的就是
+# 同一个 API（dsh-subagent/lib/index.js:522）。名单见 lib/roster.js 的 TEAMMATE_TOOL_DENY。
+- insert:
+    - id: preset-dispatch-mode
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dispatch-mode
+        name: 调度模式
+        description: 先把需求分轮问清楚再落地。内置智能体团队：12 类队员角色，可分别为每人配模型与思考强度；队员共用同一份系统提示词（角色差异只走 Lead 的派活提示词，缓存命中率高），并自动摘掉目标/子代理工具。开启团队用 /team。
+        order: 0
+        plugins:
+          # ── identity ─────────────────────────────────────────────────────────────
+          # 与极简灰度一致：极简 persona 文本 + 抑制动态 runtime context 快照。
+          # 注意这里**没有** complete: true —— 一旦 complete 生效，dispatch-preset 注册的
+          # 调度模式提示词段会被当成「非唯一段」而整段丢弃（dsh-system-prompt 只保留
+          # effective complete 段）。这是必须保持的约束。
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a helpful software engineer assistant.
+              includeRuntimeContext: false
+
+          # 调度模式提示词（分轮面试式提问工作流）/ 团队开关命令 / 开关工具。
+          # 由本包提供：name 是子路径导出，解析走 profile 的 node_modules（本包所在处）。
+          - id: dispatch-preset
+            name: '@zws/dsh-dispatch-agent-team/preset'
+
+          # AGENTS.md / workspace instruction 注入（durable USER 消息基线，不受 persona 影响）。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+
+          # ── shell: exactly one persistent shell per host ─────────────────────────
+          - id: persistent-shell
+            name: cordis:group
+            group: true
+            isolate:
+              terminals: true
+            config:
+              - id: pty
+                name: '@deepseek-ai/dsh-terminal'
+
+              - id: terminal-bash
+                name: '@deepseek-ai/dsh-terminal-bash'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 300000
+
+              - id: persistent-bash
+                name: '@deepseek-ai/dsh-tool-bash-persistent'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a bash shell
+                    * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+                    * You don't have access to the internet via this tool.
+                    * You do have access to a mirror of common linux and python packages via apt and pip.
+                    * State is persistent across command calls and discussions with the user.
+                    * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+                    * Please avoid commands that may produce a very large amount of output.
+                    * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+              - id: terminal-pwsh
+                name: '@deepseek-ai/dsh-terminal-bash'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  shellDialect: pwsh
+                  timeoutMs: 300000
+
+              - id: persistent-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a PowerShell shell
+                    * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+                    * You don't have access to the internet via this tool.
+                    * State is persistent across command calls and discussions with the user.
+                    * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
+                    * Please avoid commands that may produce a very large amount of output.
+                    * Please run long lived commands in the background, e.g. 'Start-Job' or start a process with Start-Process.
+
+          # ── filesystem ───────────────────────────────────────────────────────────
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          # ── background jobs ──────────────────────────────────────────────────────
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          # ── skills ──────────────────────────────────────────────────────────────
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+
+          # ── goal ────────────────────────────────────────────────────────────────
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+
+          # ── plan mode ───────────────────────────────────────────────────────────
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+          # ── compaction ──────────────────────────────────────────────────────────
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+          # ── delegation ──────────────────────────────────────────────────────────
+          # 探查型的一次性子代理（「事实由 Lead 派子代理查」这条纪律也用它）。
+          # 九个**团队**工具不在这里：它们在团队开启后由 host 半按 agent 作用域安装。
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+                  backgroundMode: continuable
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+                  backgroundMode: continuable
+              - id: tool-subagent-codex
+                name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
+                config:
+                  provider: codex
+                  toolName: subagent_codex
+                  backgroundMode: one-shot
+                  maxDepth: provider-managed
+              - id: tool-subagent-claude-code
+                name: '@deepseek-ai/dsh-tool-subagent'
+                disabled: true
+                config:
+                  provider: claude-code
+                  toolName: subagent_claude_code
+                  backgroundMode: one-shot
+                  maxDepth: provider-managed
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+              - id: tool-ralph
+                name: '@deepseek-ai/dsh-tool-ralph'
+                disabled: true
+                config:
+                  subagentProvider: spawn
+                  maxRounds: 64
+
+          # ── everyday tools ──────────────────────────────────────────────────────
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: false
+              searchTimeoutMs: 60000
+
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true

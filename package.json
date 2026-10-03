@@ -1,0 +1,54 @@
+{
+  "name": "@zws/dsh-dispatch-agent-team",
+  "version": "1.0.0",
+  "description": "调度模式智能体团队：基于官方 Agent Teams 改良的团队插件——12 个角色编制、队员共用同一份系统提示词（只靠 Lead 的派活提示词区分角色，缓存命中率高）、队员自动摘掉 goal/子代理工具、每个队员可配模型与思考强度、/team 开启、插件页自带配置。",
+  "type": "module",
+  "main": "lib/index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./preset": "./lib/preset.js",
+    "./client": "./lib/client.js",
+    "./roster": "./lib/roster.js",
+    "./playbook": "./lib/playbook.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "tools",
+    "presets",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "INTERFACES.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/dispatch-mode.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "agent-teams",
+    "plugin",
+    "preset",
+    "调度模式"
+  ],
+  "license": "MIT"
+}
