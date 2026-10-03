@@ -1,0 +1,56 @@
+# 调度模式智能体团队 —— bundle patch（host 平面）
+#
+# 本文件属于**我们自己的包**，官方升级 DSH 不会覆盖它（官方只改 app.asar 与 profile 的
+# cordis.yml；profile 的 cordis.patch.yml 只在崩溃恢复时被改名）。
+#
+# ── 与官方 @deepseek-ai/dsh-experimental-agent-team-profile 的关系 ──────────────
+# 官方 bundle 的三行（它自己的 patch 用 `- insert:` **新建**这三行）：
+#   * `agent-team`（域服务 ctx.agentTeams：durable roster / 邮箱 / 任务 DAG / CAS）
+#   * `tool-agent-team`（九个官方工具 + `team:policy` 策略段）
+#   * `ui-agent-team`（Web 端成员列表 / 任务看板）
+#
+# 我们**保留域服务行不动**：那 1836 行是持久化与授权的唯一实现，重造它才是
+# 「官方一升级就坏」的最大风险（复用现有 > 创造接口）。
+#
+# ⚠️ 为什么这里**不**写 `- id: tool-agent-team / ui-agent-team, disabled: true`（2026-09-28 实测教训）
+# patch 层按 `dsh.profile.bundles` 顺序应用，而官方是用 `insert` **新建**那三行的：
+# 我们的层若排在官方层**之前**，那两条 disable 就落在「还不存在的行」上 → **静默失效**。
+# 实测（2026-09-28）：官方九工具在所有 preset 里都可见，`agent-team` 的 maxMembers 被官方默认值 8
+# 顶掉（本插件的 roster 是**累计**上限，8 次 spawn 之后团队就派不出人了）。
+# 而 DSH 插件页启用 bundle 时是 **append 到 bundles 末尾**（dsh-plugin-manager 的 selectBundle），
+# 所以「谁在后面」取决于用户的启用顺序 —— 依赖顺序的做法天生不可靠。
+#
+# 现在分成两处，各自只承担自己能做到的事：
+#   * 官方**工具面/策略段**的抑制 → 调度模式的 **preset 子树**
+#     （lib/preset.js 的 suppressOfficialTeam：只在本模式里摘掉九个官方工具 + 遮蔽 team:policy 段）。
+#     这样别的 preset 继续用官方团队，本模式只有我们的团队。
+#   * 域服务**容量**（maxMembers 等）→ **profile 自己的 cordis.patch.yml**（在所有 bundle 层之后应用）。
+#     本文件下面仍然写一份同样的值：就地可用（当我们的层恰好排在官方之后时直接生效），
+#     而 tools/repair.cjs 与 tools/drift-check.cjs 会确保 profile 层那份存在且与本文件一致。
+#
+# ⚠️ 注意：官方 bundle 自己的 patch 还 disable 了 host 平面的 tool-subagent-control /
+# tool-subagent-list-agents / tool-subagent / tool-subagent-fork 四行。我们保持官方 bundle 启用，
+# 所以那四个 disable 继续生效——**不要**在本文件里再动它们，否则会和 preset 作用域的 subagent 行
+# 产生同名工具冲突。
+- id: agent-team
+  config:
+    maxMembers: 48
+    maxTasks: 512
+    maxPendingMessagesPerMember: 64
+    maxMessageBytes: 65536
+    disposalTimeoutMs: 5000
+
+- insert:
+    # 官方 Agent Teams 的 Web 端成员列表 / 任务看板，由我们自己的行重新挂载。
+    # 行 id 与官方不同，所以不会与官方行冲突；客户端半由 dsh-client-modules
+    # 按「specifier 是裸包名」的 loader 行发现，因此这里必须写完整包名。
+    - id: dispatch-agent-team-panel
+      name: '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+
+    # 调度模式智能体团队：host 半（配置读写 + HTTP 路由 + 团队工具安装 + 队员模型/强度覆盖）。
+    # 该行的 specifier 必须是本包的**裸包名**，否则 lib/client.js 不会被挂载。
+    - id: dispatch-agent-team
+      name: '@zws/dsh-dispatch-agent-team'
+      config:
+        configFile: dispatch-agent-team.json
+        maxMembers: 8

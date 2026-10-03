@@ -1,0 +1,10 @@
+# 本仓库全部按 LF 存储与检出。
+# 为什么必须钉住：这份插件在开发机上是被 DSH 桌面端**直接加载**的源码目录，
+# 任何行尾转换都会改动在用文件（core.autocrlf=true 的机器上 clone/checkout 就会发生）。
+* text=auto eol=lf
+
+# 二进制类（如果有）不做转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary

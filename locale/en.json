@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Dispatch Mode Agent Team",
+    "description": "Assign a model and reasoning effort to each of the 12 teammate roles; a cache keepalive keeps the Lead's prompt cache warm while teammates work; every teammate files a structured report (with unresolved items)."
+  }
+}
