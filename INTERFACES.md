@@ -122,6 +122,10 @@ export function nextTeammateName(role, taken);
 export function defaultConfig();    // {version, roles:{}}
 export function sanitizeConfig(raw, log?);   // 永不抛错；坏字段丢弃并 log(msg)
 export function resolveRoleRoute(config, role); // {provider,model,reasoningEffort?}|undefined
+export function resolveMemberRoute(explicitRoute, roleRoute, explicitEffort);
+    // -> {provider,model,reasoningEffort?}|undefined；2026-10-01 修复的优先级：显式参数 >
+    //    角色配置 > 两者都无(=undefined=跟随 Lead)。钉子**只**由显式参数产生（lib/runtime.js），
+    //    否则「跟随 Lead」永不生效（勘误第 41 条）。
 export function configuredRoleCount(config);
 ```
 
