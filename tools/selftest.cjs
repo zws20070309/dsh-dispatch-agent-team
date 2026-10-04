@@ -350,6 +350,47 @@ function functionBodyOf(source, needle) {
   });
 
   // ── 提示词卫生（2026-09-30 用户要求：干净、有条理、简洁而作用大）────────────────
+  await check('README 提示词预算表的「当前」列 == 实测长度（防手抄漂移）', () => {
+    const doc = readFileSync(path.join(PLUGIN_DIR, 'README.md'), 'utf8');
+    const measured = {
+      PLAYBOOK: playbook.PLAYBOOK.length,
+      TEAM_POLICY: playbook.TEAM_POLICY.length,
+      TEAMMATE_CARD: playbook.TEAMMATE_CARD.length,
+    };
+    for (const label of ['PLAYBOOK', 'TEAM_POLICY', 'TEAMMATE_CARD']) {
+      const value = measured[label];
+      const pattern = '\\| `' + label + '` \\| ≤ (\\d+) \\| \\*\\*(\\d+)\\*\\*';
+      const row = new RegExp(pattern).exec(doc);
+      assert.ok(row !== null, '预算表里找不到 ' + label + ' 那一行');
+      assert.equal(Number(row[2]), value, 'README 预算表写 ' + label + ' 当前 ' + row[2] + '，实测 ' + value);
+      assert.ok(value <= Number(row[1]), label + ' 实测 ' + value + ' 超过预算 ' + row[1]);
+    }
+    const leadRowPattern = '\\| Lead 侧合计 \\| ≤ (\\d+) \\| \\*\\*(\\d+)\\*\\*';
+    const leadRow = new RegExp(leadRowPattern).exec(doc);
+    assert.ok(leadRow !== null, '预算表里找不到 Lead 侧合计那一行');
+    assert.equal(Number(leadRow[2]), playbook.PLAYBOOK.length + playbook.TEAM_POLICY.length, 'README 的 Lead 侧合计与实测不符');
+  });
+
+  await check('每个已注册团队工具都在**对应角色**的提示词里被提到（防装了没人用）', () => {
+    // 动机（2026-10-04 §8）：新工具加进工具面却没告诉模型，它会一直躺在目录里占缓存前缀，
+    // 谁也不会调 —— 集成测试全绿也发现不了。反过来，把 Lead 专属工具写进队员卡更糟：
+    // 队员照做只会拿到一次失败调用。
+    const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY;
+    for (const name of roster.LEAD_TEAM_TOOL_NAMES) {
+      // team_task_* 在提示词里是合并写的（一个前缀代表四个工具），按前缀判。
+      const mentioned = leadText.includes(name) || (name.startsWith('team_task_') && leadText.includes('team_task_'));
+      assert.ok(mentioned, 'Lead 提示词没提 ' + name + '：装了却不告诉它，等于白占每次请求的前缀');
+    }
+    for (const name of [roster.REPORT_TOOL_NAME, roster.ASK_LEAD_TOOL_NAME]) {
+      assert.ok(playbook.TEAMMATE_CARD.includes(name), '队员卡没提队员专用工具 ' + name);
+    }
+    // Lead 专属工具不许出现在队员卡里（队员调不通, 只会浪费一轮）。
+    for (const name of ['spawn_teammate', 'interrupt_agent', roster.WAKE_TOOL_NAME, roster.BROADCAST_TOOL_NAME]) {
+      assert.ok(!playbook.TEAMMATE_CARD.includes(name), '队员卡泄漏了 Lead 专属工具 ' + name);
+    }
+  });
+
+
   await check('工具 description 与控制面回执文案零 emoji（模型可见，同一条硬要求）', () => {
     // lib/tools.js 需要 @deepseek-ai/dsh-tools 才能加载，junction 坏时拿不到定义；
     // 这里退化为**源码级**扫描：把所有 description: '...' 与控制面 diagnostics.push('...')
