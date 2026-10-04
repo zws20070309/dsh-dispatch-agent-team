@@ -24,3 +24,7 @@ desktop.ini
 *.swp
 .idea/
 .vscode/
+
+# 审查历史（含本机真实路径/用户名，不进仓库；只在你本机查阅）
+REVIEW-*.md
+/docs/reviews/
