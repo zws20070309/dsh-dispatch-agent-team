@@ -360,6 +360,8 @@ dsh-dispatch-agent-team/
 │   │                               #   turn/end 截断 / 各工具真实次数 / 跨会话字面量检索）
 │   ├── selftest.cjs                # 纯逻辑回归（零 dsh 依赖）
 │   ├── integration-test.cjs        # 真链路集成测试（真 cordis + dsh-tools + dsh-system-prompt）
+│   │                               #   含一段用官方 validateJsonSchemaValue 核对返回值形状的断言
+│   │                               #   （直调 execute 本身会绕过它，所以必须显式补验）
 │   └── client-smoke-test.cjs       # 浏览器半渲染冒烟（迷你 React 替身 + 可编程 fetch）
 └── INTERFACES.md                   # 实现契约（含活体 API 实测记录 + 2026-09-28 起 42 条勘误表）
 ```

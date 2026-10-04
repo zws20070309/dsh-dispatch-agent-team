@@ -1339,6 +1339,37 @@ async function main() {
     if ((done.diagnostics || []).length !== 0) return '正常收尾后标志没被清掉：' + JSON.stringify(done.diagnostics);
     return true;
   });
+  // ── 工具返回值的**形状**校验（官方同一个校验器）────────────────────────────────────
+  // 为什么单列一段：上面所有断言都是直调 definition.execute(...)，而**生产路径**上
+  // dsh-tools 的 createSuccessResult 会先 validateJsonSchemaValue(tool.output.schema, value)
+  // （@deepseek-ai/dsh-tools/lib/index.js:3541-3544），不合 schema 就抛 ToolOutputError ——
+  // 也就是说「execute 返回值对了」不等于「模型真能拿到」。这一步补上那段空白。
+  const shapeCases = [
+    ['broadcast_message', broadcastTool, { message: 'shape' }, leadAgent],
+    ['broadcast_message(点名)', broadcastTool, { targets: ['scout', 'ghost'], message: 'shape' }, leadAgent],
+    ['broadcast_message(含 inactive)', broadcastTool, { message: 'shape', include_inactive: true }, leadAgent],
+    ['ask_lead', askTool, { question: 'shape' }, scoutAgent],
+    ['ask_lead(非阻塞)', askTool, { question: 'shape', blocking: false }, scoutAgent],
+    ['list_agents', listTool, {}, leadAgent],
+  ];
+  const shapeResults = [];
+  for (const [label, definition, args, agent] of shapeCases) {
+    try {
+      const value = await definition.execute(args, { agent, signal: new AbortController().signal });
+      const violations = dshTools.validateJsonSchemaValue(definition.output.schema, value, 'value');
+      shapeResults.push({ label, violations, value });
+    } catch (error) {
+      shapeResults.push({ label, violations: ['execute 抛错：' + (error && error.message)], value: null });
+    }
+  }
+  check('每个新工具的返回值都过官方 schema 校验（否则模型侧会拿到 ToolOutputError）', () => {
+    const bad = shapeResults.filter((item) => item.violations.length > 0);
+    if (bad.length > 0) return bad.map((item) => `${item.label}: ${JSON.stringify(item.violations).slice(0, 200)}`).join('\n        ');
+    if (shapeResults.length !== shapeCases.length) return `只跑了 ${shapeResults.length}/${shapeCases.length} 个用例`;
+    return true;
+  });
+  sentMessages.length = 0;
+
   })();
 
   // ── 8) 2026-10-01 修复的三件事：/team 的显示、宿主重启后团队工具被移除、队员唤醒 ─────────

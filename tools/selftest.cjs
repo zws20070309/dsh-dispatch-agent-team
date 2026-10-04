@@ -387,6 +387,31 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.TEAMMATE_TOOL_DENY.length, 9, '§1 的 deny 表(README §4.5)列了 9 个名字');
   });
 
+  await check('tools.js 用到的每个 runtime.<name> 都必须在 runtimeApi 门面上（缺键=静默失效）', () => {
+    // lib/runtime.js 的 installTeamTools 传给工具定义的是 **runtimeApi 门面**，不是整个模块命名空间。
+    // 而 tools.js 的调用形如 `runtime?.truncatedMemberIds?.() ?? []`：门面上少一个键，它不会抛错，
+    // 只会**静默**变成「这个功能永远不生效」——截断标志、报告落账都属于这一类。
+    // 所以每个被 tools.js 以代码形式调用的名字，都必须同时是 runtimeApi 的键（2026-10-04 审查 P2-21）。
+    const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    const facadeBlock = /const runtimeApi = \{[\s\S]*?\n\};/.exec(source);
+    assert.ok(facadeBlock !== null, '抓不到 runtimeApi 门面（改名或换写法了？同步这条断言）');
+    const facade = new Set([...facadeBlock[0].matchAll(/^  (\w+),?$/gm)].map((match) => match[1]));
+    const toolsSource = readFileSync(path.join(PLUGIN_DIR, 'lib', 'tools.js'), 'utf8');
+    const used = new Set();
+    for (const line of toolsSource.split('\n')) {
+      if (/^\s*(\/\/|\/\*|\*)/.test(line)) continue; // 注释里提到不等于依赖
+      for (const match of line.matchAll(/\bruntime\??\.([A-Za-z_]\w*)/g)) {
+        const name = match[1];
+        if (name === 'js' || name === 'enable' || name === 'disable') continue; // 开关工具走的是 host ctx 路径
+        if (/^typeof runtime\??\./.test(line.trim()) && !line.includes('runtime.' + name + '(')) continue;
+        used.add(name);
+      }
+    }
+    assert.ok(used.size >= 4, `只解析出 ${used.size} 个依赖名，正则漂了？`);
+    const missing = [...used].filter((name) => !facade.has(name));
+    assert.deepEqual(missing, [], `门面上没有这些键，功能会静默失效：${missing.join(', ')}（在 lib/runtime.js 的 runtimeApi 里补上）`);
+  });
+
   await check('INTERFACES §3 的 runtime 契约覆盖了**其它模块真正调用**的每个成员（双向）', () => {
     // 判据不是「列出全部导出」——runtime.js 有 30+ 个导出，多数是模块内部细节，全塞进文档
     // 只会让文档变噪音。真正的契约是**跨模块调用面**：index.js / preset.js / tools.js 里
