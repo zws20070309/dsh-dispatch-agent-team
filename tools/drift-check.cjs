@@ -326,6 +326,20 @@ check('官方 team bundle 用 insert 新建三行（所以 id 覆盖必须落在
   return missing.length === 0 ? true : `官方 insert 里缺行 id：${missing.join(', ')}`;
 });
 
+
+// 8b) 我们自己重新挂载官方 UI 包的那一行必须还在（2026-10-04 审查 P1-8 步骤 3）。
+// 为什么需要这条：README 曾经把「我们已不再重复挂载」写成事实（P1-8），后来 panel 行加回，
+// 靠的是人工发现。若将来有人按那份旧 README 把行删掉，**没有任何闸门会响**，
+// 用户关掉官方 ui-agent-team 行时成员列表/任务看板会静默消失。只读文本级断言，够了。
+check('本包 cordis.patch.yml 仍用自有行 id 重新挂载官方 UI 包（删掉它看板会静默消失）', () => {
+  if (oursPatch === '') return '读不到 cordis.patch.yml';
+  const panelRow = /-\s*id:\s*dispatch-agent-team-panel\b[\s\S]{0,200}?name:\s*'?(@deepseek-ai\/dsh-experimental-client-ui-agent-team)'?/u.exec(oursPatch);
+  if (panelRow === null) {
+    return 'cordis.patch.yml 里找不到 dispatch-agent-team-panel 行（或它的 name 不再是官方 UI 包）——'
+      + ' README §1.4 明确靠这一行保证「用户关掉官方 ui-agent-team 时成员列表与看板仍在」，删掉即功能静默降级';
+  }
+  return true;
+});
 check('本包 cordis.patch.yml **不**写顺序依赖的 disabled（官方行的抑制改在 preset 作用域）', () => {
   if (oursPatch === '') return '读不到 cordis.patch.yml';
   const offenders = ['tool-agent-team', 'ui-agent-team']

@@ -1262,6 +1262,45 @@ async function main() {
       { message: '只看这一条', targets: ['builder'] },
       { agent: leadAgent, signal: new AbortController().signal },
     );
+    check('broadcast_message：skipped 与 failed 各自独立（被跳过≠投递失败）', () => {
+      // 2026-10-04 独立探针抓出的真缺陷：早先把 skipped 也塞进 failed，而名单里**永远**有 lead 伪行，
+      // 于是 failed 恒非空、ok 恒为 false —— 模型会以为广播失败并重发。
+      // 这一用例里三个目标全都没发（lead 不是队员、scout/builder 都 inactive 且没开闸），
+      // 所以 ok:false 是**正确**语义（一条都没送出去），关键是它们必须出现在 skipped 而**不是** failed。
+      if (res.failed.length !== 0) return '被跳过的目标不该进 failed：' + JSON.stringify(res.failed);
+      if (res.skipped.length !== 3) return 'lead 与两个 inactive 队员都该在 skipped：' + JSON.stringify(res.skipped);
+      if (res.ok !== false) return '一条都没发出去时 ok 必须为 false（否则模型会以为广播成功）';
+      return true;
+    });
+
+    // 正向情形：真的发出去至少一条时 ok 必须为 true（此时仍有 skipped，但不该影响 ok）。
+    sentMessages.length = 0;
+    const okTrue = await broadcastTool.execute(
+      { targets: ['scout'], message: '只发给一个', include_inactive: true },
+      { agent: leadAgent, signal: new AbortController().signal },
+    );
+    check('broadcast_message：真发成功时 ok:true，且 skipped 里仍有 lead 伪行', () => {
+      if (okTrue.sent.length !== 1 || okTrue.sent[0].target !== 'scout') return JSON.stringify(okTrue.sent);
+      if (okTrue.failed.length !== 0) return '不该有 failed：' + JSON.stringify(okTrue.failed);
+      if (okTrue.ok !== true) return '发出去了却 ok:false';
+      return true;
+    });
+
+    const emptyMsg = await broadcastTool.execute({ message: '   ' }, { agent: leadAgent, signal: new AbortController().signal })
+      .then((v) => 'accepted:' + JSON.stringify(v), (e) => 'rejected:' + e.message);
+    check('broadcast_message：空正文被拒（不做静默截断/不投无意义消息）', () => {
+      if (!String(emptyMsg).startsWith('rejected:')) return '空白 message 竟然通过了：' + emptyMsg;
+      if (!String(emptyMsg).includes('不能为空')) return String(emptyMsg).slice(0, 120);
+      return true;
+    });
+
+    const hugeMsg = await broadcastTool.execute({ message: 'x'.repeat(4001) }, { agent: leadAgent, signal: new AbortController().signal })
+      .then((v) => 'accepted', (e) => 'rejected:' + e.message);
+    check('broadcast_message：超长正文被拒（广播会复制给每个队员，按人数放大）', () => {
+      if (!String(hugeMsg).startsWith('rejected:')) return '4001 字竟然通过了';
+      if (!String(hugeMsg).includes('4000')) return String(hugeMsg).slice(0, 120);
+      return true;
+    });
     check('broadcast_message：显式点名不受 inactive 闸门二次拦截', () => {
       if (res4.sent.length !== 1 || res4.sent[0].target !== 'builder') return JSON.stringify(res4);
       return true;
@@ -1290,6 +1329,15 @@ async function main() {
       { question: '要不要顺带加导出？', blocking: false },
       { agent: scoutAgent, signal: new AbortController().signal },
     );
+    const emptyQ = await askTool.execute({ question: '  ' }, { agent: scoutAgent, signal: new AbortController().signal })
+      .then(() => 'accepted', (e) => 'rejected:' + e.message);
+    const hugeQ = await askTool.execute({ question: 'x'.repeat(2001) }, { agent: scoutAgent, signal: new AbortController().signal })
+      .then(() => 'accepted', (e) => 'rejected:' + e.message);
+    check('ask_lead：空白问题与超长问题都被拒（问题该短，长背景属于报告）', () => {
+      if (!String(emptyQ).startsWith('rejected:') || !String(emptyQ).includes('不能为空')) return 'empty -> ' + emptyQ;
+      if (!String(hugeQ).startsWith('rejected:') || !String(hugeQ).includes('2000')) return 'huge -> ' + hugeQ;
+      return true;
+    });
     check('ask_lead：blocking=false 走「可继续」前缀且不附加停手指令', () => {
       if (!res2.question.startsWith('[可继续][需 Lead 决策]')) return res2.question.slice(0, 40);
       if (res2.diagnostics.length !== 0) return JSON.stringify(res2.diagnostics);
