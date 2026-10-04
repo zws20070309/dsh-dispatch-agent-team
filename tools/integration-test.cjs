@@ -1372,6 +1372,202 @@ async function main() {
 
   })();
 
+  // ── 2026-10-04 审查 P2-20：任务板 / wait / interrupt 的**插件自有逻辑**真路径 ──────────
+  // 划清边界：官方 createTask/updateTask/waitForChange 的域语义**不在这里测**（那是官方自己的
+  // 测试范围，本文件也造不出真 journal）。这里测的是**我们这一层**——上面每一行参数映射与
+  // 分支都是插件代码，写错了官方域服务再正确也没用：
+  //   team_task_create/update 的 snake_case → camelCase 映射与「缺省字段必须整个不传」
+  //   team_task_list 的 status/owner(含 unowned)/ready 三条件过滤器 + cursor/limit 分页 + nextCursor
+  //   wait_agent 的 no-active-peer 短路（它决定 Lead 会不会白等 30 秒）
+  //   interrupt_agent / wake_teammate 的 resolveTarget（agent_id 别名翻译 + 二者冲突必拒）
+  const board = [];
+  const boardCalls = [];
+  const waitCalls = [];
+  const interruptCalls = [];
+  let memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'inactive']]);
+  const boardTeams = {
+    tryMembership: (agent) => membershipById.get(agent && agent.id),
+    listMembers: (caller) => [
+      { id: 'lead-agent', name: 'lead', role: 'lead', status: memberStatus.get('lead-agent') ?? 'inactive', diagnostics: [] },
+      { id: 'scout-agent', name: 'scout', role: 'teammate', status: memberStatus.get('scout-agent') ?? 'inactive', diagnostics: [] },
+      { id: 'builder-agent', name: 'builder', role: 'teammate', status: memberStatus.get('builder-agent') ?? 'inactive', diagnostics: [] },
+    ],
+    createTask(caller, request) { boardCalls.push({ method: 'createTask', caller, request }); const task = { id: 'task-1', revision: 0, subject: request.subject, description: request.description, status: 'pending', blockedBy: request.blockedBy ?? [], writeScopes: request.writeScopes ?? [], ready: (request.blockedBy ?? []).length === 0, writeScopeWarnings: [] }; board.push(task); return task; },
+    listTasks(caller) { boardCalls.push({ method: 'listTasks', caller }); return board.map((task) => ({ ...task })); },
+    getTask(caller, taskId) { boardCalls.push({ method: 'getTask', caller, taskId }); return board.find((task) => task.id === taskId); },
+    updateTask(caller, request) { boardCalls.push({ method: 'updateTask', caller, request }); const task = board.find((row) => row.id === request.taskId); if (task === undefined) throw new Error('TEAM_TASK_NOT_FOUND'); if (request.expectedRevision !== task.revision) throw new Error('TEAM_TASK_STALE_REVISION'); task.revision += 1; if (typeof request.subject === 'string') task.subject = request.subject; return { ...task }; },
+    waitForChange(caller, timeoutMs, signal) { waitCalls.push({ caller, timeoutMs }); return { timedOut: true }; },
+    interrupt(caller, target) { interruptCalls.push({ caller, target }); return { previousStatus: memberStatus.get(target === 'scout' ? 'scout-agent' : 'lead-agent') === 'running' ? 'running' : 'inactive' }; },
+    sendMessage: () => ({ messageId: 'm', status: 'accepted' }),
+  };
+  const boardRuntime = { ...reportRuntime };
+  const boardDefinitions = new Map(toolsModule.teamToolDefinitions({ runtime: boardRuntime, agentTeams: boardTeams }).map((definition) => [definition.name, definition]));
+  for (const definition of toolsModule.teamToolDefinitions({ runtime: boardRuntime, agentTeams: boardTeams, include: roster.MEMBER_TEAM_TOOL_NAMES })) {
+    if (!boardDefinitions.has(definition.name)) boardDefinitions.set(definition.name, definition);
+  }
+  const signalOf = () => new AbortController().signal;
+  const leadExec = { agent: leadAgent, signal: signalOf() };
+
+  await (async () => {
+    boardCalls.length = 0;
+    const created = await boardDefinitions.get('team_task_create').execute(
+      { subject: '做 A', description: '细节', blocked_by: ['task-0'], write_scopes: ['src/a/'] },
+      leadExec,
+    );
+    const sent = boardCalls[0].request;
+    const keys = Object.keys(sent).sort().join(',');
+    check('team_task_create：snake_case 参数映射为域服务的 camelCase，且未给的字段整个不传', () => {
+      if (keys !== 'blockedBy,description,subject,writeScopes') return '域服务收到的键不对：' + keys;
+      if (JSON.stringify(sent.blockedBy) !== '["task-0"]') return 'blocked_by 没翻成 blockedBy：' + JSON.stringify(sent);
+      if (created === undefined || created.id !== 'task-1') return JSON.stringify(created);
+      return true;
+    });
+    const bare = await boardDefinitions.get('team_task_create').execute({ subject: 'B', description: 'd' }, leadExec);
+    check('team_task_create：不给 blocked_by / write_scopes 时**不会**出现值为 undefined 的键（官方按 hasOwnProperty 判定）', () => {
+      const second = boardCalls[boardCalls.length - 1].request;
+      if ('blockedBy' in second || 'writeScopes' in second) return JSON.stringify(Object.keys(second));
+      if (second.id !== undefined || bare === undefined) return '第二次创建异常';
+      return true;
+    });
+  })();
+
+  await (async () => {
+    board.length = 0;
+    board.push(
+      { id: 't1', revision: 0, subject: 's1', description: 'd', status: 'pending', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] },
+      { id: 't2', revision: 0, subject: 's2', description: 'd', status: 'in_progress', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] },
+      { id: 't3', revision: 0, subject: 's3', description: 'd', status: 'pending', blockedBy: ['t1'], writeScopes: [], ready: false, writeScopeWarnings: [], ownerName: 'scout' },
+      { id: 't4', revision: 0, subject: 's4', description: 'd', status: 'completed', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [], ownerName: 'builder' },
+    );
+    const listTool = boardDefinitions.get('team_task_list');
+    const ids = (result) => result.tasks.map((task) => task.id).join(',');
+    const all = await listTool.execute({}, leadExec);
+    check('team_task_list：无过滤时返回全部，并带 cursor/limit 默认分页（limit 50 内不出现 nextCursor）', () => {
+      if (ids(all) !== 't1,t2,t3,t4') return ids(all);
+      if ('nextCursor' in all) return '不该有 nextCursor：' + JSON.stringify(all.nextCursor);
+      return true;
+    });
+    const byStatus = await listTool.execute({ status: 'pending' }, leadExec);
+    const byOwner = await listTool.execute({ owner: 'unowned' }, leadExec);
+    const byScout = await listTool.execute({ owner: 'scout' }, leadExec);
+    const byReady = await listTool.execute({ ready: false }, leadExec);
+    check('team_task_list：status / owner(含 unowned 魔法值) / ready 三个过滤器各自生效', () => {
+      if (ids(byStatus) !== 't1,t3') return 'status=pending -> ' + ids(byStatus);
+      if (ids(byOwner) !== 't1,t2') return 'owner=unowned -> ' + ids(byOwner);
+      if (ids(byScout) !== 't3') return 'owner=scout -> ' + ids(byScout);
+      if (ids(byReady) !== 't3') return 'ready=false -> ' + ids(byReady);
+      return true;
+    });
+    const page1 = await listTool.execute({ limit: 2 }, leadExec);
+    const page2 = await listTool.execute({ limit: 2, cursor: 2 }, leadExec);
+    check('team_task_list：分页翻到底 + 有剩余时给 nextCursor', () => {
+      if (ids(page1) !== 't1,t2' || page1.nextCursor !== 2) return JSON.stringify(page1);
+      if (ids(page2) !== 't3,t4' || 'nextCursor' in page2) return JSON.stringify(page2);
+      return true;
+    });
+    const badCursor = await listTool.execute({ cursor: -1 }, leadExec).then(() => null, (error) => error.message);
+    const badLimit = await listTool.execute({ limit: 0 }, leadExec).then(() => null, (error) => error.message);
+    const bigLimit = await listTool.execute({ limit: 101 }, leadExec).then(() => null, (error) => error.message);
+    check('team_task_list：坏 cursor / 越界 limit 直接拒（不静默返回空页）', () => {
+      if (typeof badCursor !== 'string' || !badCursor.includes('cursor')) return 'cursor=-1 没拒：' + String(badCursor);
+      if (typeof badLimit !== 'string' || !badLimit.includes('limit')) return 'limit=0 没拒';
+      if (typeof bigLimit !== 'string' || !bigLimit.includes('limit')) return 'limit=101 没拒';
+      return true;
+    });
+  })();
+
+  await (async () => {
+    boardCalls.length = 0;
+    await boardDefinitions.get('team_task_get').execute({ task_id: 't7' }, leadExec);
+    check('team_task_get：task_id 经 TeamTaskId 品牌化后原样透传（不加工成数字）', () => {
+      const call = boardCalls[boardCalls.length - 1];
+      if (call.method !== 'getTask' || call.taskId !== 't7') return JSON.stringify(call);
+      return true;
+    });
+    board.length = 0;
+    board.push({ id: 't9', revision: 3, subject: 'old', description: 'd', status: 'pending', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] });
+    const updated = await boardDefinitions.get('team_task_update').execute(
+      { task_id: 't9', expected_revision: 3, action: 'claim', subject: 'new', blocked_by: ['t8'] },
+      leadExec,
+    );
+    const upd = boardCalls[boardCalls.length - 1].request;
+    check('team_task_update：CAS 三要素 + 可选字段映射（expected_revision→expectedRevision、blocked_by→blockedBy）', () => {
+      if (upd.taskId !== 't9' || upd.expectedRevision !== 3 || upd.action !== 'claim') return JSON.stringify(upd);
+      if (upd.subject !== 'new' || JSON.stringify(upd.blockedBy) !== '["t8"]') return JSON.stringify(upd);
+      if (updated.revision !== 4) return '返回值不是域服务更新后的：' + JSON.stringify(updated);
+      return true;
+    });
+    const stale = await boardDefinitions.get('team_task_update')
+      .execute({ task_id: 't9', expected_revision: 1, action: 'claim' }, leadExec)
+      .then(() => null, (error) => error.message);
+    check('team_task_update：stale revision 由官方 CAS 拒绝，插件**不吞掉**这个错误', () => {
+      if (typeof stale !== 'string' || !stale.includes('STALE_REVISION')) return '过期 revision 竟然通过了：' + String(stale);
+      return true;
+    });
+  })();
+
+  await (async () => {
+    waitCalls.length = 0;
+    const waitTool = boardDefinitions.get('wait_agent');
+    // caller=scout：判据排除自己，所以**除它以外全 inactive** 才构成「无人可等」——lead 在跑就算对端。
+    memberStatus = new Map([['lead-agent', 'inactive'], ['scout-agent', 'inactive'], ['builder-agent', 'inactive']]);
+    const idle = await waitTool.execute({}, { agent: scoutAgent, signal: signalOf() });
+    check('wait_agent：没有活着的对端时**短路**返回 no-active-peer，不去调 waitForChange（否则 Lead 白等 30 秒）', () => {
+      if (waitCalls.length !== 0) return 'waitForChange 被调了 ' + waitCalls.length + ' 次';
+      if (idle.timedOut !== false) return JSON.stringify(idle);
+      if (idle.noProgress === undefined || idle.noProgress.reason !== 'no-active-peer') return JSON.stringify(idle);
+      if (!idle.noProgress.message.includes('wake each required inactive teammate')) return '说明文字丢了下一步动作';
+      return true;
+    });
+    memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'running']]);
+    waitCalls.length = 0;
+    const active = await waitTool.execute({ timeout_ms: 15000 }, { agent: scoutAgent, signal: signalOf() });
+    check('wait_agent：有 running 对端时正常转给 waitForChange，并把 timeout_ms 原样传下去', () => {
+      if (waitCalls.length !== 1) return 'waitForChange 调用 ' + waitCalls.length + ' 次';
+      if (waitCalls[0].timeoutMs !== 15000) return JSON.stringify(waitCalls[0]);
+      if (active.timedOut !== true || active.noProgress !== undefined) return JSON.stringify(active);
+      return true;
+    });
+    // provisioning 也算「活着」——刚 spawn 还没起跑的队员不该被当成没人可等。
+    waitCalls.length = 0;
+    memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'provisioning']]);
+    await waitTool.execute({}, { agent: scoutAgent, signal: signalOf() });
+    check('wait_agent：provisioning 也算活跃对端（刚派出还没起跑的队员不该被当成无人可等）', () => {
+      if (waitCalls.length !== 1) return '短路了：waitForChange 没被调';
+      if (waitCalls[0].timeoutMs !== 30000) return '默认超时不是 30s：' + waitCalls[0].timeoutMs;
+      return true;
+    });
+    memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'inactive']]);
+  })();
+
+  await (async () => {
+    interruptCalls.length = 0;
+    const interruptTool = boardDefinitions.get('interrupt_agent');
+    const byName = await interruptTool.execute({ target: 'scout' }, leadExec);
+    const byId = await interruptTool.execute({ agent_id: 'scout-agent' }, leadExec);
+    check('interrupt_agent：target 用名字，agent_id 别名被翻译成名字（模型会照抄官方同名工具的形状）', () => {
+      if (interruptCalls[0].target !== 'scout') return 'target 原样失败：' + JSON.stringify(interruptCalls[0]);
+      if (interruptCalls[1].target !== 'scout') return 'agent_id 没翻译：' + JSON.stringify(interruptCalls[1]);
+      if (byName.previousStatus !== 'inactive' || byId.previousStatus !== 'inactive') return JSON.stringify([byName, byId]);
+      return true;
+    });
+    const bothConflict = await interruptTool.execute({ target: 'scout', agent_id: 'builder-agent' }, leadExec).then(() => null, (error) => error.message);
+    const bothSame = await interruptTool.execute({ target: 'scout', agent_id: 'scout' }, leadExec).then((value) => value, (error) => error.message);
+    const none = await interruptTool.execute({}, leadExec).then(() => null, (error) => error.message);
+    check('interrupt_agent：target 与 agent_id 都缺、或都给且不一致 → 拒绝；都给且一致 → 放行', () => {
+      if (typeof bothConflict !== 'string' || !bothConflict.includes('不一致')) return '冲突没拒：' + String(bothConflict);
+      if (typeof none !== 'string' || !none.includes('缺少目标')) return '空目标没拒：' + String(none);
+      if (interruptCalls[interruptCalls.length - 1].target !== 'scout') return '一致时不该拒：' + JSON.stringify(bothSame);
+      return true;
+    });
+    const leadTarget = await boardDefinitions.get('wake_teammate').execute({ target: 'lead' }, leadExec).then((v) => v, (e) => e.message);
+    check('wake_teammate：target=lead 原样透传（不拿去和队员名单比，否则官方错误信息会误导）', () => {
+      if (typeof leadTarget === 'string') return '被拒了：' + leadTarget;
+      return true;
+    });
+  })();
+
+
   // ── 8) 2026-10-01 修复的三件事：/team 的显示、宿主重启后团队工具被移除、队员唤醒 ─────────
   // 现场证据（两份真实会话日志，tools/session-probe.cjs --tools 可复现）：
   //   seq=360 request/header reason=resume series 工具 72 个 -[spawn_teammate, team_task_create, …]
