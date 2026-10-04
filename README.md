@@ -303,7 +303,7 @@ broadcast_message({ message: "...", include_inactive: true })                  #
 - 投递走官方 `sendMessage(→ lead)`，插件加固定前缀 `[阻塞·等答复]` / `[可继续]` + `[需 Lead 决策]`：
   官方投递框架只写发件人（`dsh-experimental-agent-team/lib/index.js:971-976`），没有类型位，
   所以 Lead 靠这个前缀区分「等答复」与「顺带一报」。
-- 为什么需要它：官方挡掉了队员的 `ask_user_question`（`dsh-user-questions/lib/index.js:531-534` 的
+- 为什么需要它：官方挡掉了队员的 `ask_user_question`（`dsh-user-questions/lib/index.js:531-535` 的
   `assertLiveRoot` 抛 `DELEGATED_CALLER`），而队员卡要求「有问题停下来报告给 Lead」——
   在此之前队员只有自由文本 `send_message` 这一条路，Lead 无法机器区分。现在 `ask_user_question`
   也已从队员工具面摘掉（`TEAMMATE_TOOL_DENY`），工具面与纪律口径一致。
@@ -361,7 +361,7 @@ dsh-dispatch-agent-team/
 │   ├── selftest.cjs                # 纯逻辑回归（零 dsh 依赖）
 │   ├── integration-test.cjs        # 真链路集成测试（真 cordis + dsh-tools + dsh-system-prompt）
 │   └── client-smoke-test.cjs       # 浏览器半渲染冒烟（迷你 React 替身 + 可编程 fetch）
-└── INTERFACES.md                   # 实现契约（含活体 API 实测记录 + 2026-09-28 起 41 条勘误表）
+└── INTERFACES.md                   # 实现契约（含活体 API 实测记录 + 2026-09-28 起 42 条勘误表）
 ```
 
 > **控制面注册在哪、为什么**（2026-09-28 边界修正，覆盖了 09-27 的「搬到宿主平面」）：
@@ -510,8 +510,9 @@ agent scope** 上，`dsh-tools` 会抛「already registered in this scope」。�
 | `create_goal` / `get_goal` / `update_goal` | 目标是 Lead 的编排手段；队员的目标就是它那一条任务 |
 | `subagent` / `subagent_fork` / `workflow` | 不给队员「再派子代理」的权限：多一层递归只会烧预算、让汇报链断掉 |
 | `enable_agent_team` / `disable_agent_team` | Lead 专属开关，队员调用只会拿到拒绝 |
+| `ask_user_question` | 官方本身就挡委派调用者（`dsh-user-questions/lib/index.js:531-535` 的 `assertLiveRoot` 抛 `DELEGATED_CALLER`）：队员调它必然失败，却会在**宿主全局**排队一个到期弹窗。摘掉后工具面与「有问题报给 Lead」的纪律口径一致，中途要拍板走 `ask_lead`（§2.6） |
 
-三点实现细节，都不是随便选的：
+四点实现细节，都不是随便选的：
 
 - **逐名调用 + try/catch**：`restrict` 对**不存在的名字会抛错**（`names unknown global tool`），
   而用户可能关掉某个 preset 行。逐个调用后，少一个名字只是「少摘一个」，绝不会让队员建不出来。
@@ -1087,7 +1088,7 @@ node tools\history-audit.cjs --all      # 本机出现过的所有斜杠命令�
 
 ### 8.9 2026-09-30：一个新工具的 schema 写错，**整个 Agent 的团队工具都装不上**
 
-**症状**：集成测试里「队员缺 7 个团队工具」，而宿主日志里是一句
+**症状**：集成测试里「队员缺 7 个团队工具」（当时的数字；现在队员工具面是 9 个，见 §4.5），而宿主日志里是一句
 `unsupported JSON schema: schema.additionalProperties must be explicitly true or false`。
 
 **根因**：新增的 `report_result` 输出 schema 写成了 `{type:'object', properties:{…}}`，
