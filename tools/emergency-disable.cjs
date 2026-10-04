@@ -31,7 +31,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
+// 注：DSH 主目录的定位在下面经由 tools/lib-dsh-home.cjs 解析（P1-7），不再直接用 os.homedir()。
 
 const PACKAGE_NAME = '@zws/dsh-dispatch-agent-team';
 /** 本插件声明的 preset id：如果 selectedDefault 指向它，而我们被禁用，会话创建会失败。 */
@@ -41,7 +41,11 @@ function argValue(flag) {
   const index = process.argv.indexOf(flag);
   return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : void 0;
 }
-const profileDir = argValue('--profile') || path.join(os.homedir(), '.dsh', 'profiles', 'desktop');
+// 定位统一走 tools/lib-dsh-home.cjs（P1-7）：应急摘除必须作用在**真正在用**的 profile 上，
+// 硬编码 ~/.dsh 会在 DSH_HOME 机器上摘错对象。
+const dshHomeModule = require('./lib-dsh-home.cjs');
+const dshPaths = dshHomeModule.resolveProfileDir({ explicit: argValue('--profile') });
+const profileDir = dshPaths.profileDir;
 const patchReport = process.argv.includes('--patch-report');
 const restorePatch = process.argv.includes('--restore-patch');
 const dryRun = process.argv.includes('--dry-run');
@@ -108,12 +112,26 @@ if (!removeBundle) {
   fs.copyFileSync(pkgPath, backup);
   const next = bundles.filter((name) => name !== PACKAGE_NAME);
   pkg.dsh.profile.bundles = next;
-  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+  // 原子写（tmp + rename）：这个文件坏了 DSH 就起不来，不能就地截断重写（P2-17）。
+  try {
+    require('./lib-atomic-write.cjs').writeAtomic(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+  } catch (error) {
+    console.error(`[emergency-disable] 写 package.json 失败（原文件未改动，备份在 ${path.basename(backup)}）：${error.message}`);
+    process.exit(2);
+  }
   console.log(`[emergency-disable] 已从 bundles 移除 ${PACKAGE_NAME}`);
   console.log(`[emergency-disable] package.json 备份 -> ${path.basename(backup)}`);
   console.log(`[emergency-disable] 现在的 bundles：${next.join(', ')}`);
   console.log('');
   console.log('现在重启 DSH 即可正常启动。想再启用本插件：插件页 → 已安装 → 调度模式智能体团队 → 启用。');
+  // 应急场景刻意**不**自动改 cordis.patch.yml（保持「最小动作」），但必须把后果讲清楚（P1-5）：
+  // 托管块还留在 profile 层，官方 Agent Teams 的九个团队工具会继续处于被关闭状态。
+  console.log('');
+  console.log('⚠️ 本工具没有动 profile 的 cordis.patch.yml。如果之前跑过 repair.cjs --apply，');
+  console.log('   那段 dispatch-agent-team:managed 托管块仍在生效——它会**继续关闭官方** tool-agent-team 行，');
+  console.log('   于是官方 Agent Teams 的九个团队工具在所有 preset 里都不可用。');
+  console.log(`   要恢复官方团队：node "${path.join(__dirname, 'repair.cjs')}" --revert --profile "${profileDir}"`);
+  console.log('   （或在插件页编辑 profile 的 cordis.patch.yml，删掉 dispatch-agent-team:managed:start 到 :end 之间整段，删前备份。）');
 }
 
 // ── 3) 可选的 patch 体检 / 恢复 ──────────────────────────────────────────────
@@ -186,7 +204,8 @@ if (restorePatch) {
   const guard = `${patchPath}.bak-${Date.now()}-pre-restore`;
   try {
     if (fs.existsSync(patchPath)) fs.copyFileSync(patchPath, guard);
-    fs.copyFileSync(chosen.full, patchPath);
+    // 原子替换：直接 copyFile 覆写 live 文件，中途失败会留下半份 patch（P2-17）。
+    require('./lib-atomic-write.cjs').writeAtomic(patchPath, fs.readFileSync(chosen.full, 'utf8'));
   } catch (error) {
     console.error(`[emergency-disable] 恢复失败：${error.message}`);
     process.exit(2);

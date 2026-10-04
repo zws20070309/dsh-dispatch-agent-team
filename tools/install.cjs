@@ -51,10 +51,10 @@ function argValue(flag) {
 const dryRun = process.argv.includes('--dry-run');
 const uninstall = process.argv.includes('--uninstall');
 const force = process.argv.includes('--force');
-const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-  ? path.resolve(process.env.DSH_HOME.trim())
-  : path.join(os.homedir(), '.dsh');
-const profileDir = path.join(dshHome, 'profiles', 'desktop');
+// 定位统一走 tools/lib-dsh-home.cjs（P1-7 的「一份真值」要求）。
+const dshPaths = require('./lib-dsh-home.cjs').resolveProfileDir({});
+const dshHome = dshPaths.home;
+const profileDir = dshPaths.profileDir;
 
 function die(message, code = 1) {
   console.error(`[install] ${message}`);
@@ -160,7 +160,24 @@ if (lastFailure !== '') {
 }
 
 // 官方 reconcile **不管**的两件硬前置（包内依赖 junction、profile 层的工具行关闭与容量）交给 repair。
+// 卸载方向同样必须对称（2026-10-04 审查 P1-5）：--apply 会往 profile 的 cordis.patch.yml 写
+// 「关闭官方 tool-agent-team 行 + agent-team 容量」的托管块。官方那三行是 bundle 用 insert 新建的，
+// 所以本插件被卸载后若托管块还留着，官方九个团队工具会在**所有 preset** 里静默消失，
+// 而用户没有任何回收入口。因此卸载成功后自动跑 --revert（幂等：没有托管块就是空操作、exit 0）。
 const repairPath = path.join(pluginDir, 'tools', 'repair.cjs');
+if (uninstall && fs.existsSync(repairPath)) {
+  console.log('[install] 跑 tools/repair.cjs --revert（回收 profile 层托管块，恢复官方团队工具）');
+  const reverted = spawnSync(process.execPath, [repairPath, '--revert', '--profile', profileDir], { stdio: 'inherit' });
+  if ((reverted.status ?? 1) !== 0) {
+    console.warn('[install] 托管块回收**失败**：官方 tool-agent-team 行可能仍处于被关闭状态。');
+    console.warn(`[install] 手动处理：node "${repairPath}" --revert --profile "${profileDir}"`);
+    console.warn('[install] 或直接在插件页/编辑 profile 的 cordis.patch.yml 删掉 dispatch-agent-team:managed 那一段（删前备份）。');
+  }
+} else if (uninstall) {
+  console.warn(`[install] 找不到 tools/repair.cjs（${repairPath}），无法回收 profile 层托管块。`);
+  console.warn('[install] 若之后发现官方 Agent Teams 的团队工具不见了，就是这段托管块在生效：');
+  console.warn(`[install] 编辑 ${path.join(profileDir, 'cordis.patch.yml')}，删掉 dispatch-agent-team:managed:start 到 :end 之间整段（先备份）。`);
+}
 if (!uninstall && fs.existsSync(repairPath)) {
   console.log('[install] 跑 tools/repair.cjs --apply');
   const repaired = spawnSync(process.execPath, [repairPath, '--apply', '--profile', profileDir], { stdio: 'inherit' });

@@ -20,7 +20,7 @@
 | 5 | §3:56「所有函数都接受宿主 ctx 作为第一个参数」 | 与同段签名自相矛盾：`peekConfig()` / `isEnabled(agent)` / `status(agent)` / `peekRevision()` 都不收 ctx |
 | 6 | §3.1:80/85 策略段与队员卡段 `order: 60` | **代码是 600**（`lib/runtime.js` 的 `TEAM_POLICY_ORDER` / `TEAMMATE_CARD_ORDER`），官方槽位 `TEAM_POLICY = 600`（dsh-system-prompt `SECTION_ORDERS`）。按 60 实现会把两段插到错误位置 |
 | 7 | §3.1「顺序固定」清单 | 队员侧现在多了三步：**清空工具用法段**（`muteToolSections`）、**收窄继承面工具**（`restrictTeammateTools`）、**只注册队员子集团队工具**（`MEMBER_TEAM_TOOL_NAMES`） |
-| 8 | §3.1:81/86 + §4:135/167-168「队员也是九个团队工具」 | 队员只有 **7 个**（九个减去 `spawn_teammate` / `interrupt_agent`），见 `MEMBER_TEAM_TOOL_NAMES` |
+| 8 | §3.1:81/86 + §4:135/167-168「队员也是九个团队工具」 | 队员有 **9 个**（九个减去 `spawn_teammate` / `interrupt_agent`，再加队员专用的 `report_result` 与 `ask_lead`），见 `MEMBER_TEAM_TOOL_NAMES` |
 | 9 | §3.2:100-107、319-325「监听器必须写成」 | 现行实现多两件事：本次 spawn 的**显式路由钉** `spawnRoutes`，以及**只有模型真的广告该档位才写** `reasoningEffort`（`effortAdvertised`） |
 | 10 | §3.3:120-122「`prepareDocument()` 取 dirname 即 DSH 主目录」 | **错**。`prepareDocument()` 返回的是 **profile 的 patch 路径**；现行实现按 `<home>/profiles/<profile>/<file>` 剥三段，再用 `<候选>/profiles` 是否为目录确认（`lib/runtime.js` 的 `resolveDshHome`） |
 | 11 | §4:164「identity prefix 照抄官方英文」 | 已整体替换为中文 `teammateBrief`（`lib/playbook.js`），并且把角色简报拼在 Lead 写的任务正文**之前** |
@@ -64,14 +64,14 @@
 
 ## 0. 运行环境事实（先读，避免写错 API）
 
-- **运行中的桌面端是 `@deepseek-ai/dsh-desktop 0.2.0-rc.1` / `@deepseek-ai/dsh-desktop-runtime 0.2.0-rc.1`**
-  （来自 `app.asar`；2026-09-28 由用户升级，此前是 0.1.7-rc.2）。本文档里出现的 `0.1.7`
-  行号是**取证快照**，不是「现在跑的那一版」；现行判据是 0.2.0-rc.1 的 `app.asar`
+- **运行中的桌面端是 `@deepseek-ai/dsh-desktop 0.2.0-rc.2` / 运行时同代**（2026-10-04 本机实测；
+  2026-09-28 升到 0.2.0-rc.1、其后又升到 rc.2，此前是 0.1.7-rc.2）。本文档里出现的 `0.1.7`
+  行号是**取证快照**，不是「现在跑的那一版」；现行判据是 0.2.0-rc.2 的 `app.asar`
   （`tools/drift-check.cjs` 开头会把宿主版本与插件依赖版本都打印出来）。
 - `<DSH 主目录>\profiles\node_modules\@deepseek-ai\*` 是**陈旧的 0.1.5 树**（每个 package.json 的
   `version` 都是 `0.1.5-rc.2`），里面的 `installSection` / `settings.plugin.item` /
   `dsh-client-schema-form` 在这个运行时里**不存在**。
-  **判断 API 是否存在，必须以 `app.asar`（0.2.0-rc.1）里的那一份为准。**
+  **判断 API 是否存在，必须以 `app.asar`（0.2.0-rc.2）里的那一份为准。**
   ⚠️ 反过来也成立：**这些包在插件目录里能被 `import.meta.resolve` 成功解析**（junction 到全局 CLI 的
   0.1.5 副本）。所以「解析得到」不等于「是运行中的那一份」——这是一条静默的版本错配风险，
   不是 `ERR_MODULE_NOT_FOUND`。`tools/integration-test.cjs` 会在开头把实际解析到的版本打印出来，
@@ -98,7 +98,7 @@ export const ROLE_BY_ID;            // Record<id, role>
 // ⚠️ 以下 5 个为 2026-09-28 新增（队员能力面真值，与角色无关；见 §0.1 第 3 条）：
 export const TEAM_TOOL_NAMES;             // 九个团队工具名（真值在这里，不在 lib/tools.js）
 export const LEAD_ONLY_TEAM_TOOL_NAMES;   // ['spawn_teammate','interrupt_agent']
-export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 7 个 = 九个减去上面两个
+export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减去上面两个，再加队员专用的 report_result 与 ask_lead
 export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
 export function deriveRole(name);   // 'verify-2' -> 'verify'; 非法 -> undefined
@@ -162,7 +162,7 @@ export function status(agent);                   // -> {enabled:boolean, role:st
      —— **与角色无关**，所有队员逐字节相同（旧写法 `teammateCard(deriveRole(name))` 已删除）
    - **清空**被摘掉工具的用法段（`TEAMMATE_SECTION_MUTES`：`tool:goal` / `tool:workflow`，同名空段遮蔽）
    - **收窄继承面工具** `ctx.tools.restrict({ deny: [name] })`，逐个名字 try/catch（`TEAMMATE_TOOL_DENY`）
-   - 只有 **7 个**团队工具（`MEMBER_TEAM_TOOL_NAMES`；不含 `spawn_teammate` / `interrupt_agent`）
+   - 只有 **9 个**团队工具（`MEMBER_TEAM_TOOL_NAMES`；= 官方九个去掉 `spawn_teammate` / `interrupt_agent`，再加队员专用的 `report_result` 与 `ask_lead`）
    - **模型/强度覆盖**（见 §3.2）
    - 另外尽力注册一个**同名空段** `dispatch:playbook`（order 1、text `''`）来遮蔽 preset 层的
      Lead 方法论段；**如果注册抛错就吞掉并记 diagnostic**，不要因此让 enable 失败。
@@ -173,7 +173,7 @@ export function status(agent);                   // -> {enabled:boolean, role:st
 
 在**队员自己的 agent scope** 上装一个 `agent/request` waterfall。写法照 0.1.7 官方
 `dsh-agent/lib/types/model-selection.js` 的 `installModelSelection`（同目录同名，官方在
-`dsh-agent-loop/lib/index.js:1164` 调用这个 waterfall）：
+`dsh-agent-loop/lib/index.js:1179` 调用这个 waterfall）：
 
 ```js
 const dispose = agent.ctx.on('agent/request', async (_payload, next) => {

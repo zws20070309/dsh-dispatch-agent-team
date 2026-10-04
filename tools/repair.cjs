@@ -26,7 +26,6 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const os = require('node:os');
 
 const PACKAGE_NAME = '@zws/dsh-dispatch-agent-team';
 
@@ -34,14 +33,73 @@ function argValue(flag) {
   const index = process.argv.indexOf(flag);
   return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : void 0;
 }
+
+// 原子写（tmp + rename）：tools/ 里唯一的实现，emergency-disable.cjs 共用（P2-17）。
+const { writeAtomic } = require('./lib-atomic-write.cjs');
 const apply = process.argv.includes('--apply');
-const profileDir = argValue('--profile') || path.join(os.homedir(), '.dsh', 'profiles', 'desktop');
+/** 回收模式：删掉本插件写进 profile 的托管块，把官方 tool-agent-team 行与容量还给用户。 */
+const revert = process.argv.includes('--revert');
+// DSH 主目录/profile 的定位统一走 tools/lib-dsh-home.cjs（P1-7：以前这里硬编码
+// ~/.dsh/profiles/desktop，设置了 DSH_HOME 的机器上 --apply 会把托管块写进错的 profile）。
+const dshPaths = require('./lib-dsh-home.cjs').resolveProfileDir({ explicit: argValue('--profile') });
+const profileDir = dshPaths.profileDir;
 const pluginDir = path.resolve(__dirname, '..');
 
-console.log(`[repair] profile   : ${profileDir}`);
+console.log(`[repair] profile   : ${require('./lib-dsh-home.cjs').describeSource(dshPaths)}`);
 console.log(`[repair] plugin dir: ${pluginDir}`);
-console.log(`[repair] mode      : ${apply ? 'APPLY（会写文件）' : '只读体检'}`);
+console.log(`[repair] mode      : ${revert ? 'REVERT（回收 profile 层托管块，会写文件）' : apply ? 'APPLY（会写文件）' : '只读体检'}`);
 console.log('');
+
+// 托管块的常量定义在这里（revert 早退分支与下方 --apply 分支共用）。
+const PROFILE_PATCH = path.join(profileDir, 'cordis.patch.yml');
+/** 与 cordis.patch.yml 里的值必须一致（drift-check 也校验这两份相等）。 */
+const AGENT_TEAM_CONFIG = {
+  maxMembers: 48,
+  maxTasks: 512,
+  maxPendingMessagesPerMember: 64,
+  maxMessageBytes: 65536,
+  disposalTimeoutMs: 5000,
+};
+const MANAGED_START = '# ── dispatch-agent-team:managed:start（由 tools/repair.cjs 维护，勿手改）──';
+const MANAGED_END = '# ── dispatch-agent-team:managed:end ──';
+
+/**
+ * 本包**会被加载/执行**的文件清单（源码目录与已安装副本都要查，见第 7 节）。
+ *
+ * 2026-10-04 审查 P1-3/子代理复审补：旧清单漏了 lib/cache.js 与 lib/resume.js ——
+ * 两者都被 lib/runtime.js 静态 import（:53、:55-61），缺了会让 host 行在加载期崩，
+ * 而这一节恰恰是来防这件事的；tools/lib-dsh-home.cjs 是 repair/drift-check/
+ * emergency-disable/install 四个脚本共用的定位模块，缺了它们全部直接抛栈。
+ */
+const PACKAGE_FILES = [
+  'package.json',
+  'cordis.patch.yml',
+  'presets/dispatch-mode.patch.yml',
+  'icon.svg',
+  'locale/zh.json',
+  'locale/en.json',
+  'lib/index.js',
+  'lib/preset.js',
+  'lib/runtime.js',
+  'lib/tools.js',
+  'lib/roster.js',
+  'lib/playbook.js',
+  'lib/cache.js',
+  'lib/resume.js',
+  'lib/client.js',
+  'tools/drift-check.cjs',
+  'tools/selftest.cjs',
+  'tools/integration-test.cjs',
+  'tools/client-smoke-test.cjs',
+  'tools/emergency-disable.cjs',
+  'tools/install.cjs',
+  'tools/repair.cjs',
+  'tools/lib-dsh-home.cjs',
+  'tools/lib-atomic-write.cjs',
+  'tools/session-probe.cjs',
+  'tools/history-audit.cjs',
+  'tools/asar-probe.cjs',
+];
 
 const problems = [];
 const notes = [];
@@ -50,6 +108,43 @@ const notes = [];
 if (!fs.existsSync(profileDir)) {
   console.error(`[repair] profile 目录不存在：${profileDir}`);
   process.exit(2);
+}
+
+// 1.5) --revert：回收本插件写进 profile 的托管块（2026-10-04 审查 P1-5）。
+//      为什么必须有这条路：--apply 会写「关闭官方 tool-agent-team 行 + agent-team 容量覆盖」，
+//      而官方 bundle 用 insert 新建那三行——一旦本插件被卸载/应急禁用，托管块留在 profile 里
+//      继续生效，官方九个团队工具就在**所有 preset** 里永久静默消失，用户没有任何对称的回收入口。
+//      revert 只干「删托管块」这一件事然后就结束：bundles/依赖/文件清单那些检查在卸载语境下
+//      没有意义（bundles 里没有本包恰是预期结果）。
+//      没有哨兵块时是幂等空操作（exit 0），所以 install --uninstall 可以无条件串跑它。
+if (revert) {
+  if (!fs.existsSync(PROFILE_PATCH)) {
+    console.log('- profile patch 不存在：无需回收');
+    process.exit(0);
+  }
+  const patchText = fs.readFileSync(PROFILE_PATCH, 'utf8');
+  const start = patchText.indexOf(MANAGED_START);
+  const end = patchText.indexOf(MANAGED_END);
+  if (start < 0 || end <= start) {
+    console.log('- 未发现 dispatch-agent-team 托管块：无需回收（官方工具行未被本插件关过，或已回收/手工处理）');
+    process.exit(0);
+  }
+  // 删哨兵包住的整段；块前/块后各自折叠多余空行，不碰别的行。
+  // （哨兵外若还留着 2026-09-28 之前旧版写入的裸注释头，那是 YAML 注释、无害，不越权删。）
+  const head = patchText.slice(0, start).replace(/(?:\n[ \t]*)+$/u, '\n');
+  const tail = patchText.slice(end + MANAGED_END.length).replace(/^(?:\n[ \t]*)+/u, '\n');
+  const next = `${head}${tail}`;
+  const backup = `${PROFILE_PATCH}.bak-${Date.now()}-pre-dispatch-team-revert`;
+  try {
+    fs.copyFileSync(PROFILE_PATCH, backup);
+    writeAtomic(PROFILE_PATCH, next);
+  } catch (error) {
+    console.error(`[repair] 回收失败（已保留原文件，备份在 ${backup}）：${error.message}`);
+    process.exit(1);
+  }
+  console.log(`- 已回收 profile 层托管块（关官方 tool-agent-team 行 + agent-team 容量覆盖），备份：${path.basename(backup)}`);
+  console.log('  重启 DSH 后，官方 Agent Teams 的九个团队工具在所有 preset 里恢复。');
+  process.exit(0);
 }
 
 // 2) 本包是否已装进 profile 的 node_modules（pnpm 安装产物）
@@ -83,7 +178,24 @@ if (installed) {
   try {
     const realInstalled = fs.realpathSync(path.join(installedDir, 'package.json'));
     const realSource = fs.realpathSync(path.join(pluginDir, 'package.json'));
-    console.log(`- 安装方式是同一份文件：${realInstalled === realSource ? '是（link/junction）' : `否（profile=${realInstalled}）`}`);
+    const sameFile = realInstalled === realSource;
+    console.log(`- 安装方式是同一份文件：${sameFile ? '是（link/junction）' : `否（profile=${realInstalled}）`}`);
+    if (!sameFile) {
+      // 这是「改源码不会生效」的实锤（2026-10-04 审查 P1-3：宿主跑的是安装副本，
+      // 源码目录的修改停在原地）。只打印路径太容易被无视，所以把**具体哪几个模块更新**列出来，
+      // 并直接升为问题项（不是提示），逼着用户去重跑 install。
+      const drifted = [];
+      for (const relative of ['lib/index.js', 'lib/preset.js', 'lib/runtime.js', 'lib/tools.js', 'lib/roster.js', 'lib/playbook.js', 'lib/cache.js', 'lib/resume.js', 'lib/client.js']) {
+        try {
+          const a = fs.statSync(path.join(pluginDir, relative)).mtimeMs;
+          const b = fs.statSync(path.join(realInstalled, '..', relative)).mtimeMs;
+          if (Math.abs(a - b) > 1000) drifted.push(`${relative}（源码 ${new Date(a).toISOString()} vs 已装 ${new Date(b).toISOString()}）`);
+        } catch { /* 副本里没这个文件：由下面的文件清单检查报，别在这里重复 */ }
+      }
+      problems.push(`profile 链接的不是这份源码目录，**源码里的修改不会生效**。已装：${realInstalled}`
+        + (drifted.length > 0 ? `；两边不同步的文件：${drifted.join('、')}` : '')
+        + '。修法：完全退出 DSH，在**源码目录**跑 node tools/install.cjs（pnpm 会把 link: 指到你运行命令的那个目录），再跑本脚本确认这一条变成「是」。');
+    }
   } catch { /* realpath 失败不影响体检结论 */ }
 }
 
@@ -113,7 +225,7 @@ if (!Array.isArray(bundles)) {
       const backup = `${profilePkgPath}.bak-${Date.now()}-pre-dispatch-team-repair`;
       fs.copyFileSync(profilePkgPath, backup);
       bundles.push(PACKAGE_NAME);
-      fs.writeFileSync(profilePkgPath, `${JSON.stringify(profilePkg, null, 2)}\n`, 'utf8');
+      writeAtomic(profilePkgPath, `${JSON.stringify(profilePkg, null, 2)}\n`);
       console.log(`  → 已追加并备份到 ${path.basename(backup)}`);
       problems.pop();
     }
@@ -130,17 +242,7 @@ if (!Array.isArray(bundles)) {
 //   (1) `tool-agent-team` 必须 **disabled**；
 //   (2) `agent-team` 的容量必须放大。
 // 两件事都必须写在这一层，理由见文件头与 README §8.6/§8.7。
-const PROFILE_PATCH = path.join(profileDir, 'cordis.patch.yml');
-/** 与 cordis.patch.yml 里的值必须一致（drift-check 也校验这两份相等）。 */
-const AGENT_TEAM_CONFIG = {
-  maxMembers: 48,
-  maxTasks: 512,
-  maxPendingMessagesPerMember: 64,
-  maxMessageBytes: 65536,
-  disposalTimeoutMs: 5000,
-};
-const MANAGED_START = '# ── dispatch-agent-team:managed:start（由 tools/repair.cjs 维护，勿手改）──';
-const MANAGED_END = '# ── dispatch-agent-team:managed:end ──';
+// （PROFILE_PATCH / AGENT_TEAM_CONFIG / MANAGED_START / MANAGED_END 定义在文件上方，revert 分支共用。）
 const MANAGED_BLOCK = [
   MANAGED_START,
   '# 为什么这两条必须写在这一层：bundle 的 patch 按 dsh.profile.bundles 顺序应用，官方',
@@ -199,7 +301,7 @@ if (!fs.existsSync(PROFILE_PATCH)) {
       } else {
         next = `${patchText.replace(/\s*$/u, '')}\n\n${MANAGED_BLOCK}\n`;
       }
-      fs.writeFileSync(PROFILE_PATCH, next, 'utf8');
+      writeAtomic(PROFILE_PATCH, next);
       // 写完立刻自检：解析一遍，确认块尾没有把下一行粘进注释里。
       const reparsed = next.split('\n').some((line) => line.includes(MANAGED_END) && line.trim() !== MANAGED_END);
       console.log(reparsed
@@ -211,6 +313,21 @@ if (!fs.existsSync(PROFILE_PATCH)) {
     }
   }
 }
+
+// 4.9) pnpm 安装残留：profile 的 node_modules/@zws 下若有 *_tmp_* 目录，说明上一次
+//      link/junction 重建没收尾（2026-10-04 审查 P2-18）。它占空间、看起来像另一份在用安装，
+//      但 repair 不擅自删目录 —— 只报出来让人确认。
+const zwsDir = path.join(profileDir, 'node_modules', '@zws');
+try {
+  if (fs.existsSync(zwsDir)) {
+    const leftovers = fs.readdirSync(zwsDir).filter((name) => /_tmp_\d+(_\d+)?$/u.test(name));
+    if (leftovers.length > 0) {
+      notes.push('profile 的 node_modules/@zws 下有安装残留目录：' + leftovers.join(', ')
+        + '。确认不是另一份在用安装后可删除（只删 *_tmp_* 结尾的）：Remove-Item -Recurse -Force '
+        + path.join(zwsDir, leftovers[0]));
+    }
+  }
+} catch { /* 读不了目录不该影响体检其余部分 */ }
 
 // 5) 崩溃恢复痕迹
 const backups = fs.existsSync(profileDir)
@@ -298,36 +415,65 @@ if (junctionOk) {
     const resolved = req.resolve('@deepseek-ai/dsh-tools');
     console.log(`- @deepseek-ai/dsh-tools 解析到：${resolved}`);
   } catch (error) {
-    problems.push(`依赖仍不可解析（${error.code || error.message}）：host 行会在 import 阶段失败`);
+    // junction 在、目标闭包却是空的（2026-10-04 本机现状：npm 全局 CLI 目录被清空）。
+    // 光报「不可解析」用户不知道下一步做什么，所以把整条链摸一遍再给针对性修法（P1-4③）。
+    let chain = `依赖仍不可解析（${error.code || error.message}）：host 行会在 import 阶段失败`;
+    try {
+      const viaJunction = path.resolve(fs.realpathSync(junctionPath));
+      const toolsDir = path.join(viaJunction, '@deepseek-ai', 'dsh-tools');
+      if (!fs.existsSync(path.join(toolsDir, 'package.json'))) {
+        let targetState = '不存在';
+        try {
+          const inner = fs.readlinkSync(toolsDir);
+          targetState = `junction -> ${inner}${fs.existsSync(inner) ? '（目标存在？）' : '（**目标不存在**）'}`;
+        } catch { /* 不是 link 或根本不存在 */ }
+        chain += `。链路上断点在 profiles/node_modules：${toolsDir} ${targetState}。`
+          + ' 修法：重装全局 CLI —— npm i -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com，'
+          + ' 然后重跑 node tools/repair.cjs（宿主本体不受影响：它从 app.asar 解析裸包名）。';
+      } else {
+        chain += '。profiles/node_modules 里那份在，但从本包解析不到：检查 junction 指向与 --profile 是否同一个 DSH 主目录。';
+      }
+    } catch {
+      chain += '。修法：npm i -g @deepseek-ai/dsh 后重跑本脚本。';
+    }
+    problems.push(chain);
   }
 }
 
 // 7) 本包自检：**每一个会被 loader 加载的模块**都要在清单里。
 //    旧清单只有 6 个文件，漏了 runtime/tools/roster/playbook 与 locale/en.json ——
 //    缺了核心模块它照样打印「状态完好」，等于一条假绿灯。
-for (const relative of [
-  'package.json',
-  'cordis.patch.yml',
-  'presets/dispatch-mode.patch.yml',
-  'icon.svg',
-  'locale/zh.json',
-  'locale/en.json',
-  'lib/index.js',
-  'lib/preset.js',
-  'lib/runtime.js',
-  'lib/tools.js',
-  'lib/roster.js',
-  'lib/playbook.js',
-  'lib/client.js',
-  'tools/drift-check.cjs',
-  'tools/selftest.cjs',
-  'tools/integration-test.cjs',
-  'tools/client-smoke-test.cjs',
-  'tools/emergency-disable.cjs',
-]) {
+//    清单常量 PACKAGE_FILES 定义在文件上方；源码目录与**已安装副本**都要查
+//    （宿主加载的是后者，只查前者就是子代理复审点出的假绿灯）。
+let manifestMissing = 0;
+for (const relative of PACKAGE_FILES) {
   const file = path.join(pluginDir, relative);
-  if (!fs.existsSync(file)) problems.push(`本包缺文件：${relative}`);
+  if (!fs.existsSync(file)) {
+    problems.push(`本包缺文件：${relative}`);
+    manifestMissing += 1;
+  }
 }
+// 已安装副本（宿主真正加载的那一份）查同一张清单：非 link 安装时它是一份独立拷贝，
+// 缺文件同样会崩 host 行，只查源码树就是假绿灯（2026-10-04 子代理复审 P1-3）。
+if (installed && fs.existsSync(installedDir)) {
+  let realInstalledDir = installedDir;
+  try {
+    realInstalledDir = path.dirname(fs.realpathSync(path.join(installedDir, 'package.json')));
+  } catch { /* realpath 失败就用原路径 */ }
+  try {
+    if (fs.realpathSync(realInstalledDir) !== fs.realpathSync(pluginDir)) {
+      const missingThere = PACKAGE_FILES.filter((relative) => !fs.existsSync(path.join(realInstalledDir, relative)));
+      if (missingThere.length > 0) {
+        problems.push(`已安装副本缺文件：${missingThere.join('、')}（${realInstalledDir}）。修法：完全退出 DSH 后在源码目录重跑 node tools/install.cjs。`);
+      } else {
+        console.log(`- 已安装副本文件清单：齐备（${realInstalledDir}）`);
+      }
+    } else {
+      console.log('- 已安装副本与源码是同一目录：清单已按源码检查');
+    }
+  } catch { /* 副本路径不可解析：上面的存在性检查已经报过了 */ }
+}
+if (manifestMissing === 0) console.log('- 源码文件清单：齐备');
 console.log('');
 
 // ── 结论 ─────────────────────────────────────────────────────────────────────
