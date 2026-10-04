@@ -28,3 +28,5 @@ desktop.ini
 # 审查历史（含本机真实路径/用户名，不进仓库；只在你本机查阅）
 REVIEW-*.md
 /docs/reviews/
+# NVIDIA 驱动日志残留（进程 cwd 落在本目录时会自动生成）
+/NVIDIA Corporation/
