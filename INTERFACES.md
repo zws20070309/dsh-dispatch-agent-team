@@ -9,7 +9,7 @@
 本文件由 Lead 冻结。**不要修改本文件，也不要修改已存在的 `lib/roster.js` / `lib/playbook.js` /
 `package.json` / `cordis.patch.yml` / `presets/*.yml`**。需要接口变更时向 `lead` 发消息。
 
-## 0.1 勘误表（2026-09-28 起；41 条，全部有 `file:line` 依据）
+## 0.1 勘误表（2026-09-28 起；42 条，全部有 `file:line` 依据）
 
 | # | 本文档原文位置 | 现在的真相 |
 |---|---|---|
@@ -54,6 +54,7 @@
 | 39 | §7.5（插件往会话日志写自定义事件） | **仓库外事件必须带 `ignorable` 标记**才会被持久化读路径解释：`dsh-session/lib/types/known-event-types.js:7-20` 原话「Downstream (out-of-repo) plugin events are outside this list by construction… The persisted `SessionEvent.ignorable` marker is the compatibility mechanism；event-name registration was rejected」。本插件因此**不**往会话日志写自定义事件：「哪个会话开着团队」存在插件自己的小文件 `<DSH 主目录>/dispatch-agent-team-sessions.json`（`lib/resume.js`：TTL 7 天 / 上限 200 条 / 原子写 / 读写失败只记诊断），用户显式关团时立刻删除该条记录 |
 | 40 | §5（给 agent 投递消息的三种语义） | **`agent.send(message, target, wakeup)` 的三个目标不是一回事**（`dsh-agent-loop/lib/index.js:800-814`）：`followup(input)` = `send(input, 'next-turn', true)`、`steer(input)` = `send(input, 'next-step', true)`、`inject(input)` = `send(input, 'next-step', false)`。**`next-turn` 那一条会显示在用户界面上**：客户端 `QueueDock` 从 Session 的 `inbox` 投影**读取 `next-turn`**（`dsh-client-ui-conversation/README.zh.md` 原话），用户在输入框上方看到排队行、还要点「插入/插话」——2026-10-01 18:26 我们注入的「团队已开启」就是这么跑到用户输入框里的（用户原话：「不要突然排队一句话行不？」）。**判据**：只有**用户自己打的字**才允许走 `followup`（本插件只有 `/team` 的注入）；插件想让模型知道的状态一律放进**工具返回值**，要打断当前轮用 `steer`。另：系统提示词与工具目录**每个 step 重新组装**（`:907` 的 preStep → `systemPrompt.assemble()`，`:1063` 的 `buildRequest(…, assembly.tools, …)`），所以「开团后必须注入一句提醒」这个前提本身是错的。drift-check 有闸门钉住这三条 |
 | 41 | §4（队员的模型/强度覆盖） | **队员模型覆盖的优先级**（2026-10-01 修正）：只有 `spawn_teammate` 的**显式参数**（`provider`+`model` / `reasoning_effort`）才允许被钉住（`lib/runtime.js` 的 `spawnRoutes` 与 `spawnEfforts` 两个账本，agent 销毁时清空）；**角色配置必须每次请求实时读**（`resolveRoleRoute(peekConfig(), role)`），合成用纯函数 `resolveMemberRoute(explicit, roleRoute, explicitEffort)`（`lib/roster.js`），返回 `undefined` = 不覆盖 = 跟随 Lead。旧写法把**角色配置解析出来的路由**也钉进 `spawnRoutes`，于是「跟随 Lead」/改配置对**已经在跑的队员**永远不生效（用户 2026-10-01 报的：面板改回「跟随 Lead」后队员仍跑 spawn 时刻的旧模型）。对照事实：官方 `spawn` provider 让子代理**每请求**跟随父代理当前选择（用户日志里 `red-team` 在 Lead 换模型后 2 分钟内跟着换），所以「不覆盖」就是正确的「跟随 Lead」；而 `spawn_teammate` 显式给的路由仍必须真的生效，否则返回值里的 `route` 是假的 |
+| 42 | §0.1 / §7.5（**本轮审查新增的官方事实，全部从 0.2.0-rc.2 的 `app.asar` 复核**） | ① **`ReactLoopAgent` 实例上没有 `name` 字段**（`dsh-agent-loop/lib/index.js:747-789` 的构造只赋 `id`/`session`/`options`/`ctx`）：任何「从 agent 拿名字」的写法都会拿到 `undefined`，队员名只能从 `ctx.agentTeams.tryMembership(agent)` 取——它返回 `{role, name, id, root}`（`dsh-experimental-agent-team/lib/index.js:405-410`）。本插件唯一踩这个坑的是 `report_result` 的报告头（已改为从 membership 取，`lib/tools.js` 的 `callerName`）；派活署名那条**不是缺陷**——`installMember` 一直用的就是 `membership.name`（`lib/runtime.js:1045-1053`），审查时被否证的子代理结论不再照抄。 ② `session/event` 是**不按 agent 过滤的全局广播**（`dsh-scope/lib/invariant.js:26` 把它标为 `null`），官方 agent-team 自己就监听它（`:1720-1722`），所以插件可以合法地用它记账：`turn/end` 的 `reason.kind === 'max-tokens'`（`:1151` 产生、`:979` 聚合、`:1027-1030` 落事件）现已驱动 §2.6 的截断标志。 ③ `agentPresets.compositionInventory()` 在**任何 await 之前**同步快照各 preset 的定义（`dsh-agent-preset-registry/lib/index.js:793`），所以状态文件里 preset 行内容的「准」只取决于快照时刻——本插件改为 boot/settled 两阶段写 + `ctx.loader.await()` 事件时机（官方先例：`dsh-app-boot/lib/index.js:3489`、`:4084`）。 ④ `ask_user_question` 对委派调用者是**硬拒**：`dsh-user-questions/lib/index.js:531-535` 的 `assertLiveRoot` 抛 `DELEGATED_CALLER`，但弹窗已在宿主全局排队；因此它进了 `TEAMMATE_TOOL_DENY`。 ⑤ `mountPreset` 只在 preset 的 `activate()` 里调一次（`:262`、`:534`），`agent/bind`/`session/join` **不会**重放它——「preset 子树每会话跑一次」是错的，实测口径见 README §6.1。 |
 
 
 **验证为对、可以继续依据的条目**（本次逐条复核过）：§7.5 的 `agent/request` payload 形状与
@@ -101,6 +102,20 @@ export const LEAD_ONLY_TEAM_TOOL_NAMES;   // ['spawn_teammate','interrupt_agent'
 export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减去上面两个，再加队员专用的 report_result 与 ask_lead
 export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
+// 以下 4 个是 2026-09-30 起的既有导出（工具名与 Lead 名单的真值都在这里）：
+export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
+export const REPORT_TOOL_NAME;            // 'report_result'（队员专用）
+export const LEAD_TEAM_TOOL_NAMES;        // Lead 的安装名单（官方九个 + 本插件为 Lead 加的两个）
+export const OFFICIAL_TEAM_POLICY_SECTION;// 官方 team:policy 段名（preset 作用域遮蔽它）
+// ⚠️ 以下 5 个为 2026-10-04 新增（§8 三条建议落地）：
+export const BROADCAST_TOOL_NAME;         // 'broadcast_message'（Lead 专属）
+export const ASK_LEAD_TOOL_NAME;          // 'ask_lead'（队员专用）
+export const TRUNCATED_DIAGNOSTIC;        // 截断标志的固定文案（进成员行 diagnostics）
+export function planBroadcastTargets(members, {targets?, includeInactive?, callerName?});
+                                    // -> {targets[], skipped[{target,reason}]}；纯函数，selftest 直测
+export function annotateTruncatedMembers(rows, truncatedIds);
+                                    // -> 新数组；被记账户里的队员行追加 TRUNCATED_DIAGNOSTIC，不改入参
+export function askLeadMessage(question, blocking);  // -> 投递给 lead 的正文（含固定前缀）
 export function deriveRole(name);   // 'verify-2' -> 'verify'; 非法 -> undefined
 export function isValidTeammateName(name);
 export function nextTeammateName(role, taken);
