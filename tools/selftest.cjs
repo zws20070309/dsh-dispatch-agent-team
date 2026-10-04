@@ -369,6 +369,13 @@ function functionBodyOf(source, needle) {
     const leadRow = new RegExp(leadRowPattern).exec(doc);
     assert.ok(leadRow !== null, '预算表里找不到 Lead 侧合计那一行');
     assert.equal(Number(leadRow[2]), playbook.PLAYBOOK.length + playbook.TEAM_POLICY.length, 'README 的 Lead 侧合计与实测不符');
+    // 队员侧合计也要对账（2026-10-04）：它 = 共享卡 + 该角色的简报。各角色简报长度不同，
+    // 表里写的是**代表性样本**（scout），所以按这一口径核；超预算则直接 FAIL。
+    const mateRow = new RegExp('\\| 队员侧合计（卡 \\+ 角色简报） \\| ≤ (\\d+) \\| \\*\\*(\\d+)\\*\\*').exec(doc);
+    assert.ok(mateRow !== null, '预算表里找不到队员侧合计那一行');
+    const mateMeasured = playbook.TEAMMATE_CARD.length + playbook.teammateBrief('scout', 'scout').length;
+    assert.equal(Number(mateRow[2]), mateMeasured, 'README 的队员侧合计与实测不符（卡 + scout 简报）');
+    assert.ok(mateMeasured <= Number(mateRow[1]), '队员侧合计 ' + mateMeasured + ' 超过预算 ' + mateRow[1]);
   });
 
   await check('每个已注册团队工具都在**对应角色**的提示词里被提到（防装了没人用）', () => {
