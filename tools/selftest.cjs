@@ -349,6 +349,28 @@ function functionBodyOf(source, needle) {
     assert.ok(!unknown.includes('## 你的使命'), '未知角色不该凭空编出使命');
   });
 
+  await check('lib/playbook.js 结构完整：三个常量都在、teammateBrief 在、模板字符串闭合', () => {
+    // 动机（2026-10-04 事故）：一次「压缩」用字符串替换误伤了 TEAMMATE_CARD，注入 `= ` 前缀
+    // 并删掉整个 teammateBrief，导致模块语法崩（selftest/integration 双双 Invalid token）。
+    // 这条闸门直接认结构不认文本，任何替换事故都会当场红。
+    const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'playbook.js'), 'utf8');
+    for (const name of ['PLAYBOOK', 'TEAM_POLICY', 'TEAMMATE_CARD']) {
+      assert.ok(new RegExp('^export const ' + name + ' = `', 'm').test(source), `playbook.js 少了 ${name} 的定义`);
+    }
+    assert.ok(/^export function teammateBrief\(/m.test(source), 'playbook.js 少了 teammateBrief 定义（角色差异唯一载体）');
+    assert.ok(/^export function wakeInstruction\(/m.test(source), 'playbook.js 少了 wakeInstruction 定义');
+    // 模板字符串闭合：每个 `export const X = ` 之后必须能找到同级的 `` `; ``。
+    for (const match of source.matchAll(/^export const (\w+) = `([\s\S]*?)^`;/gm)) {
+      assert.ok(match[2].length > 100, `${match[1]} 的正文只有 ${match[2].length} 字，像是被替换打断了`);
+    }
+    // 反引号必须成对（把转义 \` 排除后计数）。
+    const raw = source.split('\\`').join('');
+    assert.equal((raw.match(/`/g) || []).length % 2, 0, '反引号不成对——模板字符串没闭合');
+    // 导出的常量长度必须与运行时值一致（防止「定义被截断但语法仍合法」）。
+    assert.equal(playbook.PLAYBOOK.length >= 3000, true, `PLAYBOOK 实测只有 ${playbook.PLAYBOOK.length} 字`);
+    assert.equal(playbook.TEAM_POLICY.length >= 300, true, `TEAM_POLICY 实测只有 ${playbook.TEAM_POLICY.length} 字`);
+    assert.equal(playbook.TEAMMATE_CARD.length >= 800, true, `TEAMMATE_CARD 实测只有 ${playbook.TEAMMATE_CARD.length} 字`);
+  });
   // ── 提示词卫生（2026-09-30 用户要求：干净、有条理、简洁而作用大）────────────────
   await check('README 提示词预算表的「当前」列 == 实测长度（防手抄漂移）', () => {
     const doc = readFileSync(path.join(PLUGIN_DIR, 'README.md'), 'utf8');
