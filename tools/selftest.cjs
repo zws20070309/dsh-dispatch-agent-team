@@ -4,9 +4,11 @@
  *
  * 覆盖 `lib/roster.js` 与 `lib/playbook.js` 的导出与不变量。这两份模块不 import 任何 dsh 包，
  * 所以可以在插件源码目录直接用 node 跑（不需要安装期的 node_modules junction）。
- * 涉及 dsh 运行时的部分（runtime/tools/index/preset/client）不能在这里测：
- * `lib/tools.js` 静态 import `@deepseek-ai/dsh-tools`，`lib/runtime.js` 又 import 它，
- * 所以那几个模块由 tools/drift-check.cjs 做静态对齐、并在安装后做真链路验证。
+ * 除下面 report_result 那一组外都零依赖：`lib/tools.js` 静态 import `@deepseek-ai/dsh-tools`，
+ * 只有安装期的 node_modules junction 能解析到它。该组在依赖坏掉时**显式 SKIP 并以 exit 2 报出**
+ * （2026-10-04 审查 P1-4：以前这里直接崩掉整个自测，丢汇总还伪装成回归失败）。
+ * `lib/runtime.js` / index / preset / client 需要真宿主，不在这里测：
+ * 由 tools/drift-check.cjs 做静态对齐、tools/integration-test.cjs 做真链路验证。
  *
  * 本文件重点守住的三条不变量（都是「一破就悄悄烧钱/悄悄失效」的那种）：
  *   1. 队员卡与角色无关 → 所有队员的系统提示词逐字节相同（提示词缓存前缀才可共用）；
@@ -15,7 +17,7 @@
  *
  *   node tools/selftest.cjs
  *
- * 退出码：0 = 全通过；1 = 有失败。
+ * 退出码：0 = 全通过；1 = 有断言失败；2 = 断言全过但环境不满足（有检查组被 SKIP）。
  */
 
 'use strict';
@@ -29,6 +31,8 @@ const LIB = path.join(__dirname, '..', 'lib');
 const PLUGIN_DIR = path.join(__dirname, '..');
 let passed = 0;
 const failures = [];
+/** 环境不满足而未执行的检查组数（junction 悬空等）。非 0 时退出码用 2，与「真实回归失败」的 1 区分开。 */
+let envSkipped = 0;
 
 async function check(name, fn) {
   try {
@@ -44,6 +48,21 @@ async function check(name, fn) {
 
 const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
 
+/**
+ * 切出一个顶层函数的函数体（从 needle 到下一个行首 `\n}`）。
+ * 与 tools/drift-check.cjs 的同名实现同法：源码扫描型断言必须限定在目标函数内，
+ * 否则 `slice(start)` 扫到文件尾会把后面的无关函数一起纳入判断（2026-10-04 审查 P2-27）。
+ * @param source - 文件全文。
+ * @param needle - 函数声明的锚点文本。
+ * @returns 函数体文本；找不到 needle 时返回空串。
+ */
+function functionBodyOf(source, needle) {
+  const start = source.indexOf(needle);
+  if (start < 0) return '';
+  const end = source.indexOf('\n}\n', start);
+  return end < 0 ? source.slice(start) : source.slice(start, end);
+}
+
 (async () => {
   const roster = await load('roster.js');
   const playbook = await load('playbook.js');
@@ -56,6 +75,18 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
     // 复制出来的那份在扩编时只会各飘各的（本文件的旧版本就是这么坏的）。
     // 这里断言的是**结构不变量**，以及「PLAYBOOK 的角色表 = ROLES」这条跨文件一致性（见下面）。
     assert.ok(roster.ROLES.length >= 7, `角色数 ${roster.ROLES.length} 少于 7`);
+    // 上面那条款只是兜底「别缩太多」；真正的防漂移是**跨文件对账**：插件页文案里写死的
+    // 「N 类队员」必须等于 ROLES.length（2026-10-04 审查 P2-27：旧下限 7 与真实 12 差了 5，
+    // 缩编到 8-11 都不会报警）。断言从文案里**读出**数字，而不是在这里再抄一份真值。
+    const localeZh = JSON.parse(readFileSync(path.join(PLUGIN_DIR, 'locale', 'zh.json'), 'utf8'));
+    const claimed = /为\s*(\d+)\s*类队员/u.exec(String(localeZh?.meta?.description ?? ''));
+    assert.ok(claimed !== null, 'locale/zh.json 的描述里找不到「N 类队员」这句数量声明');
+    assert.equal(Number(claimed[1]), roster.ROLES.length, `locale 写的队员类数(${claimed[1]})与 ROLES.length(${roster.ROLES.length})不一致`);
+    // 英文文案同一真值同一条断言（两份 locale 各写一次数字，正是最容易各飘各的地方）。
+    const localeEn = JSON.parse(readFileSync(path.join(PLUGIN_DIR, 'locale', 'en.json'), 'utf8'));
+    const claimedEn = /(\d+)\s+teammate roles/u.exec(String(localeEn?.meta?.description ?? ''));
+    assert.ok(claimedEn !== null, 'locale/en.json 的描述里找不到 "N teammate roles" 这句数量声明');
+    assert.equal(Number(claimedEn[1]), roster.ROLES.length, `en.json 写的角色数(${claimedEn[1]})与 ROLES.length(${roster.ROLES.length})不一致`);
     assert.equal(roster.ROLE_IDS.length, roster.ROLES.length);
     assert.equal(new Set(roster.ROLE_IDS).size, roster.ROLES.length, '角色 id 有重复');
     assert.deepEqual(Object.keys(roster.ROLE_BY_ID), roster.ROLE_IDS, 'ROLE_BY_ID 与 ROLE_IDS 不一致');
@@ -81,10 +112,14 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
     assert.equal(teamTools.size, roster.TEAM_TOOL_NAMES.length, 'TEAM_TOOL_NAMES 有重复');
     assert.equal(memberTools.size, roster.MEMBER_TEAM_TOOL_NAMES.length, 'MEMBER_TEAM_TOOL_NAMES 有重复');
     for (const name of leadOnly) assert.ok(teamTools.has(name), `Lead 专属工具 ${name} 不在团队工具名单里`);
-    // 队员工具 = 九个官方团队工具 − Lead 专属 + 我们自己的队员专用工具（report_result 等）。
+    // 队员工具 = 九个官方团队工具 − Lead 专属 + 我们自己的队员专用工具。
     // 2026-09-30：report_result 是**队员专用**（Lead 不注册），所以它不在 TEAM_TOOL_NAMES 里。
+    // 2026-10-04：ask_lead 同为队员专用（审查 §8 建议 C）——Lead 没有汇报对象，也不该有。
+    // 这条断言**故意**钉死名单：加队员专用工具必须同时改这里 + lib/tools.js 的 memberOnly + 文档计数。
     const memberOnly = roster.MEMBER_TEAM_TOOL_NAMES.filter((name) => !teamTools.has(name));
-    assert.deepEqual(memberOnly, [roster.REPORT_TOOL_NAME], `队员专用工具名单变了：${memberOnly.join(', ')}`);
+    assert.deepEqual(memberOnly, [roster.REPORT_TOOL_NAME, roster.ASK_LEAD_TOOL_NAME], `队员专用工具名单变了：${memberOnly.join(', ')}`);
+    assert.ok(!roster.LEAD_TEAM_TOOL_NAMES.includes(roster.ASK_LEAD_TOOL_NAME), 'ask_lead 泄漏给了 Lead 名单');
+    assert.ok(!roster.TEAM_TOOL_NAMES.includes(roster.ASK_LEAD_TOOL_NAME), 'ask_lead 不该进官方镜子名单 TEAM_TOOL_NAMES');
     const expected = [...roster.TEAM_TOOL_NAMES.filter((name) => !leadOnly.has(name)), ...memberOnly];
     assert.deepEqual([...roster.MEMBER_TEAM_TOOL_NAMES], expected, '队员工具名单 ≠ 九个团队工具减去 Lead 专属，再加队员专用工具');
     // 队员**没有**再派子代理的权限：这是本次设计的硬要求，单独钉一条。
@@ -220,19 +255,28 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
   console.log('lib/playbook.js');
 
   await check('全部模型可见文本都不含双花括号（persona 会把它当变量严格插值）', () => {
-    assert.equal(PLAYBOOK_HAS_TEMPLATE_BRACES(playbook.PLAYBOOK), false, 'PLAYBOOK 里出现了 {{…}} 变量语法');
-    assert.equal(PLAYBOOK_HAS_TEMPLATE_BRACES(playbook.TEAM_POLICY), false, 'TEAM_POLICY 里出现了 {{…}} 变量语法');
-    assert.equal(PLAYBOOK_HAS_TEMPLATE_BRACES(playbook.TEAMMATE_CARD), false, 'TEAMMATE_CARD 里出现了 {{…}} 变量语法');
+    assert.equal(hasTemplateBraces(playbook.PLAYBOOK), false, 'PLAYBOOK 里出现了 {{…}} 变量语法');
+    assert.equal(hasTemplateBraces(playbook.TEAM_POLICY), false, 'TEAM_POLICY 里出现了 {{…}} 变量语法');
+    assert.equal(hasTemplateBraces(playbook.TEAMMATE_CARD), false, 'TEAMMATE_CARD 里出现了 {{…}} 变量语法');
     for (const roleId of roster.ROLE_IDS) {
-      assert.equal(PLAYBOOK_HAS_TEMPLATE_BRACES(playbook.teammateBrief(roleId, roleId)), false, `角色简报 ${roleId} 里出现了 {{…}} 变量语法`);
+      assert.equal(hasTemplateBraces(playbook.teammateBrief(roleId, roleId)), false, `角色简报 ${roleId} 里出现了 {{…}} 变量语法`);
     }
-    assert.equal(PLAYBOOK_HAS_TEMPLATE_BRACES(playbook.teamCommandLine('x')), false);
-    assert.equal(PLAYBOOK_HAS_TEMPLATE_BRACES(playbook.wakeInstruction('scout', '只做调研')), false);
+    assert.equal(hasTemplateBraces(playbook.teamCommandLine('x')), false);
+    assert.equal(hasTemplateBraces(playbook.wakeInstruction('scout', '只做调研')), false);
+  });
+
+  await check('模型可见文本零 emoji（用户硬要求；代码注释里的不算）', () => {
+    // 覆盖全部会注入模型的文本：三段提示词 + 每个角色的派活简报 + 唤醒文案 + 命令行。
+    // 修复前的现场：PLAYBOOK 曾命令 Lead 用 ❓/➡️ 排版（2026-10-04 审查 P1-2）。
+    for (const [label, text] of visibleModelTexts(playbook, roster)) {
+      const found = text.match(MODEL_TEXT_EMOJI);
+      assert.ok(found === null, label + ' 含 emoji：' + JSON.stringify([...new Set(found || [])]));
+    }
   });
 
   await check('PLAYBOOK 含分轮面试式提问的关键要素（设计树/前沿/分轮/格式/等答复/事实归 Lead）', () => {
     const text = playbook.PLAYBOOK;
-    for (const marker of ['设计树', '前沿', '❓', '➡️', '找事实是你的工作', '不要替用户拍板', '用户明确说', '共享理解']) {
+    for (const marker of ['设计树', '前沿', '推荐：', '找事实是你的工作', '不要替用户拍板', '用户明确说', '共享理解']) {
       assert.ok(text.includes(marker), `PLAYBOOK 缺少标记：${marker}`);
     }
     assert.ok(/Q1/u.test(text) && /Q2/u.test(text), 'PLAYBOOK 缺少 Q1/Q2 的排版示例');
@@ -306,9 +350,67 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
   });
 
   // ── 提示词卫生（2026-09-30 用户要求：干净、有条理、简洁而作用大）────────────────
+  await check('工具 description 与控制面回执文案零 emoji（模型可见，同一条硬要求）', () => {
+    // lib/tools.js 需要 @deepseek-ai/dsh-tools 才能加载，junction 坏时拿不到定义；
+    // 这里退化为**源码级**扫描：把所有 description: '...' 与控制面 diagnostics.push('...')
+    // 的字面量取出来判 emoji，不依赖模块能加载。
+    const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'tools.js'), 'utf8');
+    const literals = [...source.matchAll(/description: (['"])((?:\\.|(?!\1)[^\\\n])*)\1/gu)].map((match) => match[2]);
+    for (const match of source.matchAll(/diagnostics\.push\(['`"]([^'"`\n]*)['`"]/gu)) literals.push(match[1]);
+    assert.ok(literals.length >= 20, `只扫到 ${literals.length} 条文案字面量，正则漂了？`);
+    for (const text of literals) {
+      const found = text.match(MODEL_TEXT_EMOJI);
+      assert.ok(found === null, `工具文案含 emoji：${JSON.stringify([...new Set(found || [])])} <- ${text.slice(0, 60)}`);
+    }
+  });
+
+  await check('broadcast 目标规划：排除 lead、默认不唤醒 inactive、id 兼容、逐个理由可解释', () => {
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'running', diagnostics: [] },
+      { id: 'b-id', name: 'builder-2', role: 'teammate', status: 'inactive', diagnostics: [] },
+      { id: 'c-id', name: 'scout', role: 'teammate', status: 'provisioning', diagnostics: [] },
+    ];
+    // 默认：只打 running/provisioning，lead 永不进目标。
+    const auto = roster.planBroadcastTargets(rows, { callerName: 'lead' });
+    assert.deepEqual(auto.targets, ['builder', 'scout'], '默认应只覆盖 running/provisioning 队员');
+    assert.ok(auto.skipped.some((item) => item.target === 'builder-2' && item.reason.includes('includeInactive')), '被跳过的 inactive 队员必须带可操作的理由');
+    // includeInactive 才拉起停着的队员（那要额外开一次 turn）。
+    assert.deepEqual(roster.planBroadcastTargets(rows, { includeInactive: true }).targets, ['builder', 'builder-2', 'scout']);
+    // 显式目标：认名字也认 agent id；对不上的如实报原因（与插件既有的 agent_id 兼容策略一致）。
+    assert.deepEqual(roster.planBroadcastTargets(rows, { targets: ['b-id', 'ghost'], includeInactive: true }).targets, ['builder-2']);
+    const ghost = roster.planBroadcastTargets(rows, { targets: ['ghost'] });
+    assert.equal(ghost.skipped.length, 1, '不存在的目标要被报出来而不是静默丢掉');
+    // 去重与自我排除。
+    assert.deepEqual(roster.planBroadcastTargets(rows, { targets: ['builder', 'builder', 'lead'] }).targets, ['builder']);
+    assert.deepEqual(roster.planBroadcastTargets([], {}).targets, []);
+    assert.equal(roster.BROADCAST_TOOL_NAME, 'broadcast_message');
+    assert.ok(roster.LEAD_TEAM_TOOL_NAMES.includes(roster.BROADCAST_TOOL_NAME), 'broadcast 不在 Lead 名单里 = 装不上');
+    assert.ok(!roster.MEMBER_TEAM_TOOL_NAMES.includes(roster.BROADCAST_TOOL_NAME), 'broadcast 泄漏给了队员');
+    assert.ok(!roster.TEAM_TOOL_NAMES.includes(roster.BROADCAST_TOOL_NAME), '自造工具不许进官方镜子名单（drift-check 靠它对齐官方）');
+  });
+
+  await check('截断标志：只标注被记账户里的队员，且不改入参（缓存前缀纪律）', () => {
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: ['boom'] },
+      { id: 'b-id', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    const marked = roster.annotateTruncatedMembers(rows, new Set(['a-id']));
+    assert.equal(marked[1].diagnostics.length, 2, '标志要追加，不能吞掉官方已有的 diagnostics');
+    assert.ok(marked[1].diagnostics.includes(roster.TRUNCATED_DIAGNOSTIC));
+    assert.equal(marked[2].diagnostics.length, 0, '没被记账的队员不许被标注');
+    assert.equal(marked[0], rows[0], '未受影响的行必须原样复用（不产生新对象）');
+    assert.deepEqual(rows[1].diagnostics, ['boom'], '入参必须不被修改（该数组同时是 Lead 请求前缀的一部分）');
+    // 幂等：重复标注不加第二份。
+    assert.equal(roster.annotateTruncatedMembers(marked, new Set(['a-id']))[1].diagnostics.length, 2);
+    // 空账本 = 原样返回（Lead 的团队没出截断时零副作用）。
+    assert.equal(roster.annotateTruncatedMembers(rows, []).length, rows.length);
+    assert.ok(roster.TRUNCATED_DIAGNOSTIC.includes('wake_teammate'), '标志文案要直接给出下一步动作');
+  });
   await check('提示词预算：系统提示词前缀不许膨胀（每多一个字，每次请求都多付一次钱）', () => {
     const budget = {
-      PLAYBOOK: 4100,        // 调度模式方法论（Lead 与所有请求的前缀）
+      PLAYBOOK: 3900,        // 调度模式方法论（Lead 与所有请求的前缀）。2026-10-04 从 4100 收到 3900：只防「超预算」不防「贴边」，留余量给以后新增的纪律
       TEAM_POLICY: 800,      // 团队运行期事实（开后才有）
       TEAMMATE_CARD: 1150,   // 队员卡（每个队员的固定前缀）
     };
@@ -355,7 +457,10 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
     assert.equal(playbook.DISABLE_INSTRUCTION, undefined, 'DISABLE_INSTRUCTION 必须保持删除（同上）');
     // wake_teammate 的正文：必须说清「从断点续、不重头再来」，并且带上 Lead 的补充要求。
     const woke = playbook.wakeInstruction('scout', '只补 §3');
-    assert.ok(woke.includes('输出上限'), '续写指令要说明为什么被叫醒');
+    // 「为什么停下」必须由队员自己判断：文案可以把输出上限列为候选原因，但不许把它写成既成事实
+    // （2026-10-04 审查 P2-11：旧文案「你上一条回答被模型输出上限截断」会在其它停因下误导队员重做）。
+    assert.ok(woke.includes('为什么停下'), '续写指令要把归因交回队员');
+    assert.ok(!woke.includes('被模型**输出上限**截断'), '不许把输出上限写成既成事实');
     assert.ok(woke.includes('不要重头再来'), '续写指令必须禁止重做');
     assert.ok(woke.includes('report_result'), '续写指令必须要求照常交付');
     assert.ok(woke.includes('scout') && woke.includes('只补 §3'), '续写指令要带队员名与 Lead 的补充要求');
@@ -370,9 +475,7 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
     // 源码级判据：`controlToolDefinitions` 里不许出现 followup / inject( / pushInstruction 这类调用，
     // 否则又会往 next-turn 收件箱写东西 → 用户输入框上方多一条排队消息（用户 2026-10-01 明确要求不要）。
     const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'tools.js'), 'utf8');
-    const start = source.indexOf('export function controlToolDefinitions');
-    assert.ok(start >= 0, '找不到 controlToolDefinitions');
-    const body = source.slice(start);
+    const body = functionBodyOf(source, 'export function controlToolDefinitions');
     for (const needle of ['pushInstruction(', '.followup(', '.send(']) {
       assert.ok(!body.includes(needle), `controlToolDefinitions 里又出现了 ${needle}（会把消息排进用户输入框）`);
     }
@@ -499,9 +602,24 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
   console.log('');
   console.log('lib/tools.js（report_result 的形状校验）');
 
-  const tools = await load('tools.js');
+  // lib/tools.js 静态 import @deepseek-ai/dsh-tools，只有安装期的 node_modules junction 能解析到它。
+  // 那份闭包坏掉时（2026-10-04 实测：全局 CLI 目录被清空 → junction 全部悬空），
+  // 旧写法会把整个 selftest 崩掉：既丢汇总，又让「环境坏了」看起来像「代码回归了」。
+  // 现在显式 SKIP 这两组并以 exit 2 报出环境问题。
+  let tools;
+  try {
+    tools = await load('tools.js');
+  } catch (error) {
+    if (error && error.code === 'ERR_MODULE_NOT_FOUND') {
+      envSkipped += 2;
+      console.log('  SKIP  lib/tools.js 无法加载：' + String(error.message ?? error).split('\n')[0]);
+      console.log('        → 依赖闭包不可解析（junction 悬空？）。修法：npm i -g @deepseek-ai/dsh，再跑 node tools/repair.cjs --apply。');
+    } else {
+      throw error;
+    }
+  }
 
-  await check('report_result：completed 必须带证据，未决项/长度上限被强制', () => {
+  if (tools !== undefined) await check('report_result：completed 必须带证据，未决项/长度上限被强制', () => {
     assert.throws(() => tools.validateReport({ status: 'completed', summary: '做完了' }), /evidence/u);
     assert.throws(() => tools.validateReport({ status: 'nope', summary: 'x' }), /status/u);
     assert.throws(() => tools.validateReport({ status: 'blocked', summary: '' }), /summary/u);
@@ -522,7 +640,7 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
     assert.match(tools.validateReport({ status: 'blocked', summary: 'x' }).acceptance, /未验证/u);
   });
 
-  await check('formatReport：把状态/未决项渲染成 Lead 一眼能判的文本', () => {
+  if (tools !== undefined) await check('formatReport：把状态/未决项渲染成 Lead 一眼能判的文本', () => {
     const text = tools.formatReport('builder', tools.validateReport({
       status: 'blocked',
       summary: '缺依赖',
@@ -536,11 +654,18 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
 
   console.log('');
   console.log(`${passed}/${passed + failures.length} 通过。`);
+  if (envSkipped > 0) console.log(`（另有 ${envSkipped} 组因环境不满足未执行）`);
   if (failures.length > 0) {
     console.log('');
     console.log('失败项：');
     for (const failure of failures) console.log(`  - ${failure.name}: ${failure.message}`);
     process.exit(1);
+  }
+  // 断言全过但环境缺件：这不是「全绿」，用 exit 2 明确区分（与 integration-test/drift-check 的约定一致）。
+  if (envSkipped > 0) {
+    console.log('');
+    console.log('[selftest] 断言全部通过，但环境不满足：修复依赖闭包后重跑才能覆盖 lib/tools.js。');
+    process.exit(2);
   }
   process.exit(0);
 })().catch((error) => {
@@ -548,7 +673,32 @@ const load = (file) => import(pathToFileURL(path.join(LIB, file)).href);
   process.exit(1);
 });
 
+/**
+ * 模型可见文本的 emoji 判定：Emoji_Presentation/杂项符号(2600-27BF,含 ⚠❓➡)/装饰符/变体选择符 U+FE0F。
+ * 不含箭头区段 2190-21FF：`→`(U+2192) 是普通箭头、无 emoji 呈现，审查报告的判定是它不违反字面要求。
+ * 只用于「会注入模型」的文本；代码注释里的 ⚠️/⛔ 不在此列（它们不进系统提示词）。
+ */
+const MODEL_TEXT_EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{2753}\u{2754}\u{27A1}]/gu;
+
+/**
+ * 枚举插件注入模型的全部文本：三段提示词 + 每个角色简报 + 唤醒文案 + 命令行。
+ * @param playbook - lib/playbook.js 的模块命名空间。
+ * @param roster - lib/roster.js 的模块命名空间。
+ * @returns [标签, 文本] 数组。
+ */
+function visibleModelTexts(playbook, roster) {
+  const out = [
+    ['PLAYBOOK', playbook.PLAYBOOK],
+    ['TEAM_POLICY', playbook.TEAM_POLICY],
+    ['TEAMMATE_CARD', playbook.TEAMMATE_CARD],
+    ['wakeInstruction', playbook.wakeInstruction('scout', '只做调研')],
+    ['teamCommandLine', playbook.teamCommandLine('x')],
+  ];
+  for (const roleId of roster.ROLE_IDS) out.push(['teammateBrief(' + roleId + ')', playbook.teammateBrief(roleId, roleId)]);
+  return out;
+}
+
 /** 检测严格变量插值的模板语法：任何 `{{` 都会在 prompt 渲染期被当成变量引用。 */
-function PLAYBOOK_HAS_TEMPLATE_BRACES(text) {
+function hasTemplateBraces(text) {
   return typeof text !== 'string' || text.includes('{{');
 }

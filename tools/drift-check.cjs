@@ -56,8 +56,9 @@ const ASAR_CANDIDATES = [
   ),
 ].filter(Boolean);
 
-const PROFILE_DIR =
-  argValue('--profile') || path.join(os.homedir(), '.dsh', 'profiles', 'desktop');
+// 定位统一走 tools/lib-dsh-home.cjs（P1-7）：漂移检测必须对着真正在用的 profile 校验，
+// 否则报告错对象。
+const PROFILE_DIR = require('./lib-dsh-home.cjs').resolveProfileDir({ explicit: argValue('--profile') }).profileDir;
 
 const PLUGIN_DIR = path.resolve(__dirname, '..');
 
@@ -108,14 +109,33 @@ function openAsar(file) {
 
 // ── 报告器 ───────────────────────────────────────────────────────────────────
 const results = [];
+/**
+ * 报告器契约（2026-10-04 审查 P2-19 收紧，改之前先读）：
+ *   * 返回 true            -> PASS
+ *   * 返回**非空字符串**    -> FAIL（字符串就是原因）
+ *   * 返回 skipCheck(...)   -> SKIP：既不算过也不算失败，单列计数
+ *   * 什么都不返回          -> 仍按 PASS，但会打一条告警：漏写 return 的检查是**假绿灯**，
+ *                             旧版把它静默当成通过（P2-19 的一条根因）
+ */
+const SKIP_PREFIX = '\u0000dsh-skip\u0000';
+function skipCheck(reason) {
+  return SKIP_PREFIX + String(reason ?? '未说明');
+}
+function isSkip(value) {
+  return typeof value === 'string' && value.startsWith(SKIP_PREFIX);
+}
 function check(name, fn) {
   try {
     const outcome = fn();
-    if (outcome === true || outcome === void 0) {
-      results.push({ name, ok: true, detail: '' });
-    } else {
-      results.push({ name, ok: false, detail: String(outcome) });
+    if (isSkip(outcome)) {
+      results.push({ name, ok: true, skipped: true, detail: outcome.slice(SKIP_PREFIX.length) });
+      return;
     }
+    if (outcome === void 0) {
+      results.push({ name, ok: true, detail: '', missingReturn: true });
+      return;
+    }
+    results.push({ name, ok: outcome === true, detail: outcome === true ? '' : String(outcome) });
   } catch (error) {
     results.push({ name, ok: false, detail: `检查本身抛错：${error && error.message ? error.message : String(error)}` });
   }
@@ -292,8 +312,11 @@ check('官方 team bundle 用 insert 新建三行（所以 id 覆盖必须落在
   if (!/-\s*insert:/u.test(officialProfilePatch)) {
     return '官方 patch 不再用 insert：patch 的组合顺序语义变了，必须重读 dsh-app-boot 的 loadProfileDirectory/readProfilePatches';
   }
+  // P2-19①：必须锚定到**非注释的 YAML 行**上的 `- id:`。旧正则的裸子串会命中注释里的
+  // 同名字样 —— 官方把行删了、注释还提它，就会假 PASS。
+  const nonComment = officialProfilePatch.split('\n').filter((line) => !/^\s*#/u.test(line)).join('\n');
   const missing = ['agent-team', 'tool-agent-team', 'ui-agent-team']
-    .filter((id) => !new RegExp(`id:\\s*${id}\\b`, 'u').test(officialProfilePatch));
+    .filter((id) => !new RegExp(`^\\s*-\\s+id:\\s*${id}\\s*$`, 'mu').test(nonComment));
   return missing.length === 0 ? true : `官方 insert 里缺行 id：${missing.join(', ')}`;
 });
 
@@ -622,7 +645,7 @@ function presetSection(presetId) {
 }
 
 check('调度模式 preset 与「极简灰度模式」的插件行未漂移（行身份 + 开关状态 + 顺序）', () => {
-  if (profilePatch === '' || ourPresetPatch === '') return '读不到 profile 或本包的 patch（跳过）';
+  if (profilePatch === '' || ourPresetPatch === '') return skipCheck('读不到 profile 或本包的 patch：本项无对象可比');
   const section = presetSection('preset-minimal-grayscale');
   if (section === '') return '在 profile patch 里没找到 preset-minimal-grayscale 的插件行（用户可能改了 preset 结构）';
   const minimalRows = rowSignatures(section).filter((row) => !isPresetContainerRow(row));
@@ -648,7 +671,7 @@ check('调度模式 preset 与「极简灰度模式」的插件行未漂移（�
 // 11b) 行数也要对得上：只比签名会漏掉「同一 id 出现两次」这种结构差异。
 check('调度模式 preset 的能力行数 = 极简灰度 + 1（我们自己的 dispatch-preset）', () => {
   const section = presetSection('preset-minimal-grayscale');
-  if (section === '') return '读不到极简灰度那一段（跳过）';
+  if (section === '') return skipCheck('读不到极简灰度那一段：本项无对象可比');
   const minimalCount = rowSignatures(section).filter((row) => !isPresetContainerRow(row)).length;
   const oursCount = rowSignatures(ourPresetPatch).filter((row) => !isPresetContainerRow(row)).length;
   if (oursCount !== minimalCount + 1) {
@@ -922,6 +945,8 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
         asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-goal/lib/index.js') || '',
         asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-subagent/lib/index.js') || '',
         asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-workflow/lib/index.js') || '',
+        // TEAMMATE_TOOL_DENY 里的 ask_user_question 出处在这里（2026-10-04 P2-30 加入名单）。
+        asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-ask-user/lib/index.js') || '',
       ];
       // preset 里 `toolName: subagent_fork` 这种：名字来自行 config，不在官方包源码里。
       const declaredToolNames = new Set(
@@ -946,17 +971,32 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 12c) 被清空的提示词段名必须仍与官方注册的段名一致，否则我们清了一个不存在的段，
     // 队员的系统提示词里会留着「怎么用 create_goal / workflow」。
     check('TEAMMATE_SECTION_MUTES 的段名仍与官方注册的段名一致', () => {
-      const goal = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-goal/lib/index.js') || '';
-      const workflow = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-workflow/lib/index.js') || '';
+      // P2-19②：段名 -> 官方包用**显式映射表**（旧写法「含 goal 就查 goal 包、否则一律查 workflow」，
+      // 新增第三类段就会查错源）。也不再拿「源码里出现 tool:${toolName} 模板」当**无条件** PASS ——
+      // 那会让「官方改了默认值」或「我们在 preset 里覆盖了 toolName」这两种真漂移照样绿。
+      // 模板段名的正确判据：反查该包 toolName 的默认值拼出的段名 == mute.name，且我们那一行没覆盖 toolName。
+      const MUTE_SOURCES = {
+        'tool:goal': { entry: 'dsh/node_modules/@deepseek-ai/dsh-tool-goal/lib/index.js', row: 'tool-goal' },
+        'tool:workflow': { entry: 'dsh/node_modules/@deepseek-ai/dsh-tool-workflow/lib/index.js', row: 'tool-workflow' },
+      };
       const problems = [];
       for (const mute of roster.TEAMMATE_SECTION_MUTES) {
-        const source = mute.name.includes('goal') ? goal : workflow;
-        if (source === '') { problems.push(`${mute.name}：读不到对应的官方包`); continue; }
-        if (!source.includes(`"${mute.name}"`) && !source.includes(`tool:\${toolName}`) && !source.includes('`tool:${toolName}`')) {
-          problems.push(`${mute.name}：官方侧找不到这个段名`);
-        }
+        const source = MUTE_SOURCES[mute.name];
+        if (source === undefined) { problems.push(mute.name + '：映射表里没有这个段名（新增 mutes 要同时补映射）'); continue; }
+        const text = asar.read(source.entry) || '';
+        if (text === '') { problems.push(mute.name + '：读不到对应的官方包'); continue; }
+        if (text.includes('"' + mute.name + '"')) continue; // 官方注册的就是这个逐字段名（dsh-tool-goal 的现状）
+        // 只剩「模板段名」这一种合法可能：`tool:${toolName}`（dsh-tool-workflow 的现状）。
+        if (!text.includes('`tool:' + String.fromCharCode(36) + '{toolName}`')) { problems.push(mute.name + '：官方侧既没有这个逐字段名，也不是模板段名'); continue; }
+        const defaulted = /toolName: z\.string\(\)\.default\("([a-z0-9_-]+)"\)/u.exec(text);
+        if (defaulted === null) { problems.push(mute.name + '：官方用模板段名，但 toolName 默认值找不到了'); continue; }
+        if ('tool:' + defaulted[1] !== mute.name) { problems.push(mute.name + '：官方默认 toolName 现在拼出的是 tool:' + defaulted[1]); continue; }
+        // 我们自己那一行若覆盖了 toolName，段名就跟着变了 —— 必须按**行块**查，不能全文扫
+        // （preset 里 subagent 那几行本来就有 toolName 覆盖，全文扫会误报）。
+        const rowBlock = new RegExp('id: ' + source.row + '[\\s\\S]{0,240}?\\n\\s*- id:', 'u').exec(ourPresetPatch);
+        if (rowBlock !== null && /toolName:/.test(rowBlock[0])) problems.push(mute.name + '：我们的 preset 给 ' + source.row + ' 行覆盖了 toolName，段名不再是 ' + mute.name + ' —— mutes 要跟着改');
       }
-      return problems.length === 0 ? true : `段名对不上：${problems.join('；')}`;
+      return problems.length === 0 ? true : '段名对不上：' + problems.join('；');
     });
 
     // 12d) 角色数量在**所有会写数字的文案**里都必须一致。
@@ -1083,7 +1123,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
 
     check('report_result 仍是队员专用（不进 Lead 的工具目录）', () => {
       if (toolsJs === '') return '读不到 lib/tools.js';
-      if (!toolsJs.includes('const memberOnly = new Set([REPORT_TOOL_NAME])')) return '找不到「队员专用」的过滤逻辑';
+      if (!toolsJs.includes('const memberOnly = new Set([REPORT_TOOL_NAME, ASK_LEAD_TOOL_NAME])')) return '找不到「队员专用」的过滤逻辑（report_result / ask_lead 都该在里面）';
       if (!toolsJs.includes('!memberOnly.has(definition.name)')) return 'Lead 的工具目录没有排除队员专用工具';
       if (!roster.MEMBER_TEAM_TOOL_NAMES.includes(roster.REPORT_TOOL_NAME)) return 'MEMBER_TEAM_TOOL_NAMES 里没有 report_result';
       if (roster.TEAM_TOOL_NAMES.includes(roster.REPORT_TOOL_NAME)) return 'report_result 混进了官方九工具名单（会污染同名冲突判定）';
@@ -1093,10 +1133,19 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
 
   // ── 输出 ───────────────────────────────────────────────────────────────────
   let failed = 0;
+  let skipped = 0;
   console.log('结果：');
   for (const result of results) {
+    if (result.skipped === true) {
+      skipped += 1;
+      console.log(`  SKIP  ${result.name}`);
+      console.log(`        · ${result.detail}`);
+      continue;
+    }
     if (result.ok) {
       console.log(`  PASS  ${result.name}`);
+      // 漏写 return 的检查等于「永远绿」——不能和真 PASS 混在一起（P2-19 根因之一）。
+      if (result.missingReturn === true) console.log('        · ⚠️ 该检查没有显式 return，按 PASS 处理但请补上返回值');
     } else {
       failed += 1;
       console.log(`  FAIL  ${result.name}`);
@@ -1104,7 +1153,8 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     }
   }
   console.log('');
-  console.log(`${results.length - failed}/${results.length} 通过。`);
+  const executed = results.length - skipped;
+  console.log(`${executed - failed}/${executed} 通过。` + (skipped > 0 ? `（另有 ${skipped} 项因环境/对象缺席而 SKIP，未计入）` : ''));
 
   if (failed > 0) {
     console.log('');

@@ -16,7 +16,7 @@
  *   1. 队员真的拿不到 create_goal / get_goal / update_goal / subagent / subagent_fork / workflow
  *      / enable_agent_team / disable_agent_team，而 Lead 拿得到；
  *   2. 队员自己作用域注册的团队工具不受 restrict 影响（官方语义：restrict 只过滤继承面），
- *      且队员只拿到 MEMBER_TEAM_TOOL_NAMES 那 7 个（没有 spawn_teammate / interrupt_agent）；
+ *      且队员只拿到 MEMBER_TEAM_TOOL_NAMES 那 9 个（官方九个去掉 spawn_teammate / interrupt_agent，再加队员专用的 report_result 与 ask_lead）；
  *   3. preset 层写死的 `tool:goal` / `tool:workflow` 用法段被队员的同名空段真的压掉了；
  *   4. 两个不同角色的队员：最终**系统提示词逐字节相同 + 工具目录完全相同**（缓存前缀可共用），
  *      而 Lead 的与队员的不同（这是应有的差异）；
@@ -287,7 +287,7 @@ async function main() {
   });
 
   // ── 2) 队员自己的团队工具子集 ──────────────────────────────────────────────
-  check('队员只拿到 MEMBER_TEAM_TOOL_NAMES 那 8 个团队工具（继承面同名的那份被遮蔽）', () => {
+  check('队员只拿到 MEMBER_TEAM_TOOL_NAMES 那 9 个团队工具（继承面同名的那份被遮蔽）', () => {
     const missing = roster.MEMBER_TEAM_TOOL_NAMES.filter((name) => !scoutTools.includes(name));
     if (missing.length > 0) return `队员缺团队工具：${missing.join(', ')}`;
     const extra = roster.TEAM_TOOL_NAMES
@@ -1126,11 +1126,26 @@ async function main() {
     preflightRoute: async (_ctx, route) => ({ ok: true, route, diagnostics: [] }),
     pinSpawnRoute: () => {},
     recordReport: (name, report) => runtime.recordReport(name, report),
+    // 截断账本的读口也委托给真 runtime：noteTurnEndReason 是它的写入点，
+    // list_agents 通过这里取值（被测的就是生产路径）。
+    truncatedMemberIds: () => runtime.truncatedMemberIds(),
   };
   const reportTeams = {
+    // 与真域服务同形：队员名只能从 membership 拿（ReactLoopAgent 上没有 name 字段，
+    // 官方 dsh-agent-loop/lib/index.js:747-789）。report_result 的报告头靠它（2026-10-04 审查 P1-1）。
+    tryMembership(agent) { return membershipById.get(agent && agent.id); },
+    // 与真域服务同形：行里有 id（截断标注按 id 匹配），且状态由测试自己控制。
+    // lead 记 running、两个队员记 inactive —— 正好用来验「默认广播不唤醒 inactive 队员」。
+    listMembers() {
+      return [
+        { id: 'lead-agent', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+        { id: 'scout-agent', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+        { id: 'builder-agent', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: [] },
+      ];
+    },
     sendMessage(caller, request) {
       sentMessages.push({ caller, request });
-      return { ok: true };
+      return { ok: true, messageId: 'team-message-test', status: 'accepted' };
     },
   };
   const memberDefinitions = toolsModule.teamToolDefinitions({ runtime: reportRuntime, agentTeams: reportTeams, include: roster.MEMBER_TEAM_TOOL_NAMES });
@@ -1153,7 +1168,9 @@ async function main() {
         unresolved: [],
         changed_files: ['x.js'],
       },
-      { agent: { id: 'scout-agent', name: 'scout' } },
+      // 故意**不给** agent.name：生产里 Agent 对象没有这个名字字段，给了就会把
+      // 「名字其实来自域服务」这条真实依赖掩盖掉（P1-1 的根因正是这个假设）。
+      { agent: { id: 'scout-agent' } },
     );
     check('report_result：校验 → 记录 → 自己投递给 lead（一条固定形状的消息）', () => {
       if (result.ok !== true || result.delivered !== true) return JSON.stringify(result);
@@ -1171,11 +1188,157 @@ async function main() {
 
     let rejected = false;
     try {
-      await reportTool.execute({ status: 'completed', summary: '做完了' }, { agent: { id: 'scout-agent', name: 'scout' } });
+      await reportTool.execute({ status: 'completed', summary: '做完了' }, { agent: { id: 'scout-agent' } });
     } catch {
       rejected = true;
     }
     check('report_result：completed 但没有 evidence → 直接拒绝（不产生空报告）', () => (rejected ? true : '竟然通过了'));
+
+  // ── 2026-10-04 新增三件套：broadcast_message / ask_lead / list_agents 的截断标注 ────────────
+  const broadcastTool = leadDefinitions.find((definition) => definition.name === roster.BROADCAST_TOOL_NAME);
+  const askTool = memberDefinitions.find((definition) => definition.name === roster.ASK_LEAD_TOOL_NAME);
+  const listTool = leadDefinitions.find((definition) => definition.name === 'list_agents');
+  check('新工具的注册面：broadcast 只给 Lead，ask_lead 只给队员', () => {
+    if (broadcastTool === undefined) return 'Lead 的工具面里没有 broadcast_message';
+    if (memberDefinitions.some((d) => d.name === roster.BROADCAST_TOOL_NAME)) return 'broadcast_message 泄漏给队员';
+    if (askTool === undefined) return '队员的工具面里没有 ask_lead';
+    if (leadDefinitions.some((d) => d.name === roster.ASK_LEAD_TOOL_NAME)) return 'ask_lead 泄漏给 Lead（它没有汇报对象）';
+    if (listTool === undefined) return 'Lead 拿不到 list_agents';
+    return true;
+  });
+
+  await (async () => {
+    sentMessages.length = 0;
+    const before = sentMessages.length;
+    const res = await broadcastTool.execute(
+      { message: '协议升级 v1.1：sticks 语义变了' },
+      // caller 用真的 Lead：它自己在 fakeDomain 里是 role=lead / name=lead。
+      { agent: leadAgent, signal: new AbortController().signal },
+    );
+    check('broadcast_message：默认只打 running/provisioning 队员，lead 与自己都不进目标', () => {
+      // fakeDomain.listMembers 给的 status 恒是 inactive（测试替身没有活体），所以默认路径
+      // 应该**一个都不发**并逐个给出理由 —— 这正是「不许意外把所有人拉起来」的成本闸门。
+      if (res.sent.length !== 0) return `不该发的也发了：${JSON.stringify(res.sent)}`;
+      if (res.ok !== false) return '零投递却返回 ok:true';
+      const skipped = res.skipped.map((item) => item.target).sort();
+      if (!skipped.includes('scout') || !skipped.includes('builder')) return JSON.stringify(skipped);
+      // lead 既不该收到、也不该以「includeInactive」为由被跳（它是「不是队员」）。
+      const leadSkip = res.skipped.find((item) => item.target === 'lead');
+      if (leadSkip === undefined || !leadSkip.reason.includes('不是队员')) return JSON.stringify(leadSkip ?? null);
+      if (before !== 0 || sentMessages.length !== 0) return `sendMessage 被调了 ${sentMessages.length} 次`;
+      // 被成本闸门挡下的队员，理由必须给出可操作下一步。
+      for (const name of ['scout', 'builder']) {
+        const item = res.skipped.find((candidate) => candidate.target === name);
+        if (item === undefined || !item.reason.includes('includeInactive')) return '缺可操作理由：' + JSON.stringify(item ?? null);
+      }
+      return true;
+    });
+
+    const res2 = await broadcastTool.execute(
+      { message: '协议升级 v1.1', targets: ['scout', 'ghost-404'] },
+      { agent: leadAgent, signal: new AbortController().signal },
+    );
+    check('broadcast_message：显式目标生效，找不到的如实报原因（不静默丢）', () => {
+      if (res2.sent.length !== 1 || res2.sent[0].target !== 'scout') return JSON.stringify(res2.sent);
+      if (res2.sent[0].status !== 'accepted') return JSON.stringify(res2.sent[0]);
+      if (!res2.skipped.some((item) => item.target === 'ghost-404')) return JSON.stringify(res2.skipped);
+      if (sentMessages.length !== 1) return `sendMessage 次数=${sentMessages.length}`;
+      if (sentMessages[0].request.target !== 'scout') return `target=${sentMessages[0].request.target}`;
+      if (sentMessages[0].request.content[0].text !== '协议升级 v1.1') return '正文被改写';
+      return true;
+    });
+
+    const res3 = await broadcastTool.execute(
+      { message: '全员注意', include_inactive: true },
+      { agent: leadAgent, signal: new AbortController().signal },
+    );
+    check('broadcast_message：include_inactive=true 才拉起 inactive 队员（显式承担成本）', () => {
+      if (res3.sent.length !== 2) return JSON.stringify(res3.sent.map((s) => s.target));
+      return true;
+    });
+
+    // 显式点名的 inactive 队员不该被二次拦截（点名 = Lead 的明确决定）。
+    const res4 = await broadcastTool.execute(
+      { message: '只看这一条', targets: ['builder'] },
+      { agent: leadAgent, signal: new AbortController().signal },
+    );
+    check('broadcast_message：显式点名不受 inactive 闸门二次拦截', () => {
+      if (res4.sent.length !== 1 || res4.sent[0].target !== 'builder') return JSON.stringify(res4);
+      return true;
+    });
+    // 本段测试结束后清空投递记录，别把后面的 report_result 断言的计数污染掉。
+    sentMessages.length = 0;
+  })();
+
+  await (async () => {
+    sentMessages.length = 0;
+    const res = await askTool.execute(
+      { question: '字体栈用系统默认还是内嵌？' },
+      { agent: scoutAgent, signal: new AbortController().signal },
+    );
+    check('ask_lead：默认阻塞、带固定前缀、投递给 lead', () => {
+      if (res.ok !== true || res.delivered !== true) return JSON.stringify(res);
+      if (sentMessages.length !== 1) return `sendMessage ${sentMessages.length} 次`;
+      if (sentMessages[0].request.target !== 'lead') return `target=${sentMessages[0].request.target}`;
+      const text = sentMessages[0].request.content[0].text;
+      if (!text.startsWith('[阻塞·等答复][需 Lead 决策] 字体栈')) return text.slice(0, 60);
+      if (!res.diagnostics.some((d) => d.includes('不要再自行推进'))) return JSON.stringify(res.diagnostics);
+      return true;
+    });
+
+    const res2 = await askTool.execute(
+      { question: '要不要顺带加导出？', blocking: false },
+      { agent: scoutAgent, signal: new AbortController().signal },
+    );
+    check('ask_lead：blocking=false 走「可继续」前缀且不附加停手指令', () => {
+      if (!res2.question.startsWith('[可继续][需 Lead 决策]')) return res2.question.slice(0, 40);
+      if (res2.diagnostics.length !== 0) return JSON.stringify(res2.diagnostics);
+      return true;
+    });
+
+    let threw = false;
+    try { await askTool.execute({ question: 'x' }, { agent: scoutAgent, signal: new AbortController().signal }); }
+    catch { threw = true; }
+    // check() 不 await 异步断言（见其实现），所以先把投递失败的调用跑完、再同步判定。
+    const brokenTeams = {
+      tryMembership: (agent) => membershipById.get(agent && agent.id),
+      sendMessage() { throw new Error('TEAM_MAILBOX_FULL'); },
+    };
+    const brokenAsk = toolsModule.teamToolDefinitions({
+      runtime: reportRuntime,
+      agentTeams: brokenTeams,
+      include: roster.MEMBER_TEAM_TOOL_NAMES,
+    }).find((definition) => definition.name === roster.ASK_LEAD_TOOL_NAME);
+    const failedAsk = await brokenAsk.execute({ question: '投递不了的测试' }, { agent: scoutAgent, signal: new AbortController().signal });
+    check('ask_lead：投递失败不静默（diagnostics 指路 report_result 的 needs_decision）', () => {
+      if (threw) return '正常路径不该抛错';
+      if (failedAsk.ok !== false || failedAsk.delivered !== false) return JSON.stringify(failedAsk);
+      if (!failedAsk.diagnostics.some((d) => d.includes('needs_decision'))) return JSON.stringify(failedAsk.diagnostics);
+      return true;
+    });
+  })();
+
+  // 真实链路：noteTurnEndReason 就是 session/event 监听器调的那个写入点（lib/runtime.js），
+  // 测试与生产共用同一函数；list_agents 必须据此把标志并进 diagnostics。
+  // check() 不 await（见其实现），所以三次调用全部先跑完，回调里只做同步判定。
+  const plainRows = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  runtime.noteTurnEndReason('scout-agent', 'max-tokens');
+  const markedRows = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  runtime.noteTurnEndReason('scout-agent', 'completed');
+  const clearedRows = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  check('list_agents 把截断标志并入 diagnostics（Lead 据此选 wake_teammate 而非 send_message）', () => {
+    const findScout = (rows) => rows.find((row) => row.target === 'scout');
+    const before = findScout(plainRows);
+    const after = findScout(markedRows);
+    const done = findScout(clearedRows);
+    if (before === undefined || after === undefined || done === undefined) return JSON.stringify(markedRows.map((row) => row.target));
+    if ((before.diagnostics || []).length !== 0) return '记账前就有 diagnostics：测试前提不成立';
+    if (!after.diagnostics.some((d) => d.includes('wake_teammate'))) return JSON.stringify(after.diagnostics);
+    const builder = markedRows.find((row) => row.target === 'builder');
+    if (builder === undefined || (builder.diagnostics || []).length !== 0) return '未被记账的队员被误标注：' + JSON.stringify(builder);
+    if ((done.diagnostics || []).length !== 0) return '正常收尾后标志没被清掉：' + JSON.stringify(done.diagnostics);
+    return true;
+  });
   })();
 
   // ── 8) 2026-10-01 修复的三件事：/team 的显示、宿主重启后团队工具被移除、队员唤醒 ─────────

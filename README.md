@@ -10,7 +10,7 @@
 - **队员共用同一份系统提示词**（逐字节相同），角色差异**只走 Lead 派活时的提示词**。
   这是**为缓存命中率做的硬设计**：队员之间共用同一份提示词与工具目录前缀，详见 §4.5。
 - **队员的工具面主动收窄**：自动摘掉 `create_goal/update_goal`、`subagent/subagent_fork/workflow`
-  与 Lead 专属的团队开关，并只给 7 个团队工具（不含 `spawn_teammate`/`interrupt_agent`/`wake_teammate`）。
+  与 Lead 专属的团队开关，并只给 9 个团队工具（官方九个减去 `spawn_teammate`/`interrupt_agent`，再加队员专用的 `report_result` 与 `ask_lead`；`wake_teammate`/`broadcast_message` 也是 Lead 专属）。
 - **每个队员可配模型与思考强度**，默认与 Lead 完全一致。配置在**插件页**里点着改，不用编辑 YAML。
 - **`/team` 开启团队**；默认关闭，因为团队会真的多花模型预算。
   团队开关**按会话记忆**（2026-10-01）：宿主重启后会自动把开过团的会话装回来，不用再打一次 `/team`。详见 §2.1。
@@ -100,7 +100,8 @@ node tools\install.cjs
   作用域（见 §8.6 / §8.7）。profile 的 `cordis.patch.yml` 在所有 bundle 层之后应用，是唯一顺序无关的落点。
 
 前置：DSH 桌面端已启用官方 `@deepseek-ai/dsh-experimental-agent-team-profile`（本插件复用它的
-`agentTeams` 域服务；工具面与 UI 面由本插件接管）。`install.cjs` 会在 bundles 里缺它时补上。
+`agentTeams` 域服务；工具面与 UI 面由本插件接管）。**缺失时 `repair.cjs` 只会提示，不会替你添加**——
+请到插件页手动启用官方 bundle，本插件不去改它的启用状态。
 
 ### 1.4 生效方式
 
@@ -204,7 +205,7 @@ node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替�
 
 1. 用户说需求（可能很模糊）。
 2. Lead 派 1–3 个 `scout`（本仓库）或 `researcher`（仓库之外）去查事实。
-3. Lead 把不依赖这些事实的问题**一次性**列成一轮（`❓ Q1 … ➡️ 推荐答案`），等用户答复。
+3. Lead 把不依赖这些事实的问题**一次性**列成一轮（「**Q1 — 标题**：正文」+ 下一行「推荐：答案」），等用户答复。
 4. 答复改变设计树 → 重算前沿 → 下一轮。前沿快空时派 `frontier-auditor` 复核有没有被跳过的分支，
    直到前沿为空 **且用户确认共享理解**。
 5. Lead 切写域、在任务板上建任务（`write_scopes` 必须真正不相交）、派 `builder`。
@@ -258,9 +259,9 @@ wake_teammate({ target: "scout", note: "只补 §3 与验收命令" })
 
 它发出的正文是固定措辞（`lib/playbook.js` 的 `wakeInstruction`）：
 
-> [系统] scout：你上一条回答被模型**输出上限**截断，turn 已结束，任务还没有交付。
-> 继续把任务做完：**从断点接着写/接着做**，不要重头再来、不要复述已经写过的内容；
-> 先一句话说明你已经完成到哪一步，再补完剩余部分，然后照常调 report_result 交付。
+> [系统] scout：你上一个 turn 已结束，但没有交付 report_result。
+> 先用一句话说明你已完成到哪一步、**为什么停下**（撞输出上限 / 遇到障碍 / 以为已经做完）；
+> 任务没做完就**从断点接着写/接着做**，不要重头再来、不要复述已经写过的内容，然后照常调 report_result 交付。
 
 - 只有 Lead 有它（队员的工具面里没有 `wake_teammate`，也没有 `spawn_teammate` / `interrupt_agent`）。
 - 它是一次**普通的消息投递**（和 `send_message` 同一条链路）：跑着的队员在最近步边界收到，
@@ -308,7 +309,7 @@ dsh-dispatch-agent-team/
 │   ├── selftest.cjs                # 纯逻辑回归（零 dsh 依赖）
 │   ├── integration-test.cjs        # 真链路集成测试（真 cordis + dsh-tools + dsh-system-prompt）
 │   └── client-smoke-test.cjs       # 浏览器半渲染冒烟（迷你 React 替身 + 可编程 fetch）
-└── INTERFACES.md                   # 实现契约（含活体 API 实测记录 + 2026-09-28 起 39 条勘误表）
+└── INTERFACES.md                   # 实现契约（含活体 API 实测记录 + 2026-09-28 起 41 条勘误表）
 ```
 
 > **控制面注册在哪、为什么**（2026-09-28 边界修正，覆盖了 09-27 的「搬到宿主平面」）：
@@ -333,9 +334,9 @@ dsh-dispatch-agent-team/
 
 | 官方 bundle 的行 | 我们的处理 | 为什么 |
 |---|---|---|
-| `agent-team`（域服务 `ctx.agentTeams`） | **保留官方实现**，容量参数由 **profile 的 patch 层**覆盖（不是我们的 bundle patch，原因见 §8.6） | durable roster / 邮箱 / 任务 DAG / revision CAS 都在这 1870 行里。重造它才是「官方一升级就坏」的最大风险 |
+| `agent-team`（域服务 `ctx.agentTeams`） | **保留官方实现**，容量参数由 **profile 的 patch 层**覆盖（不是我们的 bundle patch，原因见 §8.6） | durable roster / 邮箱 / 任务 DAG / revision CAS 都在这 1871 行里。重造它才是「官方一升级就坏」的最大风险 |
 | `tool-agent-team`（九个官方工具 + `team:policy` 段） | 由 **profile 的 patch 层整行关闭**（`tools/repair.cjs --apply` 维护）；调度模式的 preset 作用域再遮蔽它的 `team:policy` 段 | ⛔ 它与本插件的九个工具**同名、同作用域**（官方给每个 agent 都装，源码行号见 §8.7），两边不可能共存：不关它，本插件的工具就装不上，角色/模型参数全丢 |
-| `ui-agent-team`（成员列表 / 任务看板） | **保持启用**（官方行自己挂载；我们已不再重复挂载） | 同一份 UI 模块读的是共享的 `agentTeams` 域服务，所以看到的就是本插件的成员与任务 |
+| `ui-agent-team`（成员列表 / 任务看板） | 官方行保持启用；我们另用自有行 id `dispatch-agent-team-panel` **再挂一份同一个包**（`cordis.patch.yml:43-48`） | 客户端模块按 specifier 去重执行（dsh-client-modules 的 executedBundleUrls），两行并存不会双渲染；这样即使用户关掉官方 `ui-agent-team` 行，成员列表与任务看板也还在 |
 
 也就是说：**本插件的团队功能（角色 / 模型 / 思考强度 / 工具收窄 / 派活提示词）100% 由本插件提供，
 官方只提供不可替代的持久化域服务与那份 UI**。
@@ -467,8 +468,8 @@ agent scope** 上，`dsh-tools` 会抛「already registered in this scope」。�
   提示词段。工具摘了段还在，提示词就在教队员调用它没有的工具。所以队员作用域里还会用**同名空段**
   清掉 `tool:goal` / `tool:workflow`（`TEAMMATE_SECTION_MUTES`）。`merge` 取最近的同名段，
   `renderPrompt` 丢弃空段，所以祖先文本被真正压掉、也不会留下空行。
-- **只给 7 个团队工具**：`spawn_teammate` / `interrupt_agent` / `wake_teammate` 是 Lead 专属，
-  队员拿到的是 `MEMBER_TEAM_TOOL_NAMES`（= 官方九个减前两个，再加队员专用的 `report_result`）。
+- **只给 9 个团队工具**：`spawn_teammate` / `interrupt_agent` / `wake_teammate` / `broadcast_message` 是 Lead 专属，
+  队员拿到的是 `MEMBER_TEAM_TOOL_NAMES`（= 官方九个减前两个，再加队员专用的 `report_result` 与 `ask_lead`）。
   工具面从 schema 层就没有，
   而不是注册了再靠权限拒绝——后者会把目录撑大、还要在提示词里解释它们为什么不能用。
 
@@ -476,7 +477,7 @@ agent scope** 上，`dsh-tools` 会抛「already registered in this scope」。�
 `deepseek-flash` 的路由声明了 `systemPromptUpdate: in-history` 与 `toolUpdate: addition-only`：
 前者让「系统提示词变了」变成**在历史尾部追加一条 system 消息**，而不是重写 message 0；
 后者让 `startsSeries` 不再因为工具目录变化而重启请求序列
-（`dsh-agent-loop/lib/index.js:1039` 的 `preparedCall?.toolUpdate === void 0 && this.toolsChanged(...)`）。
+（`dsh-agent-loop/lib/index.js:1054` 的 `preparedCall?.toolUpdate === void 0 && this.toolsChanged(...)`）。
 所以 `/team` 中途开启时新增的团队工具与策略段**不会**把之前的前缀缓存全部作废。
 
 > 一句话总结：**队员之间的差异只允许出现在 Lead 的派活提示词里**。任何往队员系统提示词或队员工具面里
@@ -495,11 +496,11 @@ agent scope** 上，`dsh-tools` 会抛「already registered in this scope」。�
 
   | 文本 | 预算 | 当前 | 谁在读 |
   |---|---|---|---|
-  | `PLAYBOOK` | ≤ 4100 | **4095** | 调度模式的**每一次**请求（Lead） |
+  | `PLAYBOOK` | ≤ 3900 | **3891** | 调度模式的**每一次**请求（Lead） |
   | `TEAM_POLICY` | ≤ 800 | **575** | 团队开启后的 Lead |
-  | `TEAMMATE_CARD` | ≤ 1150 | **1018** | 每个队员的固定前缀 |
-  | Lead 侧合计 | ≤ 4900 | **4670** | |
-  | 队员侧合计（卡 + 角色简报） | ≤ 1550 | **1393** | 简报是第一条 user 消息，同样进前缀 |
+  | `TEAMMATE_CARD` | ≤ 1150 | **1134** | 每个队员的固定前缀 |
+  | Lead 侧合计 | ≤ 4900 | **4466** | |
+  | 队员侧合计（卡 + 角色简报） | ≤ 1550 | **1509** | 简报是第一条 user 消息，同样进前缀 |
 
 - **不重复注入**：`integration-test.cjs` 用真运行时渲染提示词，断言 `PLAYBOOK` / 队员卡 / 团队事实段
   在渲染结果里**各只出现一次**（`enable` 被调两次、段注册两次都会当场红）。
@@ -586,7 +587,7 @@ cordis patch**——那正好是崩溃恢复会改名备份的文件。
 ## 6. 维护（官方升级后必做）
 
 ```
-node tools\drift-check.cjs      # 48 项：逐条验证本插件依赖的官方实现细节是否还在
+node tools\drift-check.cjs      # 50 项：逐条验证本插件依赖的官方实现细节是否还在
 node tools\repair.cjs           # 安装状态体检（bundles / junction / 文件齐全 / 恢复痕迹）
 node tools\selftest.cjs         # 纯逻辑回归（角色表 / 配置净化 / 缓存策略 / 报告校验 / 文本不变量）
 node tools\integration-test.cjs # 真链路（真 cordis + dsh-tools + dsh-system-prompt + llm/stream 瀑布）
@@ -677,10 +678,12 @@ node tools\selftest.cjs && node tools\drift-check.cjs && node tools\integration-
      桌面端自带的那份 `dsh.cmd`（见 §1.1），PATH 上的独立 CLI 会拒绝 desktop profile。
 2. 回到推理模式选择器，把默认 preset 换回你原来的那个（新会话默认值存在
    `~/.dsh/profiles/desktop/cordis.patch.yml` 的 `agent-preset-registry.selectedDefault`）。
-3. 想恢复官方 Agent Teams 的完整行为：`install.cjs --uninstall` 之后，profile 的 `cordis.patch.yml` 里
-   那段 `dispatch-agent-team:managed` 块（`tool-agent-team: disabled` + `agent-team` 容量覆盖）需要
-   手工删掉 —— 它由 `tools/repair.cjs` 写入，卸载不会自动清（删前对照该文件里的
-   `# ── dispatch-agent-team:managed:start/end ──` 两行标记）。
+3. 恢复官方 Agent Teams 的完整行为：`node tools\install.cjs --uninstall` 会在卸载成功后**自动串跑**
+   `tools/repair.cjs --revert`，删掉 profile 层那段 `dispatch-agent-team:managed` 块
+   （`tool-agent-team: disabled` + `agent-team` 容量覆盖），并留下 `.bak-<时间戳>-pre-dispatch-team-revert`
+   备份。它是幂等的（没有托管块就是空操作）。走界面卸载、或 `emergency-disable.cjs` 应急摘 bundle 时
+   **不会**自动回收，需自己跑一次：`node tools\repair.cjs --revert`
+   （或手工删 `# ── dispatch-agent-team:managed:start/end ──` 两行之间的整段，删前备份）。
 
 卸载后 `~/.dsh/dispatch-agent-team.json`（角色配置）与 `dispatch-agent-team-sessions.json`
 （会话记忆）会留下，可以手动删。
@@ -963,7 +966,7 @@ dsh-base, dsh-web-app, @zws/dsh-dispatch-agent-team, @deepseek-ai/dsh-experiment
 2. **更重要：这个抑制手段本身是错的**。官方 `tool-agent-team` **不是**把九个工具注册到全局层，而是
    给**每一个 live agent** 装进**它自己的 agent 作用域**：
    - `dsh-experimental-tool-agent-team/lib/index.js:539-546`：`maybeInstall` 只在
-     `tryMembership(agent) === undefined` 时跳过；源码 :229-231 的注释原话是
+     `tryMembership(agent) === undefined` 时跳过；源码 :225 的注释原话是
      「Team tools are registered only in an exact Agent scope」；
    - `dsh-experimental-agent-team/lib/index.js:397-426`：`tryMembership` 对**任意非子代理 agent**
      都返回 `{root: agent, role: "lead", name: "lead"}` —— 所以每个会话都会被装上。
@@ -1176,6 +1179,12 @@ Lead 只能自己写代码并改用 `list_agents` 轮询。
 | 收益证据把「固定工具目录」与「保活」混在一起 | 我们只承诺机制，收益**由面板上的真实数字说话** | 它家 `docs/EVIDENCE.md:113` 是两项一起改的结果，没有单独验证 |
 
 ### 10.2 默认策略（线路族表）
+
+> **线路族按真实请求判定**（2026-10-04 修复 P1-9）：开团挂载时插件拿不到 Lead 的真实路由
+> （配置里的 `roles` 只认 12 个角色 id，没有 `lead` 这个键），所以策略先落在兜底族，
+> 等抓到**第一个真实模型请求**时按它的 `provider/model` 重算（用户中途切模型也同样跟上）。
+> 副作用一条：以前贴在 `generic` 键上的手工覆盖，在真实族被识别后不再命中该线路，
+> 需要把覆盖键改写成具体的 `provider`、`provider/model` 或族 id（如 `deepseek`）。
 
 | 线路族 | 默认 | TTL | 理由 |
 | --- | --- | --- | --- |
