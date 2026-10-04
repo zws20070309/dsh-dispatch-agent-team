@@ -297,7 +297,7 @@ broadcast_message({ message: "...", include_inactive: true })                  #
   但一条都没送出去时 `ok:false` 是对的（那确实等于没广播）。
 - 正文上限 4000 字符、`ask_lead` 的问题上限 2000 字符，超了直接报错**不做静默截断**：
   截断会让一部分队员收到半句话，比如实报错危险得多。
-- 取证：皮影戏会话里 Lead 对 4 个 builder **逐条 send_message 同一份协议变更**
+- 取证：某可视交付任务会话里 Lead 对 4 个 builder **逐条 send_message 同一份协议变更**
   （`seq 544/547/550`、`400/404/408`），纯重复且容易漏发。
 
 **`ask_lead`（队员专属）** —— 队员在任务中途向 Lead 提一个只有 Lead（或用户）能拍板的问题。
