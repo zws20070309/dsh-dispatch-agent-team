@@ -125,7 +125,7 @@ node tools\install.cjs
 
 ```
 node tools\repair.cjs             # 安装状态体检（bundles / junction / 文件齐全 / 崩溃恢复痕迹）
-node tools\drift-check.cjs        # 50 项官方实现假设校验（升级后必跑）
+node tools\drift-check.cjs        # 51 项官方实现假设校验（升级后必跑）
 node tools\selftest.cjs           # 纯逻辑回归（角色表 / 配置净化 / 保活策略 / 文本不变量）
 node tools\integration-test.cjs   # 真链路：真 cordis + dsh-tools + systemPrompt + llm/stream 瀑布
 node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替身，真渲染组件）
@@ -291,8 +291,12 @@ broadcast_message({ message: "...", include_inactive: true })                  #
   所以「广播全体」实际会把所有停着的队员都拉起来干活、每人多烧一轮。默认只发
   `running` / `provisioning`，被跳过的目标**逐个给出理由**；要那种效果必须显式 `include_inactive: true`。
   但**显式点名**的目标不受这条闸门限制——点名本身就是 Lead 的明确决定（等价于对它单独 `send_message`）。
-- 每个目标独立成败：邮箱满（`TEAM_MAILBOX_FULL`）、目标消失等只影响那一条，绝不带走整批；
-  返回 `{ ok, sent[], failed[], skipped[] }`，`ok` 只在「全发成功」时为 true。
+- 每个目标独立成败：邮箱满（`TEAM_MAILBOX_FULL`）、目标消失等只影响那一条，绝不带走整批。
+  返回值把三种结果**分开**报：`sent[]`（真投出去的）/`failed[]`（真的调用失败）/`skipped[]`（按规则没发的，
+  每条带原因）。`ok` 的语义是「**至少送出一条，且没有任何一条真投递失败**」——被跳过不算失败，
+  但一条都没送出去时 `ok:false` 是对的（那确实等于没广播）。
+- 正文上限 4000 字符、`ask_lead` 的问题上限 2000 字符，超了直接报错**不做静默截断**：
+  截断会让一部分队员收到半句话，比如实报错危险得多。
 - 取证：皮影戏会话里 Lead 对 4 个 builder **逐条 send_message 同一份协议变更**
   （`seq 544/547/550`、`400/404/408`），纯重复且容易漏发。
 
@@ -351,7 +355,7 @@ dsh-dispatch-agent-team/
 │   ├── lib-dsh-home.cjs             # DSH 主目录 / profile 目录的唯一解析口径（认 DSH_HOME）
 │   ├── lib-atomic-write.cjs         # tmp+rename 原子写（profile 关键文件不许留半份）
 │   ├── install.cjs                 # ★ 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
-│   ├── drift-check.cjs             # 官方升级漂移检测（50 项，升级后必跑）
+│   ├── drift-check.cjs             # 官方升级漂移检测（51 项，升级后必跑）
 │   ├── repair.cjs                  # 安装状态体检 / 崩溃恢复后的修复
 │   ├── emergency-disable.cjs       # DSH 起不来时的一键退出
 │   ├── history-audit.cjs           # 只读：某个斜杠命令在本机到底有没有活过（判「历史 vs 活命令」）
@@ -551,10 +555,10 @@ agent scope** 上，`dsh-tools` 会抛「already registered in this scope」。�
 
   | 文本 | 预算 | 当前 | 谁在读 |
   |---|---|---|---|
-  | `PLAYBOOK` | ≤ 3900 | **3885** | 调度模式的**每一次**请求（Lead） |
+  | `PLAYBOOK` | ≤ 3800 | **3783** | 调度模式的**每一次**请求（Lead） |
   | `TEAM_POLICY` | ≤ 800 | **575** | 团队开启后的 Lead |
   | `TEAMMATE_CARD` | ≤ 1150 | **1134** | 每个队员的固定前缀 |
-  | Lead 侧合计 | ≤ 4900 | **4460** | |
+  | Lead 侧合计 | ≤ 4900 | **4358** | |
   | 队员侧合计（卡 + 角色简报） | ≤ 1550 | **1509** | 简报是第一条 user 消息，同样进前缀 |
 
 - **不重复注入**：`integration-test.cjs` 用真运行时渲染提示词，断言 `PLAYBOOK` / 队员卡 / 团队事实段
@@ -642,7 +646,7 @@ cordis patch**——那正好是崩溃恢复会改名备份的文件。
 ## 6. 维护（官方升级后必做）
 
 ```
-node tools\drift-check.cjs      # 50 项：逐条验证本插件依赖的官方实现细节是否还在
+node tools\drift-check.cjs      # 51 项：逐条验证本插件依赖的官方实现细节是否还在
 node tools\repair.cjs           # 安装状态体检（bundles / junction / 文件齐全 / 恢复痕迹）
 node tools\selftest.cjs         # 纯逻辑回归（角色表 / 配置净化 / 缓存策略 / 报告校验 / 文本不变量）
 node tools\integration-test.cjs # 真链路（真 cordis + dsh-tools + dsh-system-prompt + llm/stream 瀑布）
