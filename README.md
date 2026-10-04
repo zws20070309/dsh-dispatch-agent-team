@@ -266,12 +266,60 @@ wake_teammate({ target: "scout", note: "只补 §3 与验收命令" })
 - 只有 Lead 有它（队员的工具面里没有 `wake_teammate`，也没有 `spawn_teammate` / `interrupt_agent`）。
 - 它是一次**普通的消息投递**（和 `send_message` 同一条链路）：跑着的队员在最近步边界收到，
   停下的队员被唤醒开新 turn。
-- **为什么不做「自动续写」**：截断是可检测的（`turn/end.reason.kind === 'max-tokens'`），但第三方线路
-  实测一天里 4 个队员会话各撞了 2 次（`node tools/session-probe.cjs --grep '"kind":"max-tokens"'` 可复查），
+- **为什么不做「自动续写」**：截断是**可检测且已经检测到**的（§2.6 的截断标志）：官方在
+  `dsh-agent-loop/lib/index.js:1151` 产出 `max-tokens`、`:979` 在 turn 内聚合、`:1027-1030` 落成
+  `turn/end` 事件；但第三方线路实测一天里 4 个队员会话各撞了 2 次（`node tools/session-probe.cjs --grep '"kind":"max-tokens"'` 可复查），
   自动续写会变成无界烧钱。决定权交给 Lead，
   再配一条提示词纪律：队员停了又没交报告 → 用 `wake_teammate` 叫它续写，别让用户手动打「继续」。
 - `send_message` / `interrupt_agent` 也接受官方的 `agent_id` 写法（会翻译成队员名）；
   同时给 `target` 与 `agent_id` 且不一致时**拒绝**，不猜目标。
+
+### 2.6 2026-10-04 新增：广播、队员提问、截断标志
+
+来自审查报告 §8 的三条建议，全部有真实会话日志取证与真跑断言（`tools/integration-test.cjs`）。
+
+**`broadcast_message`（Lead 专属）** —— 一次把同一条消息发给多个队员。
+
+```
+broadcast_message({ message: "CONTRACT 升 v1.2，三条 delta 影响你的文件" })   # 发给当前所有在跑的队员
+broadcast_message({ targets: ["builder", "builder-2"], message: "..." })       # 只发点名的（认名字，也认 agent id）
+broadcast_message({ message: "...", include_inactive: true })                  # 连停着的队员一起叫醒
+```
+
+- **为什么默认不发给 inactive 队员**：官方 `send_message` 对 inactive 目标会**启动一个新的 turn**
+  （投递链：`dispatchOnce` → `steerHostSubagentPrompt` → `deliverFollowup` 的 coldResume），
+  所以「广播全体」实际会把所有停着的队员都拉起来干活、每人多烧一轮。默认只发
+  `running` / `provisioning`，被跳过的目标**逐个给出理由**；要那种效果必须显式 `include_inactive: true`。
+  但**显式点名**的目标不受这条闸门限制——点名本身就是 Lead 的明确决定（等价于对它单独 `send_message`）。
+- 每个目标独立成败：邮箱满（`TEAM_MAILBOX_FULL`）、目标消失等只影响那一条，绝不带走整批；
+  返回 `{ ok, sent[], failed[], skipped[] }`，`ok` 只在「全发成功」时为 true。
+- 取证：皮影戏会话里 Lead 对 4 个 builder **逐条 send_message 同一份协议变更**
+  （`seq 544/547/550`、`400/404/408`），纯重复且容易漏发。
+
+**`ask_lead`（队员专属）** —— 队员在任务中途向 Lead 提一个只有 Lead（或用户）能拍板的问题。
+
+- 与 `report_result` 的 `needs_decision` 分工：`ask_lead` 是**中途问**（可以边等边做别的），
+  `needs_decision` 是**交付时判定**（这次不做了）。
+- 投递走官方 `sendMessage(→ lead)`，插件加固定前缀 `[阻塞·等答复]` / `[可继续]` + `[需 Lead 决策]`：
+  官方投递框架只写发件人（`dsh-experimental-agent-team/lib/index.js:971-976`），没有类型位，
+  所以 Lead 靠这个前缀区分「等答复」与「顺带一报」。
+- 为什么需要它：官方挡掉了队员的 `ask_user_question`（`dsh-user-questions/lib/index.js:531-534` 的
+  `assertLiveRoot` 抛 `DELEGATED_CALLER`），而队员卡要求「有问题停下来报告给 Lead」——
+  在此之前队员只有自由文本 `send_message` 这一条路，Lead 无法机器区分。现在 `ask_user_question`
+  也已从队员工具面摘掉（`TEAMMATE_TOOL_DENY`），工具面与纪律口径一致。
+- 投递失败**不静默**：返回 `ok:false` + diagnostics 指路「写进 report_result 的 unresolved，状态用 needs_decision」。
+
+**截断标志（`list_agents` 的行内 diagnostics）** —— 把 `wake_teammate` 的触发从「猜」变成「看标志」。
+
+- 插件在宿主 ctx 上监听 `session/event`（官方 `dsh-scope/lib/invariant.js:26` 把它标为不按 agent 过滤的全局广播；
+  官方 agent-team 自己就是这么监听的：`dsh-experimental-agent-team/lib/index.js:1720-1722`），
+  看到某队员的 `turn/end` 且 `reason.kind === 'max-tokens'` 就记账；任何一次正常收尾/中止/报错都清掉。
+- `list_agents` 通过 `annotateTruncatedMembers` 给该队员行追加一条固定文案
+  （「…用 wake_teammate 叫它从断点续写」），Lead 据此区分**该 wake 续写**还是**该 send_message 给新指令**。
+- 为什么放 `diagnostics` 而不是新增字段：那个字段官方 schema 里本来就有（放创建失败原因），
+  不新增字段 = 不动 Lead 的工具目录 = 不动每次请求的缓存前缀。
+- 写入点 `runtime.noteTurnEndReason(agentId, kind)` 是监听器与集成测试**共用的同一个函数**，
+  被测的就是生产路径，不是为测试另造的假入口。
 
 ---
 
@@ -285,19 +333,23 @@ dsh-dispatch-agent-team/
 ├── icon.svg
 ├── locale/{zh,en}.json             # 插件卡片标题与描述
 ├── lib/
-│   ├── roster.js                   # 12 角色表 + 配置模型 + 队员能力面常量（共享真值，零 dsh 依赖）
+│   ├── roster.js                   # 12 角色表 + 配置模型 + 队员能力面常量 + 广播/截断纯函数
+│   │                               #   （共享真值，零 dsh 依赖，可直接 import 做单测）
 │   ├── playbook.js                 # PLAYBOOK / TEAM_POLICY / 共享队员卡 TEAMMATE_CARD / teammateBrief
 │   │                               #   / teamCommandLine / wakeInstruction（工具路径不再注入任何消息）
 │   ├── resume.js                   # 会话级团队开关记忆（重启后自动恢复；纯逻辑可单测，零 dsh 依赖）
 │   ├── cache.js                    # 缓存保活 + 缓存统计（纯策略层可单测；控制器挂 llm/stream 瀑布）
 │   ├── runtime.js                  # 配置读写、模型目录、preflight、enable/disable、队员收窄与遮蔽、
 │   │                               #   会话记忆恢复（restoreRemembered）
-│   ├── tools.js                    # 官方九个团队工具（可只注册子集）+ wake_teammate + 两个开关工具 + report_result
+│   ├── tools.js                    # 官方九个团队工具（可只注册子集）+ wake_teammate / broadcast_message
+│   │                               #   + 队员专用 report_result / ask_lead + 两个开关工具
 │   ├── index.js                    # host 入口：HTTP 路由（含 revision CAS）+ 控制面注册 + 生命周期接线
 │   ├── preset.js                   # preset 入口：**只**注册调度模式提示词段（apply）；控制面由
 │   │                               #   `registerControls()` 导出、交由 host 入口在宿主平面注册
 │   └── client.js                   # 浏览器半：插件详情页配置表单（手写 lazy-CJS，无需构建）
 ├── tools/
+│   ├── lib-dsh-home.cjs             # DSH 主目录 / profile 目录的唯一解析口径（认 DSH_HOME）
+│   ├── lib-atomic-write.cjs         # tmp+rename 原子写（profile 关键文件不许留半份）
 │   ├── install.cjs                 # ★ 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
 │   ├── drift-check.cjs             # 官方升级漂移检测（50 项，升级后必跑）
 │   ├── repair.cjs                  # 安装状态体检 / 崩溃恢复后的修复
