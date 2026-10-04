@@ -364,6 +364,29 @@ function functionBodyOf(source, needle) {
     }
   });
 
+  await check('INTERFACES §1 的 roster 契约清单与真实导出逐项对账（双向）', () => {
+    // 动机：这份清单是别人改插件时的**唯一接口文档**，飘了就等于骗人。
+    // 2026-10-04 审查 P2-26/27：只做单向检查抓不到「代码加了导出、文档没补」，
+    // 所以两侧都要判：文档有 / 代码无 -> FAIL；代码有 / 文档无 -> FAIL。
+    const doc = readFileSync(path.join(PLUGIN_DIR, 'INTERFACES.md'), 'utf8');
+    const section = doc.slice(doc.indexOf('## 1. '), doc.indexOf('## 2. '));
+    const documented = new Set([...section.matchAll(/^export (?:const|let|function) (\w+)/gmu)].map((match) => match[1]));
+    // 判据用「块里能解析出 roster 的已知符号」，不用 length/关键字黑名单：§1 的注释里本来就
+    // 合法地写着 `-> undefined`（deriveRole 的返回值），拿裸字符串当守卫会误报。
+    assert.ok(section.includes('lib/roster.js') && documented.has('ROLES'), '抓不到 INTERFACES §1 的整块（标题漂了？）');
+    const actual = new Set(Object.keys(roster));
+    assert.ok(documented.size >= 20, `只从文档解析出 ${documented.size} 个导出名，正则漂了？`);
+    const ghost = [...documented].filter((name) => !actual.has(name));
+    const undocumented = [...actual].filter((name) => !documented.has(name));
+    assert.deepEqual(ghost, [], `文档列了但代码里没有（假接口）：${ghost.join(', ')}`);
+    assert.deepEqual(undocumented, [], `代码导出了但文档没列（别人按文档改就会漏）：${undocumented.join(', ')}`);
+    // 清单里写死的数量注释也必须为真（MEMBER=9 个、官方九个）。
+    assert.equal(roster.MEMBER_TEAM_TOOL_NAMES.length, 9, '§1 注释写着队员 9 个');
+    assert.equal(roster.TEAM_TOOL_NAMES.length, 9, '§1 注释写着官方九个团队工具');
+    assert.equal(roster.LEAD_TEAM_TOOL_NAMES.length, 11, '§1 注释写着 Lead = 官方九个 + 为 Lead 加的两个');
+    assert.equal(roster.TEAMMATE_TOOL_DENY.length, 9, '§1 的 deny 表(README §4.5)列了 9 个名字');
+  });
+
   await check('broadcast 目标规划：排除 lead、默认不唤醒 inactive、id 兼容、逐个理由可解释', () => {
     const rows = [
       { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
