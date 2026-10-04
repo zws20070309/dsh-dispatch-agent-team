@@ -228,8 +228,10 @@ check('官方 agent-team-profile 的 patch 仍存在且含三行 id', () => {
 const officialTool = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-tool-agent-team/lib/index.js') || '';
 check('官方工具包仍含九个工具名', () => {
   if (officialTool === '') return '读不到 dsh-experimental-tool-agent-team/lib/index.js';
-  const missing = OFFICIAL_TEAM_TOOL_NAMES.filter((name) => !officialTool.includes(`"${name}"`));
-  return missing.length === 0 ? true : `官方工具包缺：${missing.join(', ')} —— 本插件的 lib/tools.js 需要对齐`;
+  // P2-19④：要求 `name: "x"` 这一定义形状，而不是裸 `"x"` 子串 —— 后者连
+  // 「名字只出现在注释或错误文案里」都算命中。实测今日九个全部以该形状出现。
+  const missing = OFFICIAL_TEAM_TOOL_NAMES.filter((name) => !officialTool.includes(`name: "${name}"`));
+  return missing.length === 0 ? true : `官方工具包里找不到这些工具定义：${missing.join(', ')} —— 本插件的 lib/tools.js 需要对齐`;
 });
 
 // 3) 官方域服务仍提供 agentTeams 及我们调用到的方法
@@ -250,8 +252,12 @@ check('官方域服务仍提供 agentTeams 与全部被调用方法', () => {
     'waitForChange',
     'interrupt',
   ];
-  const missing = methods.filter((name) => !officialDomain.includes(`${name}(`));
-  return missing.length === 0 ? true : `域服务缺方法：${missing.join(', ')}`;
+  // P2-19④：旧写法判据是 `name + '('`，那**不区分定义与调用点**——官方内部大量互相调用
+  // （如 roster 里的 `this.tryMembership(agent)`、`this.ctx.subagents.interrupt(target.id, …)`），
+  // 所以哪怕域服务上那个方法整个被删，检查也照样绿。改成要求「行首缩进 + (async )?名字 + (」
+  // 这一**定义**形状；实测今日 11 个方法全部命中（397/387/1755/1764/1773/1782/1791/1799/1808/1818/503）。
+  const missing = methods.filter((name) => !new RegExp('^\\s{0,10}(?:async\\s+)?' + name + '\\s*\\(', 'mu').test(officialDomain));
+  return missing.length === 0 ? true : '域服务里找不到这些**方法定义**：' + missing.join(', ');
 });
 
 // 4) agent/request waterfall 仍在（队员模型/强度覆盖的唯一支点）
@@ -453,8 +459,12 @@ const HOST_TOOLS_INDEX = 'dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js';
 check('@deepseek-ai/dsh-tools 仍导出 defineTool', () => {
   const source = asar.read(HOST_TOOLS_INDEX);
   if (source === void 0) return 'dsh-tools 包不在安装闭包里';
-  if (!/defineTool/u.test(source)) {
-    return '找不到 defineTool —— lib/tools.js 的静态 import 会拿到 undefined，九个工具全部注册失败';
+  // P2-19④：裸 /defineTool/ 连「只有注释里提到」都算过。要求看到**定义**形状
+  // （function defineTool / const defineTool =）或 **export 块里有它**，二者满足其一。
+  const declared = /function defineTool\b/u.test(source) || /const defineTool\b/u.test(source);
+  const exported = /export \{[^}]*\bdefineTool\b[^}]*\}/u.test(source);
+  if (!declared && !exported) {
+    return 'defineTool 的定义/导出都找不到了 —— lib/tools.js 的静态 import 会拿到 undefined，九个工具全部注册失败';
   }
   return true;
 });
@@ -512,7 +522,9 @@ check('dsh-settings 仍有 prepareDocument()/documentPath（DSH 主目录定位�
 
 // 10f-2) 队员能力面收窄依赖 `ctx.tools.restrict()`。它是**载重依赖**：一旦官方删掉/改语义，
 // 队员就会静默恢复成「和目标工具、子代理工具、Lead 专属开关全都有」，而没有任何报错。
-check('dsh-tools 仍提供 restrict() 且仍是「只过滤继承面」的语义', () => {
+// 注意最后那条是**注释金丝雀**：它判的是官方源码里的英文注释原文，不是行为。
+// 官方只改措辞（语义没变）也会让这一条 FAIL —— 那不是回归，是提醒「去重读一遍实现」。
+check('dsh-tools 仍提供 restrict() 且仍是「只过滤继承面」的语义（末条为注释金丝雀，可能只是措辞变化）', () => {
   const source = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js');
   if (source === void 0) return 'dsh-tools 包不在安装闭包里';
   if (!/restrict\(filter\)/u.test(source)) {
