@@ -387,6 +387,42 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.TEAMMATE_TOOL_DENY.length, 9, '§1 的 deny 表(README §4.5)列了 9 个名字');
   });
 
+  await check('INTERFACES §3 的 runtime 契约覆盖了**其它模块真正调用**的每个成员（双向）', () => {
+    // 判据不是「列出全部导出」——runtime.js 有 30+ 个导出，多数是模块内部细节，全塞进文档
+    // 只会让文档变噪音。真正的契约是**跨模块调用面**：index.js / preset.js / tools.js 里
+    // 以代码形式写了 `runtime.<name>` 的每一个名字，§3 都必须登记；文档写了而代码没有的，
+    // 就是假接口（2026-10-04 审查 P2-21/26）。
+    // 注释里的 `runtime.<name>` **不算**（第一版算进来了，把一句解释当成契约，误报）。
+    const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    const actual = new Set([...source.matchAll(/^export (?:async )?function (\w+)|^export const (\w+)|^export \{ (\w+) \}/gm)].map((match) => match[1] ?? match[2] ?? match[3]));
+    const doc = readFileSync(path.join(PLUGIN_DIR, 'INTERFACES.md'), 'utf8');
+    const sec3 = doc.slice(doc.indexOf('## 3. `lib/runtime.js`'), doc.indexOf('### 3.1'));
+    const documented = new Set([...sec3.matchAll(/^export (?:async )?function (\w+)|^export const (\w+)/gm)].map((match) => match[1] ?? match[2]));
+    assert.ok(sec3.includes('lib/runtime.js') && documented.has('status'), '抓不到 INTERFACES §3 的契约块（标题漂了？）');
+    const ghost = [...documented].filter((name) => !actual.has(name));
+    assert.deepEqual(ghost, [], `§3 列了但 runtime 没有（假接口）：${ghost.join(', ')}`);
+    const used = new Set();
+    for (const file of ['index.js', 'preset.js', 'tools.js']) {
+      const text = readFileSync(path.join(PLUGIN_DIR, 'lib', file), 'utf8');
+      for (const line of text.split('\n')) {
+        if (/^\s*(\/\/|\/\*|\*)/.test(line)) continue; // 整行注释: 提到不等于依赖
+        for (const match of line.matchAll(/\bruntime\??\.([A-Za-z_]\w*)/g)) {
+          if (match[1] !== 'js') used.add(match[1]); // 排掉 'runtime.js' 文件名里的假命中
+        }
+      }
+    }
+    const undocumented = [...used].filter((name) => !documented.has(name));
+    assert.deepEqual(undocumented, [], `别的模块在用但 §3 没登记（改了会静默崩）：${undocumented.join(', ')}`);
+    // status() 的返回形状：文档必须与真实字段一致（它是插件页与状态文件的读接口）。
+    const statusBlock = /export function status\(agent\)[\s\S]*?\n  \};/.exec(source);
+    assert.ok(statusBlock !== null, '抓不到 status() 的函数体（形状变了？）');
+    for (const field of ['enabled', 'role', 'route', 'domain', 'restrictedTools', 'diagnostics']) {
+      // 允许**简写属性**（status() 里就是 `role,` 而不是 `role:`）：字段名后跟冒号或直接到逗号。
+      assert.ok(new RegExp('[{,\\s]' + field + '(\\s*:|\\s*,)').test(statusBlock[0]), `status() 少了字段 ${field}`);
+      assert.ok(sec3.includes(field), `§3 的 status() 契约没写 ${field}（消费方按它渲染）`);
+    }
+  });
+
   await check('broadcast 目标规划：排除 lead、默认不唤醒 inactive、id 兼容、逐个理由可解释', () => {
     const rows = [
       { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },

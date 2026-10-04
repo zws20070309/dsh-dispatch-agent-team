@@ -163,7 +163,30 @@ export function isEnabled(agent);                // -> boolean（按 agent.id �
 export async function enable(ctx, agent, opts);  // opts: {source:'command'|'tool'|'boot', rawInput?:string, extra?:string}
                                                  // -> {ok:boolean, enabled:boolean, member:boolean, diagnostics:string[]}
 export function disable(ctx, agent);             // -> {ok:boolean, wasEnabled:boolean}
-export function status(agent);                   // -> {enabled:boolean, role:string|undefined, route:object|undefined, diagnostics:string[]}
+export function status(agent);                   // -> {enabled:boolean, role:string|undefined, route:object|undefined,
+                                                 //    domain:boolean|null, restrictedTools:string[]|undefined, diagnostics:string[]}
+
+// —— 以下是**其它模块以代码形式调用**的契约。selftest 有一条双向对账会验证这张表：
+//    别人用了而这里没登记 -> FAIL；这里写了而 runtime 没有 -> FAIL。改名/新增必须同步。
+export const TEAM_POLICY_ORDER = 600;      // 团队事实段的 order（官方槽位同为 600；写 60 会插错位置，§0.1 第 6 条）
+export function peekRevision();            // -> number；配置文件的修订号（HTTP 保存的 revision CAS 用它）
+export function notes();                   // -> string[]；注册期信息快照（浅拷贝）
+export function diagnostics();             // -> string[]；故障快照（浅拷贝，外部改不到内部数组）
+export function recordBootNote(message, kind); // 记一条注册期记录；kind='info' 走信息通道，其余走故障通道
+export function inject(agent, text);       // 把 text 作为 user 消息投给该 agent 的下一个 turn；**抛错**而非返回 {ok:false}，
+                                           //    否则 preset.js 的 tryInject 会把失败当成功（静默吞错）
+export function pinSpawnRoute(name, route);// 给某个队员钉路由；**只**由 spawn 的显式参数产生（§0.1 第 41 条）
+export function watchAgents(ctx);          // 幂等订阅 agent/created、agent/disposed、session/event（截断记账的入口）
+export function reconcileAgents(ctx);      // 给所有活体 agent 补齐安装：冷恢复 + 补装的统一入口
+export function disposeAll();              // 卸载全部注册并清内部状态（含截断账本与保活计时器）
+export function setStatusRefresh(fn);      // 注入「重算并写状态文件」的回调（lib/index.js 用它做 settled 阶段重写）
+export function installKeepalive(ctx);     // 挂 llm/stream 瀑布（缓存保活 + 统计）；幂等
+export function keepaliveStats();          // -> 保活/缓存命中统计快照（插件页与状态文件都读它）
+export function recentReports();           // -> 最近的队员报告（浅拷贝）
+export function recordReport(name, report);// 记一条队员报告：report_result 的落账口
+export function truncatedMemberIds();      // -> Set<agentId>；上一轮撞输出上限且未交付的队员（list_agents 标注用）
+export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
+export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
 ```
 
 ### 3.1 `enable()` 必须做的事（顺序固定）
