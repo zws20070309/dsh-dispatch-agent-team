@@ -117,7 +117,8 @@ export function planBroadcastTargets(members, {targets?, includeInactive?, calle
 export function annotateTruncatedMembers(rows, truncatedIds);
                                     // -> 新数组；被记账户里的队员行追加 TRUNCATED_DIAGNOSTIC，不改入参
 export function askLeadMessage(question, blocking);  // -> 投递给 lead 的正文（含固定前缀）
-export function deriveRole(name);   // 'verify-2' -> 'verify'; 非法 -> undefined
+export function deriveRole(name);   // 'verify-2' / 'verify-deep' -> 'verify'（最长角色前缀）；
+                                    // 形状不是官方队员名 -> undefined（'scout-' / 'Scout' / 'lead'）
 export function isValidTeammateName(name);
 export function nextTeammateName(role, taken);
 export function defaultConfig();    // {version, roles:{}}
@@ -267,7 +268,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 name: 'spawn_teammate'
 parameters: {
   role: { type:'string', required:true, enum: ROLE_IDS, description:'队员角色 id；队员名由此决定。' },
-  name: { type:'string', description:'可选，必须是 <角色id> 或 <角色id>-N；省略时自动取未占用的名字。' },
+  name: { type:'string', description:'可选，必须以角色 id 开头（<角色id> / <角色id>-<后缀>）；省略时自动取未占用的名字。' },
   description: { type:'string', required:true, description:'这个队员负责什么（一句话）。' },
   prompt: { type:'string', required:true, description:'自包含的初始任务：目标/已知事实+文件行号/要做什么/边界与写域/验收标准/回复格式/汇报方式。' },
   context: { type:'string', enum:['fresh','fork'], description:'默认 fresh。' },
@@ -279,7 +280,13 @@ parameters: {
 
 `execute` 逻辑：
 1. `role` 必须合法；`name` 若给了必须 `isValidTeammateName` 且 `deriveRole(name) === role`，
-   否则报错。没给则用 `nextTeammateName(role, 现有队员名 + 'lead')`。
+   否则报错。**显式给名字时也会查一次已占用名单**（同一个 `takenNames`），撞名直接给出下一个可用名
+   —— 官方的 roster 是历史累计、名字永不复用，撞上时官方只抛一句英文
+   `teammate name "X" was already used in this Team`（2026-10-05）。
+   没给则用 `nextTeammateName(role, 现有队员名 + 'lead')`。
+   `spawnTeammate` 抛出的官方错误码还会被翻译成带下一步动作的中文：
+   `TEAM_MEMBER_NAME_TAKEN` / `TEAM_MEMBER_LIMIT`（累计帽）/ `ACTIVATION_LIMIT_REACHED`
+   （同时在线帽，`maxActiveSubagents`，进程级共享、满了不排队）。
 2. 路由：工具显式 `provider/model/reasoning_effort` > `resolveRoleRoute(peekConfig(), role)` > 不覆盖（继承 Lead）。
    显式给了 provider 或 model 其中一个而另一个缺失 → 报错。**先 `preflightRoute`**，
    `ok:false` 就报错，被丢掉的 effort 要写进返回值 diagnostics。
