@@ -86,6 +86,7 @@ const PACKAGE_FILES = [
   'lib/playbook.js',
   'lib/cache.js',
   'lib/resume.js',
+  'lib/text-clip.js',
   'lib/client.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
@@ -185,7 +186,7 @@ if (installed) {
       // 源码目录的修改停在原地）。只打印路径太容易被无视，所以把**具体哪几个模块更新**列出来，
       // 并直接升为问题项（不是提示），逼着用户去重跑 install。
       const drifted = [];
-      for (const relative of ['lib/index.js', 'lib/preset.js', 'lib/runtime.js', 'lib/tools.js', 'lib/roster.js', 'lib/playbook.js', 'lib/cache.js', 'lib/resume.js', 'lib/client.js']) {
+      for (const relative of ['lib/index.js', 'lib/preset.js', 'lib/runtime.js', 'lib/tools.js', 'lib/roster.js', 'lib/playbook.js', 'lib/cache.js', 'lib/resume.js', 'lib/text-clip.js', 'lib/client.js']) {
         try {
           const a = fs.statSync(path.join(pluginDir, relative)).mtimeMs;
           const b = fs.statSync(path.join(realInstalled, '..', relative)).mtimeMs;

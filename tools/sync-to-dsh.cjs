@@ -66,6 +66,7 @@ const FILES = [
   'lib/playbook.js',
   'lib/cache.js',
   'lib/resume.js',
+  'lib/text-clip.js',
   'lib/client.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
