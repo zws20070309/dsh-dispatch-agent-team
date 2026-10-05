@@ -125,7 +125,7 @@ node tools\install.cjs
 
 ```
 node tools\repair.cjs             # 安装状态体检（bundles / junction / 文件齐全 / 崩溃恢复痕迹）
-node tools\drift-check.cjs        # 55 项官方实现假设校验（升级后必跑）
+node tools\drift-check.cjs        # 56 项官方实现假设校验（升级后必跑）
 node tools\selftest.cjs           # 纯逻辑回归（角色表 / 配置净化 / 保活策略 / 文本不变量）
 node tools\integration-test.cjs   # 真链路：真 cordis + dsh-tools + systemPrompt + llm/stream 瀑布
 node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替身，真渲染组件）
@@ -355,7 +355,7 @@ dsh-dispatch-agent-team/
 │   ├── lib-dsh-home.cjs             # DSH 主目录 / profile 目录的唯一解析口径（认 DSH_HOME）
 │   ├── lib-atomic-write.cjs         # tmp+rename 原子写（profile 关键文件不许留半份）
 │   ├── install.cjs                 # ★ 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
-│   ├── drift-check.cjs             # 官方升级漂移检测（55 项，升级后必跑）
+│   ├── drift-check.cjs             # 官方升级漂移检测（56 项，升级后必跑）
 │   ├── repair.cjs                  # 安装状态体检 / 崩溃恢复后的修复
 │   ├── emergency-disable.cjs       # DSH 起不来时的一键退出
 │   ├── history-audit.cjs           # 只读：某个斜杠命令在本机到底有没有活过（判「历史 vs 活命令」）
@@ -678,7 +678,7 @@ cordis patch**——那正好是崩溃恢复会改名备份的文件。
 ## 6. 维护（官方升级后必做）
 
 ```
-node tools\drift-check.cjs      # 55 项：逐条验证本插件依赖的官方实现细节是否还在
+node tools\drift-check.cjs      # 56 项：逐条验证本插件依赖的官方实现细节是否还在
 node tools\repair.cjs           # 安装状态体检（bundles / junction / 文件齐全 / 恢复痕迹）
 node tools\selftest.cjs         # 纯逻辑回归（角色表 / 配置净化 / 缓存策略 / 报告校验 / 文本不变量）
 node tools\integration-test.cjs # 真链路（真 cordis + dsh-tools + dsh-system-prompt + llm/stream 瀑布）
