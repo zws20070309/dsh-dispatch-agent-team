@@ -1914,6 +1914,113 @@ async function main() {
       if (!String((effortOnly?.diagnostics ?? []).join(' ')).includes('思考强度')) return '回执里没说清楚只钉了强度';
       return true;
     });
+
+    // ── 失败路径（2026-10-05 补：这条路径此前没有任何用例，我的 scope 笔误就是从这儿漏出去的）──
+    // 事实：Agent Teams 的 roster 是**历史累计**记录，队员名永不复用（官方 roster.js:243-244），
+    // 撞上时官方只抛一句英文 `teammate name "X" was already used in this Team`。
+    // 插件应当把它翻译成带**下一个可用名**的中文；这里用与真域服务同形的假服务验这条链路。
+    const nameTakenError = new Error('teammate name "builder-2" was already used in this Team');
+    nameTakenError.code = 'TEAM_MEMBER_NAME_TAKEN';
+    const limitError = new Error('Team member limit 48 reached');
+    limitError.code = 'TEAM_MEMBER_LIMIT';
+    const activationError = new Error('subagent limit reached (active child limit: 15); wait for an existing child to finish');
+    activationError.code = 'ACTIVATION_LIMIT_REACHED';
+
+    /** 造一个「spawnTeammate 必抛某个官方错误码」的工具面；taken 决定预检能否提前拦住。 */
+    const spawnWithFailure = (failure, members) => {
+      const tools = toolsModule.teamToolDefinitions({
+        runtime: spawnRuntime,
+        agentTeams: {
+          listMembers: () => members,
+          spawnTeammate: async () => { throw failure; },
+        },
+        include: roster.LEAD_TEAM_TOOL_NAMES,
+      });
+      return tools.find((definition) => definition.name === 'spawn_teammate');
+    };
+
+    const takenRow = { id: 'builder-agent', name: 'builder-2', role: 'teammate', status: 'inactive' };
+    const thrown = {};
+    for (const [label, failure, members] of [
+      ['重名（预检提前拦）', nameTakenError, [takenRow]],
+      ['重名（预检没拦住，官方兜底）', nameTakenError, []],
+      ['累计帽', limitError, []],
+      ['同时在线帽', activationError, []],
+    ]) {
+      try {
+        await spawnWithFailure(failure, members).execute(
+          { role: 'builder', name: 'builder-2', description: 'x', prompt: 'y' },
+          { agent: caller },
+        );
+        thrown[label] = null;
+      } catch (error) {
+        thrown[label] = error;
+      }
+    }
+
+    check('spawn_teammate：重名在插件侧就被拦下，并给出下一个可用名（不把官方英文原文丢给模型）', () => {
+      const error = thrown['重名（预检提前拦）'];
+      if (error === null || error === undefined) return '竟然派出去了（名单里 builder-2 已存在）';
+      if (error instanceof ReferenceError) return `失败路径自己抛了 ReferenceError：${error.message}`;
+      if (!error.message.includes('已经用过')) return error.message;
+      // 建议的名字必须是**真的可用**的：从报错里抠出来再验一遍（断言比写死 builder-3 更强——
+      // 这条名单里 builder 本来就空着，写死具体值会把「算法变了」误判成失败）。
+      const suggested = /改成 "([a-z0-9-]+)"/u.exec(error.message)?.[1];
+      if (suggested === undefined) return `没给出下一个可用名：${error.message}`;
+      if (suggested === 'builder-2') return '建议了一个已被占用的名字';
+      if (!roster.isValidTeammateName(suggested)) return `建议的名字本身不合法：${suggested}`;
+      return true;
+    });
+
+    check('spawn_teammate：官方错误码被翻译成可执行中文（重名/累计帽/同时在线帽）', () => {
+      const fallback = thrown['重名（预检没拦住，官方兜底）'];
+      if (fallback === null || fallback === undefined) return '官方抛错却没被捕获';
+      // 这条最容易踩的坑：翻译函数在 execute 作用域里引用了 resolveSpawn 的局部变量（role/taken），
+      // 于是每次 spawn 失败都变成 ReferenceError —— 比原始的英文报错更糟。
+      if (fallback instanceof ReferenceError) return `翻译路径抛了 ReferenceError：${fallback.message}`;
+      if (!fallback.message.includes('已经用过')) return `没翻译成中文：${fallback.message}`;
+      const limit = thrown['累计帽'];
+      if (limit === null || limit === undefined) return '累计帽错误没被捕获';
+      if (!limit.message.includes('历史成员额度已满')) return limit.message;
+      const activation = thrown['同时在线帽'];
+      if (activation === null || activation === undefined) return '同时在线帽错误没被捕获';
+      if (!activation.message.includes('同时在线队员额度已满')) return activation.message;
+      if (!activation.message.includes('先 wait_agent')) return `没给出下一步动作：${activation.message}`;
+      return true;
+    });
+
+    // 用户实测的两个报错：name "scout-core" / name "scout-validate" 不是合法的队员名。
+    // 这里走**真工具**执行路径，证明它们现在能一路走到 spawnTeammate（旧实现全在插件层被拒）。
+    const accepted = [];
+    const relaxedTools = toolsModule.teamToolDefinitions({
+      runtime: spawnRuntime,
+      agentTeams: {
+        listMembers: () => [],
+        spawnTeammate: async (_caller, request) => {
+          accepted.push(request.name);
+          return { member: { id: `agent-${request.name}`, name: request.name, role: 'teammate', status: 'inactive', diagnostics: [] } };
+        },
+      },
+      include: roster.LEAD_TEAM_TOOL_NAMES,
+    });
+    const relaxedTool = relaxedTools.find((definition) => definition.name === 'spawn_teammate');
+    const relaxErrors = [];
+    for (const [role, name] of [['scout', 'scout-core'], ['scout', 'scout-validate'], ['plan-critic', 'plan-critic-verify']]) {
+      try {
+        await relaxedTool.execute({ role, name, description: 'x', prompt: 'y' }, { agent: caller });
+      } catch (error) {
+        relaxErrors.push(`${name}: ${error.message}`);
+      }
+    }
+    check('spawn_teammate：放宽后的名字也能派出（scout-core / plan-critic-verify 这类过去被插件自己拒掉）', () => {
+      if (relaxErrors.length > 0) return `这些名字仍被拒：${relaxErrors.join('；')}`;
+      const expected = ['scout-core', 'scout-validate', 'plan-critic-verify'];
+      if (JSON.stringify(accepted) !== JSON.stringify(expected)) return `实际派出：${JSON.stringify(accepted)}`;
+      // 角色必须推导正确（plan-critic-verify 不能被误判成 plan——最长前缀匹配的意义）。
+      if (roster.deriveRole('plan-critic-verify') !== 'plan-critic') return 'plan-critic-verify 的角色推导错了';
+      if (roster.deriveRole('scout-core') !== 'scout') return 'scout-core 的角色推导错了';
+      return true;
+    });
   })();
 
   // 临时目录收尾：不留任何东西在磁盘上。
