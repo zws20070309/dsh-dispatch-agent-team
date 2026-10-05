@@ -1126,6 +1126,7 @@ async function main() {
     preflightRoute: async (_ctx, route) => ({ ok: true, route, diagnostics: [] }),
     pinSpawnRoute: () => {},
     recordReport: (name, report) => runtime.recordReport(name, report),
+    markReportDelivered: (entry, delivered) => runtime.markReportDelivered(entry, delivered),
     // 截断账本的读口也委托给真 runtime：noteTurnEndReason 是它的写入点，
     // list_agents 通过这里取值（被测的就是生产路径）。
     truncatedMemberIds: () => runtime.truncatedMemberIds(),
@@ -1181,10 +1182,42 @@ async function main() {
       if (!text.startsWith('【report_result】scout · completed')) return text.slice(0, 80);
       if (!text.includes('未决项：无')) return '完成态报告缺「未决项：无」';
       const reports = runtime.recentReports();
-      const last = reports[reports.length - 1];
-      if (last === undefined || last.name !== 'scout' || last.status !== 'completed') return JSON.stringify(reports.slice(-1));
+      const last = reports.items[reports.items.length - 1];
+      if (last === undefined || last.name !== 'scout' || last.status !== 'completed') return JSON.stringify(reports.items.slice(-1));
+      // 投递成功时记录里必须补上 delivered=true（2026-10-05 审查 §1-⑤ 的顺序修复）。
+      if (last.delivered !== true) return `投递成功后记录里的 delivered=${String(last.delivered)}（应为 true）`;
+      if (reports.dropped !== 0) return `dropped 应为 0，实为 ${reports.dropped}`;
       return true;
     });
+
+    // 投递失败的那条路径：记录里必须留下 delivered=false，而不是显示成一条正常的报告。
+    // 这正是修复前的问题——「插件页记录」与「Lead 邮箱」两套口径不一致。
+    {
+      const failingRuntime = {
+        ...reportRuntime,
+        recordReport: (name, report) => runtime.recordReport(name, report),
+      };
+      const failingTools = toolsModule.teamToolDefinitions({
+        runtime: failingRuntime,
+        agentTeams: {
+        ...reportTeams,
+          sendMessage() { throw new Error('mailbox full'); },
+        },
+      });
+      const failingTool = failingTools.find((definition) => definition.name === 'report_result');
+      const failed = await failingTool.execute(
+        { status: 'completed', summary: '投不出去', evidence: ['证据'], unresolved: [], changed_files: [] },
+        { agent: { id: 'scout-agent' } },
+      );
+      check('report_result：投递失败时记录里留下 delivered=false（不再假显示成一条正常汇报）', () => {
+        if (failed.ok !== false || failed.delivered !== false) return `ok=${String(failed.ok)} delivered=${String(failed.delivered)}`;
+        const items = runtime.recentReports().items;
+        const last = items[items.length - 1];
+        if (last === undefined || last.name !== 'scout') return JSON.stringify(items.slice(-1));
+        if (last.delivered !== false) return `delivered=${String(last.delivered)}（投递失败时必须为 false）`;
+        return true;
+      });
+    }
 
     let rejected = false;
     try {
