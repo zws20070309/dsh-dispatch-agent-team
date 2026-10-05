@@ -1228,6 +1228,33 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+  check('package.json 的 files 声明都在 sync 清单里（否则已安装副本会留过期文档）', () => {
+    // 动机（2026-10-05）：tools/sync-to-dsh.cjs 的文件头写着「同步源码与文档」，但它的 FILES
+    // 清单漏了 README.md 与 INTERFACES.md —— 这两个是 package.json 的 files 里声明、正式安装时
+    // 会被拷进插件目录的东西。漏了它们，已安装副本里会留一份过期的 README，看起来像
+    // 「源码改了没同步成功」，而且是**静默**的（sync 自己不会报）。与下一条是同一类问题
+    // （清单与真实文件集脱节），只是对象换成了 package.json 的声明。
+    const manifest = readFileOr(path.join(PLUGIN_DIR, 'package.json'));
+    const syncSource = readFileOr(path.join(PLUGIN_DIR, 'tools', 'sync-to-dsh.cjs'));
+    if (manifest === '' || syncSource === '') return '读不到 package.json 或 tools/sync-to-dsh.cjs';
+    let listed;
+    try {
+      listed = JSON.parse(manifest).files;
+    } catch (error) {
+      return 'package.json 不是合法 JSON：' + String(error && error.message ? error.message : error);
+    }
+    if (!Array.isArray(listed) || listed.length === 0) return 'package.json 的 files 不是非空数组';
+    // files 里会写目录（lib / tools / presets / locale）；这里只核对**单个文件**的条目
+    // （目录展开由下一条管）。
+    const fileEntries = listed.filter((entry) => typeof entry === 'string' && /\.[a-z0-9]+$/iu.test(entry));
+    const missing = fileEntries.filter((entry) => !syncSource.includes("'" + entry + "'"));
+    if (missing.length > 0) {
+      return `package.json 声明了这些文件但 sync-to-dsh.cjs 的 FILES 没列：${missing.join(', ')}`
+        + ' —— 已安装（或已同步）的那份会留过期副本，而脚本自己不会报';
+    }
+    return true;
+  });
+
   check('lib/*.js 的每个文件都在两份清单里（repair 的 PACKAGE_FILES + sync 的 FILES）', () => {
     // 为什么要有这条（2026-10-05）：审查 P1-3 记录过同一类缺口 ——
     // 「旧清单只有 6 个文件，漏了 runtime/tools/roster/playbook，缺了核心模块它照样打印
