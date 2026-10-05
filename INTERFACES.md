@@ -16,7 +16,7 @@
 | 1 | §0:18-19「可以直接 import 的只有 dsh-tools 与 dsh-experimental-agent-team」 | `lib/tools.js:22-34` 允许的静态 import **只剩** `@deepseek-ai/dsh-tools` 与 `./` 内部模块；`TeamTaskId` 已本地实现，不再 import 官方包 |
 | 2 | §0:9-11 的 0.1.5/0.1.7 判断 | **正确**，但要补一条：从插件目录 `import.meta.resolve('@deepseek-ai/dsh-llm')` **是成功的**（解析到全局 CLI 的 0.1.5 副本），失败模式不是 `ERR_MODULE_NOT_FOUND` 而是**静默绑到另一份模块实例**。所以「不要 import」这条结论仍成立，理由要按这句写 |
 | 3 | §1:28 的 `ROLES` 与 §1 导出清单 | 现在是 **12 个角色**（`lib/roster.js:29-198`），并按工作流阶段排序；另新增 7 个导出：`TEAM_TOOL_NAMES` / `LEAD_ONLY_TEAM_TOOL_NAMES` / `MEMBER_TEAM_TOOL_NAMES` / `TEAMMATE_TOOL_DENY` / `TEAMMATE_SECTION_MUTES` / `LEAD_TEAM_TOOL_NAMES`（Lead 的完整工具名单 = 官方九个 + `wake_teammate`）/ `WAKE_TOOL_NAME`（2026-10-01 新增，见第 38 条） |
-| 4 | §2:45 `teammateCard(roleId)` | **该 API 已删除**。现在是与角色无关的常量 `TEAMMATE_CARD`（`lib/playbook.js`）+ 角色简报 `teammateBrief(roleId, name)`（走 Lead 派活提示词）。理由见 README §4.5 |
+| 4 | §2:45 `teammateCard(roleId)` | **该 API 已删除**。现在是与角色无关的常量 `TEAMMATE_CARD`（`lib/playbook.js`）+ 角色简报 `teammateBrief(roleId, name)`（走 Lead 派活提示词）。理由见 MAINTAINER-NOTES.md §4.5 |
 | 5 | §3:56「所有函数都接受宿主 ctx 作为第一个参数」 | 与同段签名自相矛盾：`peekConfig()` / `isEnabled(agent)` / `status(agent)` / `peekRevision()` 都不收 ctx |
 | 6 | §3.1:80/85 策略段与队员卡段 `order: 60` | **代码是 600**（`lib/runtime.js` 的 `TEAM_POLICY_ORDER` / `TEAMMATE_CARD_ORDER`），官方槽位 `TEAM_POLICY = 600`（dsh-system-prompt `SECTION_ORDERS`）。按 60 实现会把两段插到错误位置 |
 | 7 | §3.1「顺序固定」清单 | 队员侧现在多了三步：**清空工具用法段**（`muteToolSections`）、**收窄继承面工具**（`restrictTeammateTools`）、**只注册队员子集团队工具**（`MEMBER_TEAM_TOOL_NAMES`） |
@@ -146,6 +146,23 @@ export const DISABLE_INSTRUCTION;            // 否 已删除（见 §0.1 第 38
 export function teamCommandLine(rawInput);   // 是 /team 注入的 user 消息正文 = 用户原文那一行（可能是 '/team'）
 export function wakeInstruction(name, note); // 是 wake_teammate 发给队员的正文（固定「从断点续」措辞）
 ```
+
+### 2.1 提示词预算（闸门在 `tools/selftest.cjs`，超了就 FAIL）
+
+系统提示词是**每一次请求都要重付的前缀**，所以这些文本要像代码一样管预算。
+分工固定：`PLAYBOOK` 只放**纪律**（该怎么做），`TEAM_POLICY` 只放**运行期语义**（工具返回什么、
+状态是什么意思），两者都不许重复对方的内容。
+
+| 文本 | 预算 | 当前 | 谁在读 |
+|---|---|---|---|
+| `PLAYBOOK` | ≤ 3800 | **3783** | 调度模式的**每一次**请求（Lead） |
+| `TEAM_POLICY` | ≤ 800 | **758** | 团队开启后的 Lead |
+| `TEAMMATE_CARD` | ≤ 1150 | **1134** | 每个队员的固定前缀 |
+| Lead 侧合计 | ≤ 4900 | **4541** | |
+| 队员侧合计（卡 + 角色简报） | ≤ 1550 | **1509** | 简报是第一条 user 消息，同样进前缀 |
+
+改这四段文本后必须重跑 `node tools/selftest.cjs`：那条闸门会拿上面的数字与模块实测长度对账
+（`README` 里的旧副本已随文档精简移除，现在这份表是唯一真值）。
 
 ## 3. `lib/runtime.js`（`builder-host` 写）—— 三模块共用单例
 
@@ -331,7 +348,7 @@ export { TEAM_TOOL_NAMES };                                            // 名字
 > 注意：**本节与 §5.2 / §5.3 已过时且危险，先读 §0.1 第 15/16 条**：
 > `apply()` **只注册一个提示词段**，`inject` 只有 `['systemPrompt']`；
 > 两个命令与两个开关工具由 `registerControls(ctx)` 导出、在**宿主平面**注册
-> （`lib/index.js` 调用）。在 preset 子树里发布能力会让**整份 preset 变 broken**（README §8.2）。
+> （`lib/index.js` 调用）。在 preset 子树里发布能力会让**整份 preset 变 broken**（MAINTAINER-NOTES.md §8.2）。
 
 ```js
 export const name = '@zws/dsh-dispatch-agent-team/preset';

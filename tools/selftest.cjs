@@ -406,8 +406,10 @@ function functionBodyOf(source, needle) {
     assert.equal(playbook.TEAMMATE_CARD.length >= 800, true, `TEAMMATE_CARD 实测只有 ${playbook.TEAMMATE_CARD.length} 字`);
   });
   // ── 提示词卫生（2026-09-30 用户要求：干净、有条理、简洁而作用大）────────────────
-  await check('README 提示词预算表的「当前」列 == 实测长度（防手抄漂移）', () => {
-    const doc = readFileSync(path.join(PLUGIN_DIR, 'README.md'), 'utf8');
+  // 2026-10-05：预算表从 README 迁到 INTERFACES §2.1 —— README 改成面向使用者的简明文档，
+  // 而这条对账需要一份**长期存在**的实现文档来承载。判据本身没变（仍是模块实测 .length）。
+  await check('INTERFACES §2.1 提示词预算表的「当前」列 == 实测长度（防手抄漂移）', () => {
+    const doc = readFileSync(path.join(PLUGIN_DIR, 'INTERFACES.md'), 'utf8');
     const measured = {
       PLAYBOOK: playbook.PLAYBOOK.length,
       TEAM_POLICY: playbook.TEAM_POLICY.length,
@@ -418,19 +420,19 @@ function functionBodyOf(source, needle) {
       const pattern = '\\| `' + label + '` \\| ≤ (\\d+) \\| \\*\\*(\\d+)\\*\\*';
       const row = new RegExp(pattern).exec(doc);
       assert.ok(row !== null, '预算表里找不到 ' + label + ' 那一行');
-      assert.equal(Number(row[2]), value, 'README 预算表写 ' + label + ' 当前 ' + row[2] + '，实测 ' + value);
+      assert.equal(Number(row[2]), value, 'INTERFACES §2.1 预算表写 ' + label + ' 当前 ' + row[2] + '，实测 ' + value);
       assert.ok(value <= Number(row[1]), label + ' 实测 ' + value + ' 超过预算 ' + row[1]);
     }
     const leadRowPattern = '\\| Lead 侧合计 \\| ≤ (\\d+) \\| \\*\\*(\\d+)\\*\\*';
     const leadRow = new RegExp(leadRowPattern).exec(doc);
     assert.ok(leadRow !== null, '预算表里找不到 Lead 侧合计那一行');
-    assert.equal(Number(leadRow[2]), playbook.PLAYBOOK.length + playbook.TEAM_POLICY.length, 'README 的 Lead 侧合计与实测不符');
+    assert.equal(Number(leadRow[2]), playbook.PLAYBOOK.length + playbook.TEAM_POLICY.length, 'INTERFACES 的 Lead 侧合计与实测不符');
     // 队员侧合计也要对账（2026-10-04）：它 = 共享卡 + 该角色的简报。各角色简报长度不同，
     // 表里写的是**代表性样本**（scout），所以按这一口径核；超预算则直接 FAIL。
     const mateRow = new RegExp('\\| 队员侧合计（卡 \\+ 角色简报） \\| ≤ (\\d+) \\| \\*\\*(\\d+)\\*\\*').exec(doc);
     assert.ok(mateRow !== null, '预算表里找不到队员侧合计那一行');
     const mateMeasured = playbook.TEAMMATE_CARD.length + playbook.teammateBrief('scout', 'scout').length;
-    assert.equal(Number(mateRow[2]), mateMeasured, 'README 的队员侧合计与实测不符（卡 + scout 简报）');
+    assert.equal(Number(mateRow[2]), mateMeasured, 'INTERFACES 的队员侧合计与实测不符（卡 + scout 简报）');
     assert.ok(mateMeasured <= Number(mateRow[1]), '队员侧合计 ' + mateMeasured + ' 超过预算 ' + mateRow[1]);
   });
 
@@ -469,7 +471,7 @@ function functionBodyOf(source, needle) {
   });
 
   await check('import 边界：纯逻辑模块只许 import node: 与 ./（把散在 4 处的说法变成可跑断言）', () => {
-    // 动机（2026-10-05 审查 §1-⑧）：这条事实此前散在 README 的目录树注释、INTERFACES 的
+    // 动机（2026-10-05 审查 §1-⑧）：这条事实此前散在 MAINTAINER-NOTES.md 与 INTERFACES 的、INTERFACES 的
     // 许可清单、各文件头三处**散文**里，代码级守卫是 0 命中。而它是有承重作用的：
     // selftest / drift-check 能在**没有安装期 junction** 的机器上直接 import 这几个模块
     // （selftest 文件头就是这么写的：零依赖、直接跑真代码）。一旦有人在 roster.js 里
@@ -517,7 +519,7 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.MEMBER_TEAM_TOOL_NAMES.length, 9, '§1 注释写着队员 9 个');
     assert.equal(roster.TEAM_TOOL_NAMES.length, 9, '§1 注释写着官方九个团队工具');
     assert.equal(roster.LEAD_TEAM_TOOL_NAMES.length, 11, '§1 注释写着 Lead = 官方九个 + 为 Lead 加的两个');
-    assert.equal(roster.TEAMMATE_TOOL_DENY.length, 9, '§1 的 deny 表(README §4.5)列了 9 个名字');
+    assert.equal(roster.TEAMMATE_TOOL_DENY.length, 9, '§1 的 deny 表(MAINTAINER-NOTES.md §4.5)列了 9 个名字');
   });
 
   await check('tools.js 用到的每个 runtime.<name> 都必须在 runtimeApi 门面上（缺键=静默失效）', () => {
@@ -734,7 +736,7 @@ function functionBodyOf(source, needle) {
   // integration-test 只在真实时钟下用它（写与读在同一次运行内，记录年龄≈0）。
   // 于是 `7 * 24 * 60 * 60 * 1000` 少写一个 `* 1000`（7 天写成 7 分钟）这类一行笔误，
   // 38 项 selftest + 56 项 drift-check + integration 全都不会红，
-  // 表现却是「用户过几天重启 DSH，团队没自动恢复」——正是 README §8.10 已经发生过一次的事故类型。
+  // 表现却是「用户过几天重启 DSH，团队没自动恢复」——正是 MAINTAINER-NOTES.md §8.10 已经发生过一次的事故类型。
   // 这组用例全部走**纯函数** sanitizeStore（完全不落盘），与 selftest 的零依赖形态一致。
   await check('resume.sanitizeStore：TTL 边界两侧（注入时钟，防「7 天写成 7 分钟」这类笔误）', async () => {
     const resume = await load('resume.js');

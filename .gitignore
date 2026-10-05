@@ -25,8 +25,10 @@ desktop.ini
 .idea/
 .vscode/
 
-# 审查历史（含本机真实路径/用户名，不进仓库；只在你本机查阅）
+# 审查历史与维护者笔记（含本机真实路径/用户名，不进仓库；只在你本机查阅）
+# MAINTAINER-NOTES.md = 设计取舍 + 事故记录 + 实现细节（README 只留面向使用者的部分）
 REVIEW-*.md
+MAINTAINER-NOTES.md
 /docs/reviews/
 # NVIDIA 驱动日志残留（进程 cwd 落在本目录时会自动生成）
 /NVIDIA Corporation/

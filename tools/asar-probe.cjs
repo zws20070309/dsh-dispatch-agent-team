@@ -5,7 +5,7 @@
  * 为什么需要它：本插件的判据**必须**是运行中那一版官方代码，而不是记忆或旧笔记。
  * 但 `app.asar` 是归档文件：`rg`/`glob`/`read` 都进不去（`read` 会报
  * `Cannot mix BigInt and other types`），于是每次都要临时写脚本解包 —— 这个文件把
- * 那件事固化下来，官方升级后可以直接复核（见 README §6「维护」）。
+ * 那件事固化下来，官方升级后可以直接复核（见 MAINTAINER-NOTES.md）。
  *
  * 用法：
  *   node tools/asar-probe.cjs --list "dsh-llm/"                  # 列出匹配的条目
