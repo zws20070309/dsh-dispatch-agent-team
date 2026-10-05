@@ -125,7 +125,7 @@ node tools\install.cjs
 
 ```
 node tools\repair.cjs             # 安装状态体检（bundles / junction / 文件齐全 / 崩溃恢复痕迹）
-node tools\drift-check.cjs        # 56 项官方实现假设校验（升级后必跑）
+node tools\drift-check.cjs        # 57 项官方实现假设校验（升级后必跑）
 node tools\selftest.cjs           # 纯逻辑回归（角色表 / 配置净化 / 保活策略 / 文本不变量）
 node tools\integration-test.cjs   # 真链路：真 cordis + dsh-tools + systemPrompt + llm/stream 瀑布
 node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替身，真渲染组件）
@@ -355,7 +355,7 @@ dsh-dispatch-agent-team/
 │   ├── lib-dsh-home.cjs             # DSH 主目录 / profile 目录的唯一解析口径（认 DSH_HOME）
 │   ├── lib-atomic-write.cjs         # tmp+rename 原子写（profile 关键文件不许留半份）
 │   ├── install.cjs                 # ★ 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
-│   ├── drift-check.cjs             # 官方升级漂移检测（56 项，升级后必跑）
+│   ├── drift-check.cjs             # 官方升级漂移检测（57 项，升级后必跑）
 │   ├── repair.cjs                  # 安装状态体检 / 崩溃恢复后的修复
 │   ├── emergency-disable.cjs       # DSH 起不来时的一键退出
 │   ├── history-audit.cjs           # 只读：某个斜杠命令在本机到底有没有活过（判「历史 vs 活命令」）
@@ -486,6 +486,15 @@ dsh-dispatch-agent-team/
 ⇒ **Lead 纪律**：派到接近上限之前先 `wait_agent` 或 `interrupt_agent` 收人；这道帽满了之后
 `spawn_teammate` 会抛，且现在会抛出一句**带下一步动作的中文**（`lib/tools.js` 的
 `translateSpawnFailure`，按官方错误码 `ACTIVATION_LIMIT_REACHED` 翻译）。
+
+**另外：被限流时不再是「看不出发生了什么」**（2026-10-05 补）。宿主本来就在自动退避
+（`dsh-llm/lib/index.js` 的 `maxRetries=5` / `initialDelayMs=500` / `maxDelayMs=1e4` / `jitterRatio=.1`，
+可重试码含 `RATE_LIMIT`），但插件此前把 `llm/retry` 事件整个丢掉，于是「被 429 打死的队员」
+与「干完了忘了交报告的队员」在状态面上**长得一模一样**。现在 `list_agents` 会给这类队员
+追加一行 `最近一次请求被宿主自动重试：失败码 X · 线路 Y · 第 N/M 次 · 等 Zms`，
+队员开始新的一轮时这条自动作废（不跨轮沿用旧码）。**只观测，不退避重排队**：
+本地队员是常驻 continuable 会话，重排队要么杀会话（丢掉「返工回同一个队员」），
+要么继续占那道同时在线帽的名额。
 
 **这道帽的有效值现在会被采集**：`dispatch-agent-team-status.json` 的 `rows[]` 里，
 `subagent` 行会带上 `maxActiveSubagents`（与 `agent-team` 行记 `maxMembers` 同法）。
@@ -678,7 +687,7 @@ cordis patch**——那正好是崩溃恢复会改名备份的文件。
 ## 6. 维护（官方升级后必做）
 
 ```
-node tools\drift-check.cjs      # 56 项：逐条验证本插件依赖的官方实现细节是否还在
+node tools\drift-check.cjs      # 57 项：逐条验证本插件依赖的官方实现细节是否还在
 node tools\repair.cjs           # 安装状态体检（bundles / junction / 文件齐全 / 恢复痕迹）
 node tools\selftest.cjs         # 纯逻辑回归（角色表 / 配置净化 / 缓存策略 / 报告校验 / 文本不变量）
 node tools\integration-test.cjs # 真链路（真 cordis + dsh-tools + dsh-system-prompt + llm/stream 瀑布）
