@@ -10,7 +10,7 @@
 # 的原样复制——官方不支持 preset 之间的继承，复制是官方唯一支持的组合方式。
 # `tools/drift-check.cjs` 会逐行比对两者，防止官方或用户改了极简灰度后本 preset 悄悄落后。
 #
-# ── 与极简灰度的两处差异 ──────────────────────────────────────────────────────
+# ── 与极简灰度的三处差异 ──────────────────────────────────────────────────────
 # 1) 新增一行 `dispatch-preset`（紧跟 persona）：调度模式的提示词 + 控制面（`/team` 命令与
 #    enable_agent_team / disable_agent_team 两个开关工具）。控制面注册在**本 preset 的作用域**里，
 #    所以只有选了「调度模式」的会话能看到它们（别的 preset 看不到 /team，也开不了本插件的团队）。
@@ -18,6 +18,24 @@
 #    所以「默认不开团队」是真的。**没有 `/team-off`**：关闭团队走 disable_agent_team 工具。
 # 2) persona 文本与 includeRuntimeContext 与极简灰度完全一致（保持不降智的极简身份）；
 #    调度模式的全部方法论文本由 dispatch-preset 自己注册的 prompt 段承载。
+# 3) `tool-subagent` 行**不写** `modelSelectionSettings: true`（极简灰度写了）。
+#    为什么关掉官方那套子代理模型选择（2026-10-05）：
+#      * 官方能力是「**临时**给某一次 subagent 调用挑一个别的模型」——正是这个模式刻意
+#        不依赖的东西：临时换模型要么让本次调用贵得没道理，要么贵模型被用在查文件这种活上；
+#      * 本模式有**自己**的模型选择器（本插件配置页，12 个角色各一份 provider/model/强度），
+#        两套并存时模型会看到两条互相竞争的指令（官方 subagent 工具描述在这三个参数可见时
+#        会多出一整段 "Child LLM selection is optional…"，而调度模式的纪律是角色决定模型）；
+#      * 关掉**不会**削弱本模式：团队的 spawn_teammate 自带 provider/model/reasoning_effort
+#        参数与自己的路由预检（lib/tools.js），走的是宿主 agent/request 覆盖，与本 flag 无关；
+#        探查型子代理仍然可用，只是跟随 Lead 的模型（团队里「换模型」这件事统一由角色配置管）。
+#    影响面（对着装机 0.2.0-rc.2 逐条核过）：`list_subagent_models` 工具与 subagent schema 的
+#    provider/model/reasoning_effort 三个参数不再注册（dsh-tool-subagent/lib/index.js:387-389、
+#    :412-425）；`tool:subagent` 提示词段**不受影响**（它只由 backgroundMode 决定，:576-580）。
+#    `tool-subagent-fork` 行本来就没写这个 flag，行为不变。
+#    ⚠️ 与官方 model-selection-settings 服务的关系：本机该服务是默认值（enabled=false、
+#    allowedModels=[]，profiles/desktop/cordis.yml:493-494 没有 config 块）。不用去关它——
+#    它自己那行不写这个 flag 就没人读它；反过来，如果只把开关打开而不选模型，
+#    新会话会在 model-selection-settings.js:59 抛错（"requires at least one allowed model"）。
 #
 # ── 队员的能力面由插件在运行期收窄，不改本文件 ────────────────────────────────
 # 队员的 preset 硬编码继承父 agent 的实时 preset（官方 dsh-subagent child-agent.js:113/158，
@@ -191,12 +209,14 @@
                 name: '@deepseek-ai/dsh-tool-subagent-control'
               - id: tool-subagent-list-agents
                 name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              # ⚠️ 这里**刻意不写** `modelSelectionSettings: true`（极简灰度那一行是写的）。
+              # 见本文件头「与极简灰度的三处差异」第 3 条：调度模式里「给谁挑模型」只有一个
+              # 入口（本插件的配置页：每个角色一个模型/强度），不叠加官方那套。
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
                   backgroundMode: continuable
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'

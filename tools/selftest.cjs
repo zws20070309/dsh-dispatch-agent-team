@@ -155,27 +155,61 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.defaultConfig().version, roster.CONFIG_VERSION);
   });
 
-  await check('deriveRole：<role> 与 <role>-N 都能推导，非法名返回 undefined', () => {
+  await check('deriveRole：<role> / <role>-N / <role>-<后缀> 都能推导，非法名返回 undefined', () => {
     assert.equal(roster.deriveRole('scout'), 'scout');
     assert.equal(roster.deriveRole('verify-2'), 'verify');
     assert.equal(roster.deriveRole('visual-critic-17'), 'visual-critic');
+    // 2026-10-05 放宽：角色 id 是**最长前缀**，非数字后缀是自由标签。
+    // 用户实测报错 `name "scout-core" 不是合法的队员名` 就是这条规则过窄造成的。
+    assert.equal(roster.deriveRole('scout-core'), 'scout');
+    assert.equal(roster.deriveRole('scout-validate'), 'scout');
+    assert.equal(roster.deriveRole('plan-critic-verify'), 'plan-critic', '必须取最长前缀：plan-critic 优先于 plan');
+    assert.equal(roster.deriveRole('frontier-auditor-check'), 'frontier-auditor');
+    // 形状闸门：官方根本造不出来的名字不许被认领（否则冷恢复会对一个不存在的角色装覆盖）。
     assert.equal(roster.deriveRole(' lead '), undefined);
     assert.equal(roster.deriveRole('lead'), undefined);
+    assert.equal(roster.deriveRole('lead-2'), undefined, 'lead 不是任何角色 id 的前缀');
     assert.equal(roster.deriveRole('unknown-role'), undefined);
     assert.equal(roster.deriveRole('scout-'), undefined);
+    assert.equal(roster.deriveRole('scout--2'), undefined);
+    assert.equal(roster.deriveRole('Scout'), undefined);
+    assert.equal(roster.deriveRole('scout_core'), undefined);
     assert.equal(roster.deriveRole(''), undefined);
     assert.equal(roster.deriveRole(42), undefined);
+    // 「deriveRole 认领」必须与「isValidTeammateName 放行」严格等价（除了 -0/-1 那条更严的后缀规则）。
+    for (const name of ['scout', 'scout-2', 'scout-core', 'plan-critic-verify', 'scout-']) {
+      assert.equal(roster.deriveRole(name) !== undefined, roster.isValidTeammateName(name), `两条口径在 "${name}" 上不一致`);
+    }
   });
 
-  await check('isValidTeammateName：拒绝 lead / 未知角色 / -0 / -1 / 超长', () => {
+  await check('isValidTeammateName：只比官方更严一条（必须以角色开头），形状逐字对齐官方', () => {
     assert.equal(roster.isValidTeammateName('scout'), true);
     assert.equal(roster.isValidTeammateName('scout-2'), true);
     assert.equal(roster.isValidTeammateName('scout-99'), true);
+    assert.equal(roster.isValidTeammateName('scout-core'), true);
+    assert.equal(roster.isValidTeammateName('plan-critic-verify'), true);
+    assert.equal(roster.isValidTeammateName('red-team-alpha'), true);
     assert.equal(roster.isValidTeammateName('lead'), false);
+    // 纯数字后缀是本插件自动命名的命名空间，从 2 起（非数字后缀不受这条约束）。
     assert.equal(roster.isValidTeammateName('scout-0'), false);
     assert.equal(roster.isValidTeammateName('scout-1'), false);
+    // 末尾只要是纯数字后缀就受这条管（`scout-core-0` 的末尾也是 -0）；
+    // 非数字后缀不受约束（`scout-core` 合法），这是「一条规则一句话」的取舍。
+    assert.equal(roster.isValidTeammateName('scout-core-0'), false);
+    assert.equal(roster.isValidTeammateName('scout-core-2'), true);
     assert.equal(roster.isValidTeammateName('nope'), false);
+    // 官方 MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/ —— 形状不一致的必须拒。
+    assert.equal(roster.isValidTeammateName('scout-'), false);
+    assert.equal(roster.isValidTeammateName('-scout'), false);
+    assert.equal(roster.isValidTeammateName('scout--2'), false);
+    assert.equal(roster.isValidTeammateName('Scout'), false);
+    assert.equal(roster.isValidTeammateName('scout core'), false);
+    assert.equal(roster.isValidTeammateName('scout_core'), false);
     assert.equal(roster.isValidTeammateName('a'.repeat(65)), false);
+    const longest = `scout-${'x'.repeat(58)}`; // 64 码元整
+    assert.equal(longest.length, 64);
+    assert.equal(roster.isValidTeammateName(longest), true, '官方上限是 >64 才拒');
+    assert.equal(roster.isValidTeammateName(`${longest}x`), false);
     assert.equal(roster.isValidTeammateName(undefined), false);
   });
 
