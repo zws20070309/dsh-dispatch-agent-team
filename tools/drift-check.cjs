@@ -336,7 +336,7 @@ check('本包 cordis.patch.yml 仍用自有行 id 重新挂载官方 UI 包（�
   const panelRow = /-\s*id:\s*dispatch-agent-team-panel\b[\s\S]{0,200}?name:\s*'?(@deepseek-ai\/dsh-experimental-client-ui-agent-team)'?/u.exec(oursPatch);
   if (panelRow === null) {
     return 'cordis.patch.yml 里找不到 dispatch-agent-team-panel 行（或它的 name 不再是官方 UI 包）——'
-      + ' README §1.4 明确靠这一行保证「用户关掉官方 ui-agent-team 时成员列表与看板仍在」，删掉即功能静默降级';
+      + ' MAINTAINER-NOTES.md §1.4 明确靠这一行保证「用户关掉官方 ui-agent-team 时成员列表与看板仍在」，删掉即功能静默降级';
   }
   return true;
 });
@@ -882,7 +882,7 @@ check('lib/preset.js 仍遮蔽官方 team:policy 段，且没有误用 tools.res
 // 给每一个 live agent 都装九个工具（dsh-experimental-tool-agent-team :539-546 的 maybeInstall +
 // 域服务 tryMembership 对任意非子代理 agent 返回 lead 身份），而本插件在**同一个 agent 作用域**
 // 注册同样九个名字 → `tool "x" is already registered in this scope`，本插件的工具装不上、
-// 角色/模型参数全丢。只能靠 profile 层（在所有 bundle 层之后应用）关掉，见 README §8.7。
+// 角色/模型参数全丢。只能靠 profile 层（在所有 bundle 层之后应用）关掉，见 MAINTAINER-NOTES.md §8.7。
 check('profile 层 patch 里官方 tool-agent-team 行被关闭（否则本插件的九个工具装不上）', () => {
   const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
   if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：跑 tools/repair.cjs --apply`;
@@ -1182,14 +1182,14 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
   // 为什么要有这一组：本插件此前只登记了 `maxMembers`（累计帽），宿主**同时在线**那道
   // `maxActiveSubagents` 零登记。而那道帽管到本插件**完全依赖一个官方实现细节**：
   // 官方建队员走的是 `ctx.subagents.startContinuable(...)`（continuable 池），不是 one-shot。
-  // 官方哪天改成 one-shot 派发，这道帽就自动消失、README §4.2.1 会悄悄变成错的。
+  // 官方哪天改成 one-shot 派发，这道帽就自动消失、MAINTAINER-NOTES.md §4.2.1 会悄悄变成错的。
   // 这三条检查就是那个前提的报警器。
   const agentTeamIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
 
   check('官方建队员仍走 startContinuable（同时在线帽 maxActiveSubagents 的存在前提）', () => {
     if (agentTeamIndex === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
     if (!agentTeamIndex.includes('this.ctx.subagents.startContinuable({')) {
-      return '官方不再用 startContinuable 建队员 —— README §4.2.1「同时在线帽管到本插件」这条结论失效，'
+      return '官方不再用 startContinuable 建队员 —— MAINTAINER-NOTES.md §4.2.1「同时在线帽管到本插件」这条结论失效，'
         + 'lib/tools.js 的 ACTIVATION_LIMIT_REACHED 翻译可能再也命中不了，请重新核对官方派发方式';
     }
     return true;

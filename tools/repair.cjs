@@ -12,7 +12,7 @@
  *     我们的 bundle 若排在它之前，`- id: agent-team, config:` 就落在还不存在的行上、**静默失效**
  *     （2026-09-28 实测：maxMembers 被官方默认值 8 顶掉，8 次 spawn 后团队派不出人）。
  *     profile 的 cordis.patch.yml 在**所有 bundle 层之后**应用（dsh-app-boot 的 readProfilePatches），
- *     所以这一层的覆盖一定生效。见 README §8.6 与 INTERFACES 勘误表第 25 条。
+ *     所以这一层的覆盖一定生效。见 MAINTAINER-NOTES.md §8.6 与 INTERFACES 勘误表第 25 条。
  *
  * 用法：
  *   node tools/repair.cjs                      # 只体检，不改任何文件
@@ -242,7 +242,7 @@ if (!Array.isArray(bundles)) {
 // 4.5) profile 层必须有的两段覆盖（顺序无关的生效落点）：
 //   (1) `tool-agent-team` 必须 **disabled**；
 //   (2) `agent-team` 的容量必须放大。
-// 两件事都必须写在这一层，理由见文件头与 README §8.6/§8.7。
+// 两件事都必须写在这一层，理由见文件头与 MAINTAINER-NOTES.md §8.6/§8.7。
 // （PROFILE_PATCH / AGENT_TEAM_CONFIG / MANAGED_START / MANAGED_END 定义在文件上方，revert 分支共用。）
 const MANAGED_BLOCK = [
   MANAGED_START,
