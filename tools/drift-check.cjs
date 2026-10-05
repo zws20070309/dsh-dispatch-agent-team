@@ -1157,6 +1157,63 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     });
   }
 
+  // 13) 两道容量帽（2026-10-05 新增）。
+  //
+  // 为什么要有这一组：本插件此前只登记了 `maxMembers`（累计帽），宿主**同时在线**那道
+  // `maxActiveSubagents` 零登记。而那道帽管到本插件**完全依赖一个官方实现细节**：
+  // 官方建队员走的是 `ctx.subagents.startContinuable(...)`（continuable 池），不是 one-shot。
+  // 官方哪天改成 one-shot 派发，这道帽就自动消失、README §4.2.1 会悄悄变成错的。
+  // 这三条检查就是那个前提的报警器。
+  const agentTeamIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
+
+  check('官方建队员仍走 startContinuable（同时在线帽 maxActiveSubagents 的存在前提）', () => {
+    if (agentTeamIndex === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
+    if (!agentTeamIndex.includes('this.ctx.subagents.startContinuable({')) {
+      return '官方不再用 startContinuable 建队员 —— README §4.2.1「同时在线帽管到本插件」这条结论失效，'
+        + 'lib/tools.js 的 ACTIVATION_LIMIT_REACHED 翻译可能再也命中不了，请重新核对官方派发方式';
+    }
+    return true;
+  });
+
+  check('官方仍以 TEAM_MEMBER_LIMIT 表达累计帽（lib/tools.js 按错误码翻译的前提）', () => {
+    if (agentTeamIndex === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
+    // 本插件的 translateSpawnFailure 按 error.code 路由（不 parse message），三个码缺一不可。
+    const required = ['TEAM_MEMBER_LIMIT', 'TEAM_MEMBER_NAME_TAKEN'];
+    const missing = required.filter((code) => !agentTeamIndex.includes(code));
+    if (missing.length > 0) return `官方不再抛这些错误码：${missing.join(', ')} —— 按码翻译的分支会失效（只剩原样透传）`;
+    return true;
+  });
+
+  check('宿主仍以 ACTIVATION_LIMIT_REACHED 表达同时在线帽，且容量取自 maxActiveSubagents', () => {
+    const subagentIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '';
+    if (subagentIndex === '') return '读不到 dsh-subagent/lib/index.js';
+    if (!subagentIndex.includes('ACTIVATION_LIMIT_REACHED')) {
+      return '找不到 ACTIVATION_LIMIT_REACHED —— lib/tools.js 的「先收人再派活」提示失去触发点，'
+        + '请回读 dsh-subagent 的容量拒绝路径';
+    }
+    if (!subagentIndex.includes('maxActiveSubagents')) return '找不到 maxActiveSubagents —— 状态文件采集的那两行要跟着改';
+    return true;
+  });
+
+  check('插件自己的队员名口径 = 官方 MEMBER_NAME（不再凭空收紧）', () => {
+    // 2026-10-05 用户实测：`scout-core` 被本插件拒掉而官方完全接受。这条闸门钉住两边等价。
+    const official = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/roster.js') || '';
+    if (official === '') return '读不到官方 roster.js';
+    const match = /const MEMBER_NAME = (\/.*?\/u?);/u.exec(official);
+    if (match === null) return '官方 MEMBER_NAME 的定义形状变了（不是 `const MEMBER_NAME = /.../;`）';
+    const rosterText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'roster.js'));
+    if (rosterText === '') return '读不到 lib/roster.js';
+    const mine = /const OFFICIAL_MEMBER_NAME = (\/.*?\/u?);/u.exec(rosterText);
+    if (mine === null) return 'lib/roster.js 里找不到 OFFICIAL_MEMBER_NAME（名字形状的口径丢了）';
+    if (mine[1] !== match[1]) {
+      return `队员名形状与官方不一致：官方 ${match[1]}，本插件 ${mine[1]}`
+        + ' —— 两边不一致就会出现「官方接受、插件拒绝」的假失败（或反过来漏出官方会拒的名字）';
+    }
+    // 官方长度上限：>64 才拒（memberName 里是 value.length > 64）。
+    if (!/value\.length > 64/u.test(official)) return '官方的 64 长度上限不见了这个形状，lib/roster.js 的对应判断要重核';
+    return true;
+  });
+
   // ── 输出 ───────────────────────────────────────────────────────────────────
   let failed = 0;
   let skipped = 0;
