@@ -125,7 +125,7 @@ node tools\install.cjs
 
 ```
 node tools\repair.cjs             # 安装状态体检（bundles / junction / 文件齐全 / 崩溃恢复痕迹）
-node tools\drift-check.cjs        # 51 项官方实现假设校验（升级后必跑）
+node tools\drift-check.cjs        # 55 项官方实现假设校验（升级后必跑）
 node tools\selftest.cjs           # 纯逻辑回归（角色表 / 配置净化 / 保活策略 / 文本不变量）
 node tools\integration-test.cjs   # 真链路：真 cordis + dsh-tools + systemPrompt + llm/stream 瀑布
 node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替身，真渲染组件）
@@ -355,7 +355,7 @@ dsh-dispatch-agent-team/
 │   ├── lib-dsh-home.cjs             # DSH 主目录 / profile 目录的唯一解析口径（认 DSH_HOME）
 │   ├── lib-atomic-write.cjs         # tmp+rename 原子写（profile 关键文件不许留半份）
 │   ├── install.cjs                 # ★ 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
-│   ├── drift-check.cjs             # 官方升级漂移检测（51 项，升级后必跑）
+│   ├── drift-check.cjs             # 官方升级漂移检测（55 项，升级后必跑）
 │   ├── repair.cjs                  # 安装状态体检 / 崩溃恢复后的修复
 │   ├── emergency-disable.cjs       # DSH 起不来时的一键退出
 │   ├── history-audit.cjs           # 只读：某个斜杠命令在本机到底有没有活过（判「历史 vs 活命令」）
@@ -462,6 +462,35 @@ dsh-dispatch-agent-team/
 「本包 patch 与 profile 层两份值一致」，`repair.cjs` 还会打印**运行时有效值**（来自状态文件）。
 同一个 managed 段里还有**关闭官方 `tool-agent-team` 行**（`disabled: true`）—— 原因是同名工具撞车，
 见 §4.6 第 2 条与 §8.7。
+
+#### 4.2.1 宿主其实有**两道**容量帽 —— 同时在线那道此前没有登记（2026-10-05 补）
+
+上面那道 `maxMembers` 是**累计**帽：一个团队历史上出现过多少队员名。它与「现在有多少队员在跑」
+无关。宿主还有**第二道**帽，管的是同时在线的 continuable 子代理，本插件此前**零登记**：
+
+| 帽 | 语义 | 宿主源码 | 本机有效值 |
+|---|---|---|---|
+| `maxMembers`（官方 agent-team 行） | 这个团队**历史上**出现过多少队员名；不可变、不复用 | `dsh-experimental-agent-team/lib/index.js:564` `state.members.length >= this.maxMembers` → `TEAM_MEMBER_LIMIT` | 48（本插件的 patch） |
+| `maxActiveSubagents`（host 的 `subagent` 行） | 共享 continuable 父链的**活着的**子代理池 | `dsh-subagent/lib/index.js:728` `pool.reserve(...)` → `ACTIVATION_LIMIT_REACHED`；默认值在 :2823（`default(8).volatile()`） | **15**（本机 `profiles/desktop/cordis.yml:319` 与 `cordis.patch.yml:468` 都是 15） |
+
+为什么这道帽**确实**管到本插件：建队员那一行走的是 `startContinuable`
+（`dsh-experimental-agent-team/lib/index.js:573` `this.ctx.subagents.startContinuable({...})`），
+而 `maxActiveSubagents` 正是 continuable 池的容量。
+
+它的语义比「并发数」更严（本机 `dsh-subagent/README` 原文）：
+
+- **闲着的队员照样占一格**：它是「未结算的 Activation 数」，不是「正在思考的队员数」；
+- **满了直接拒绝、不排队**：`ACTIVATION_LIMIT_REACHED`，因为「等孩子的父代理不能等自己的槽位」；
+- **池是进程级的**：同一台机器上多个会话一起用团队时会**互相挤**。
+
+⇒ **Lead 纪律**：派到接近上限之前先 `wait_agent` 或 `interrupt_agent` 收人；这道帽满了之后
+`spawn_teammate` 会抛，且现在会抛出一句**带下一步动作的中文**（`lib/tools.js` 的
+`translateSpawnFailure`，按官方错误码 `ACTIVATION_LIMIT_REACHED` 翻译）。
+
+**这道帽的有效值现在会被采集**：`dispatch-agent-team-status.json` 的 `rows[]` 里，
+`subagent` 行会带上 `maxActiveSubagents`（与 `agent-team` 行记 `maxMembers` 同法）。
+`tools/drift-check.cjs` 另有一条闸门，钉住「官方建队员仍走 `startContinuable`」——
+这道帽的存在**完全依赖**这个事实，官方哪天改成 one-shot，闸门会先红，文档不会悄悄变成错的。
 
 ### 4.3 我们接受了的一个真实代价（诚实记录）
 
@@ -649,7 +678,7 @@ cordis patch**——那正好是崩溃恢复会改名备份的文件。
 ## 6. 维护（官方升级后必做）
 
 ```
-node tools\drift-check.cjs      # 51 项：逐条验证本插件依赖的官方实现细节是否还在
+node tools\drift-check.cjs      # 55 项：逐条验证本插件依赖的官方实现细节是否还在
 node tools\repair.cjs           # 安装状态体检（bundles / junction / 文件齐全 / 恢复痕迹）
 node tools\selftest.cjs         # 纯逻辑回归（角色表 / 配置净化 / 缓存策略 / 报告校验 / 文本不变量）
 node tools\integration-test.cjs # 真链路（真 cordis + dsh-tools + dsh-system-prompt + llm/stream 瀑布）
