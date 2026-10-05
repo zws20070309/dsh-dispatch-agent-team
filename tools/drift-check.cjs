@@ -1228,6 +1228,58 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+  check('lib/*.js 的每个文件都在两份清单里（repair 的 PACKAGE_FILES + sync 的 FILES）', () => {
+    // 为什么要有这条（2026-10-05）：审查 P1-3 记录过同一类缺口 ——
+    // 「旧清单只有 6 个文件，漏了 runtime/tools/roster/playbook，缺了核心模块它照样打印
+    //  『状态完好』」。本轮新增 lib/text-clip.js 时，两份清单又都漏了它（我手工补的）。
+    // 这个失败模式是**静默**的：漏了 PACKAGE_FILES，体检不会报缺件；
+    // 漏了 sync 的 FILES，工作区改了这个文件也永远不会同步到 DSH 实际加载的那份。
+    const libDir = path.join(PLUGIN_DIR, 'lib');
+    let actual;
+    try {
+      actual = fs.readdirSync(libDir).filter((name) => name.endsWith('.js')).sort();
+    } catch {
+      return '读不到 lib/ 目录';
+    }
+    if (actual.length === 0) return 'lib/ 里一个 .js 都没有，路径不对？';
+    const repairSource = readFileOr(path.join(PLUGIN_DIR, 'tools', 'repair.cjs'));
+    const syncSource = readFileOr(path.join(PLUGIN_DIR, 'tools', 'sync-to-dsh.cjs'));
+    if (repairSource === '' || syncSource === '') return '读不到 repair.cjs 或 sync-to-dsh.cjs';
+    const problems = [];
+    for (const file of actual) {
+      const entry = `'lib/${file}'`;
+      if (!repairSource.includes(entry)) problems.push(`repair.cjs 的 PACKAGE_FILES 缺 lib/${file}`);
+      if (!syncSource.includes(entry)) problems.push(`sync-to-dsh.cjs 的 FILES 缺 lib/${file}`);
+    }
+    if (problems.length > 0) {
+      return `${problems.join('；')} —— 缺 PACKAGE_FILES 时体检不报缺件，`
+        + '缺 sync 的 FILES 时工作区改动永远同步不到 DSH 加载的那份（两者都是静默的）';
+    }
+    return true;
+  });
+
+  check('cordis 的 inject 隔离语义仍在（integration-test 手写仿真所依据的那句话）', () => {
+    // 为什么要有这条（2026-10-05 审查 §1-⑨）：tools/integration-test.cjs 用**手写的 Proxy**
+    // 复刻 cordis 的 inject 隔离（loaderLikeCtx，硬编码 10 个 GUARDED_SERVICES，自己抛
+    // `cannot get property "x" without inject`），而本地不走真实 plugin-loader（全量 grep 零命中）。
+    // 那份仿真清单**没有任何闸门校验它与 cordis 是否仍一致** —— 官方改了错误文案或判定语义，
+    // 仿真会继续演一出已经不存在的行为，测试照样绿。参照项目被审出的同类真问题是
+    // 「测试测的不是发布物，修法是测真实加载的那个入口」；本地无构建步骤，这个机制不可移植，
+    // 但**同一教训的正确形态**是：从装机 asar 断言那句判据仍在（与本地既有 12 个官方包读取通道同法）。
+    const cordisIndex = asar.read('dsh/node_modules/@deepseek-ai/cordis/lib/index.js') || '';
+    if (cordisIndex === '') return '读不到 cordis/lib/index.js';
+    if (!cordisIndex.includes('without inject')) {
+      return 'cordis 的 inject 隔离文案里找不到 `without inject` —— integration-test 的 loaderLikeCtx'
+        + ' 仿真的是旧语义，需要回读 cordis 的 reflect 代理后重写那段仿真';
+    }
+    const integration = readFileOr(path.join(PLUGIN_DIR, 'tools', 'integration-test.cjs'));
+    if (integration === '') return '读不到 tools/integration-test.cjs';
+    if (!integration.includes('without inject')) {
+      return 'integration-test.cjs 里那段 inject 仿真消失了 —— 2026-09-28 的「/team 静默不存在」故障会重新变成盲区';
+    }
+    return true;
+  });
+
   check('插件自己的队员名口径 = 官方 MEMBER_NAME（不再凭空收紧）', () => {
     // 2026-10-05 用户实测：`scout-core` 被本插件拒掉而官方完全接受。这条闸门钉住两边等价。
     const official = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/roster.js') || '';

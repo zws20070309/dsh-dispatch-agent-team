@@ -1200,9 +1200,12 @@ async function main() {
       const failingTools = toolsModule.teamToolDefinitions({
         runtime: failingRuntime,
         agentTeams: {
-        ...reportTeams,
+          ...reportTeams,
           sendMessage() { throw new Error('mailbox full'); },
         },
+        // 必须显式给队员名单：report_result 是**队员专用**，不带 include 时它连 schema 都不注册
+        // （Lead 的工具目录里没有它），find 会拿到 undefined。
+        include: roster.MEMBER_TEAM_TOOL_NAMES,
       });
       const failingTool = failingTools.find((definition) => definition.name === 'report_result');
       const failed = await failingTool.execute(
