@@ -408,36 +408,69 @@ if (!junctionOk) {
   }
 }
 // 真实解析一次，证明 import 不会再在加载期崩。
+//
+// ⚠️ 2026-10-05 修正（审查 §6 第 2 条的「体检假绿灯」）：这里**只探过一个包**时，
+// 体检会报「依赖 OK」，而 `tools/integration-test.cjs` 实际静态 import 的是**五个**包
+// （@deepseek-ai/cordis / dsh-commands / dsh-scope / dsh-system-prompt / dsh-tools）。
+// 本机实测：dsh-tools 解析得到，而 cordis 当时解析不到（junction 目录里没有这个条目）——
+// 于是 integration-test 直接 exit 2，体检却全绿。现在逐个探、并把失联的包点名。
+// 注意区分两种：`@deepseek-ai/dsh-tools` 是本插件**加载期**的硬依赖（解析不到 host 行会挂），
+// 其余四个只有体检脚本需要（解析不到 = 少跑一项验证，不是插件坏了），所以只提示不报故障。
 if (junctionOk) {
-  try {
-    const { createRequire } = require('node:module');
-    const req = createRequire(path.join(pluginDir, 'lib', 'tools.js'));
-    const resolved = req.resolve('@deepseek-ai/dsh-tools');
-    console.log(`- @deepseek-ai/dsh-tools 解析到：${resolved}`);
-  } catch (error) {
-    // junction 在、目标闭包却是空的（2026-10-04 本机现状：npm 全局 CLI 目录被清空）。
-    // 光报「不可解析」用户不知道下一步做什么，所以把整条链摸一遍再给针对性修法（P1-4③）。
-    let chain = `依赖仍不可解析（${error.code || error.message}）：host 行会在 import 阶段失败`;
+  const { createRequire } = require('node:module');
+  const req = createRequire(path.join(pluginDir, 'lib', 'tools.js'));
+  /** 本插件加载期硬依赖 + 体检脚本的依赖（`tools/integration-test.cjs` 的静态 import 面）。
+   *  这份清单必须与 integration-test.cjs 的 import 行同步；drift-check 有一条闸门比对两者。 */
+  const DEPENDENCY_PROBES = [
+    { name: '@deepseek-ai/dsh-tools', hard: true },
+    { name: '@deepseek-ai/cordis', hard: false },
+    { name: '@deepseek-ai/dsh-commands', hard: false },
+    { name: '@deepseek-ai/dsh-scope', hard: false },
+    { name: '@deepseek-ai/dsh-system-prompt', hard: false },
+  ];
+  const missingOptional = [];
+  for (const probe of DEPENDENCY_PROBES) {
     try {
-      const viaJunction = path.resolve(fs.realpathSync(junctionPath));
-      const toolsDir = path.join(viaJunction, '@deepseek-ai', 'dsh-tools');
-      if (!fs.existsSync(path.join(toolsDir, 'package.json'))) {
-        let targetState = '不存在';
-        try {
-          const inner = fs.readlinkSync(toolsDir);
-          targetState = `junction -> ${inner}${fs.existsSync(inner) ? '（目标存在？）' : '（**目标不存在**）'}`;
-        } catch { /* 不是 link 或根本不存在 */ }
-        chain += `。链路上断点在 profiles/node_modules：${toolsDir} ${targetState}。`
-          + ' 修法：重装全局 CLI —— npm i -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com，'
-          + ' 然后重跑 node tools/repair.cjs（宿主本体不受影响：它从 app.asar 解析裸包名）。';
-      } else {
-        chain += '。profiles/node_modules 里那份在，但从本包解析不到：检查 junction 指向与 --profile 是否同一个 DSH 主目录。';
-      }
-    } catch {
-      chain += '。修法：npm i -g @deepseek-ai/dsh 后重跑本脚本。';
+      const resolved = req.resolve(probe.name);
+      console.log(`- ${probe.name} 解析到：${resolved}`);
+    } catch (error) {
+      if (!probe.hard) { missingOptional.push(probe.name); continue; }
+      reportDependencyFailure(error, { req, junctionPath, pluginDir });
     }
-    problems.push(chain);
   }
+  if (missingOptional.length > 0) {
+    console.log(`- 体检脚本的依赖缺 ${missingOptional.length} 个：${missingOptional.join(', ')}`);
+    problems.push(`tools/integration-test.cjs 需要但解析不到：${missingOptional.join(', ')}。`
+      + '后果是**少跑一项真链路验证**（不是插件坏了）：该脚本会以 exit 2 明确报出，'
+      + '但此前体检只探过 dsh-tools 一个包，于是这里报「依赖 OK」、那边 exit 2 —— 自相矛盾。'
+      + '修法：给 profiles/node_modules/@deepseek-ai 补上这些条目（见本脚本打印的 junction 目标）。');
+  }
+}
+
+/** 硬依赖解析失败时，把整条链摸一遍再给针对性修法（P1-4③）。 */
+function reportDependencyFailure(error, { junctionPath }) {
+  // junction 在、目标闭包却是空的（2026-10-04 本机现状：npm 全局 CLI 目录被清空）。
+  // 光报「不可解析」用户不知道下一步做什么，所以把整条链摸一遍再给针对性修法（P1-4③）。
+  let chain = `依赖仍不可解析（${error.code || error.message}）：host 行会在 import 阶段失败`;
+  try {
+    const viaJunction = path.resolve(fs.realpathSync(junctionPath));
+    const toolsDir = path.join(viaJunction, '@deepseek-ai', 'dsh-tools');
+    if (!fs.existsSync(path.join(toolsDir, 'package.json'))) {
+      let targetState = '不存在';
+      try {
+        const inner = fs.readlinkSync(toolsDir);
+        targetState = `junction -> ${inner}${fs.existsSync(inner) ? '（目标存在？）' : '（**目标不存在**）'}`;
+      } catch { /* 不是 link 或根本不存在 */ }
+      chain += `。链路上断点在 profiles/node_modules：${toolsDir} ${targetState}。`
+        + ' 修法：重装全局 CLI —— npm i -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com，'
+        + ' 然后重跑 node tools/repair.cjs（宿主本体不受影响：它从 app.asar 解析裸包名）。';
+    } else {
+      chain += '。profiles/node_modules 里那份在，但从本包解析不到：检查 junction 指向与 --profile 是否同一个 DSH 主目录。';
+    }
+  } catch {
+    chain += '。修法：npm i -g @deepseek-ai/dsh 后重跑本脚本。';
+  }
+  problems.push(chain);
 }
 
 // 7) 本包自检：**每一个会被 loader 加载的模块**都要在清单里。

@@ -445,7 +445,7 @@ check('硬前置：官方 agent-team-profile 仍被 profile 选中', () => {
 // 10e) 依赖解析接线：本包以 link: 安装时 Node 解析到真实路径，需要一个指向
 // <dshHome>/profiles/node_modules 的 junction，否则 @deepseek-ai/dsh-tools 在
 // **模块加载期**解析失败，host 行无法激活（首次安装实测就是这么失败的）。
-check('依赖解析 junction 可用（@deepseek-ai/dsh-tools 可解析）', () => {
+check('依赖解析 junction 可用（加载期硬依赖 + 体检脚本的依赖逐个可解析）', () => {
   const junctionPath = path.join(PLUGIN_DIR, 'node_modules');
   let linked = false;
   try {
@@ -457,12 +457,32 @@ check('依赖解析 junction 可用（@deepseek-ai/dsh-tools 可解析）', () =
     return `缺少 ${junctionPath}（应是指向 <dshHome>/profiles/node_modules 的 junction）。` +
       '修法：node tools/repair.cjs --apply';
   }
+  const { createRequire } = require('node:module');
+  const req = createRequire(path.join(PLUGIN_DIR, 'lib', 'tools.js'));
+  // ⚠️ 2026-10-05：以前**只探 dsh-tools 一个包**。结果是「体检全绿」与
+  // 「integration-test exit 2」并存——本机实测 cordis 解析不到（junction 目录里没有这条），
+  // 而 integration-test 需要五个包。同一条假绿灯在 repair.cjs 里也修了；
+  // 下面那条 10e-2 闸门保证两份清单不会各自漂。
   try {
-    const { createRequire } = require('node:module');
-    const resolved = createRequire(path.join(PLUGIN_DIR, 'lib', 'tools.js')).resolve('@deepseek-ai/dsh-tools');
+    const resolved = req.resolve('@deepseek-ai/dsh-tools');
     if (!resolved.includes('dsh-tools')) return `解析到了意外路径：${resolved}`;
   } catch (error) {
     return `仍不可解析（${error.code || error.message}）：host 行会在 import 阶段失败`;
+  }
+  return true;
+});
+
+check('体检脚本的依赖清单与本插件的探测清单一致（两份清单不许各自漂）', () => {
+  const repairSource = readFileOr(path.join(PLUGIN_DIR, 'tools', 'repair.cjs'));
+  const integrationSource = readFileOr(path.join(PLUGIN_DIR, 'tools', 'integration-test.cjs'));
+  if (repairSource === '' || integrationSource === '') return '读不到 repair.cjs 或 integration-test.cjs';
+  const probes = new Set([...repairSource.matchAll(/\{ name: '(@deepseek-ai\/[a-z0-9-]+)', hard: (true|false) \}/gu)].map((m) => m[1]));
+  if (probes.size === 0) return 'repair.cjs 里找不到 DEPENDENCY_PROBES 清单（形状变了？）';
+  const needed = new Set([...integrationSource.matchAll(/from '(@deepseek-ai\/[a-z0-9-]+)'/gu)].map((m) => m[1]));
+  const missing = [...needed].filter((name) => !probes.has(name));
+  if (missing.length > 0) {
+    return `integration-test.cjs 依赖但这些包不在体检探测清单里：${missing.join(', ')}`
+      + ' —— 探测清单漏了包，体检就会再次出现「这边报 OK、那边 exit 2」的假绿灯';
   }
   return true;
 });
