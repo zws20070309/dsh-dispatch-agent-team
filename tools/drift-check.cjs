@@ -1215,6 +1215,19 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+  check('宿主仍在会话里落 llm/retry 事件，且字段仍是插件记账用到的那些', () => {
+    // lib/runtime.js 的 noteRetryEvent 按这个形状取值（只观测，不改变行为）。
+    // 依据是装机 dsh-llm-retry/lib/index.js:116-150：agent.session.append("llm/retry", {...})。
+    const retryIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-llm-retry/lib/index.js') || '';
+    if (retryIndex === '') return '读不到 dsh-llm-retry/lib/index.js';
+    const missing = ['"llm/retry"', 'agent.session.append', 'delayMs', 'provider'].filter((needle) => !retryIndex.includes(needle));
+    if (missing.length > 0) {
+      return `dsh-llm-retry 的重试事件形状变了（找不到 ${missing.join('、')}）`
+        + ' —— lib/runtime.js 的 noteRetryEvent 会读到空值，list_agents 上的重试标志会静默失效';
+    }
+    return true;
+  });
+
   check('插件自己的队员名口径 = 官方 MEMBER_NAME（不再凭空收紧）', () => {
     // 2026-10-05 用户实测：`scout-core` 被本插件拒掉而官方完全接受。这条闸门钉住两边等价。
     const official = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/roster.js') || '';

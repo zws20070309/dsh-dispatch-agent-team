@@ -116,6 +116,9 @@ export function planBroadcastTargets(members, {targets?, includeInactive?, calle
                                     // -> {targets[], skipped[{target,reason}]}；纯函数，selftest 直测
 export function annotateTruncatedMembers(rows, truncatedIds);
                                     // -> 新数组；被记账户里的队员行追加 TRUNCATED_DIAGNOSTIC，不改入参
+export const RETRY_DIAGNOSTIC_PREFIX;     // '最近一次请求被宿主自动重试：'（同样进成员行 diagnostics）
+export function annotateRetriedMembers(rows, retryBy);
+                                    // -> 新数组；有重试记录的队员行追加该前缀 + 摘要，不改入参
 export function askLeadMessage(question, blocking);  // -> 投递给 lead 的正文（含固定前缀）
 export function deriveRole(name);   // 'verify-2' / 'verify-deep' -> 'verify'（最长角色前缀）；
                                     // 形状不是官方队员名 -> undefined（'scout-' / 'Scout' / 'lead'）
@@ -192,6 +195,9 @@ export function markReportDelivered(entry, delivered);
                                             //   插件页记录与 Lead 邮箱是两套口径，不补写就会出现
                                             //   「页面显示已交报告、Lead 从未收到」（2026-10-05 审查 §1-⑤）
 export function truncatedMemberIds();      // -> Set<agentId>；上一轮撞输出上限且未交付的队员（list_agents 标注用）
+export function retriedMemberIds();         // -> Map<agentId, 摘要>；最近一次 llm/retry 的记录（list_agents 标注用）
+export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点（监听器与测试共用）
+export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
 ```

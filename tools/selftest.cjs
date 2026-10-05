@@ -625,6 +625,34 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.annotateTruncatedMembers(rows, []).length, rows.length);
     assert.ok(roster.TRUNCATED_DIAGNOSTIC.includes('wake_teammate'), '标志文案要直接给出下一步动作');
   });
+  await check('重试标志：只标注被记录里的队员、不改入参、幂等（与截断标志同一条缓存纪律）', () => {
+    // 依据（2026-10-05 审查 §1-⑥）：插件此前把 llm/retry 整个丢掉，于是「被限流打死的队员」
+    // 与「干完没交报告的队员」在状态面上不可区分。这条把它变成 list_agents 上可见的一行。
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: ['创建失败原因'] },
+      { id: 'b-id', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    const marked = roster.annotateRetriedMembers(rows, new Map([['a-id', '失败码 RATE_LIMIT · 第 2/5 次重试 · 等 800ms']]));
+    assert.equal(marked[1].diagnostics.length, 2, '标志要追加，不能吞掉官方已有的 diagnostics');
+    assert.ok(marked[1].diagnostics[1].startsWith(roster.RETRY_DIAGNOSTIC_PREFIX), '要带固定前缀，Lead 才认得出');
+    assert.ok(marked[1].diagnostics[1].includes('RATE_LIMIT'), '失败码必须原样带上（不翻译、不推断）');
+    assert.equal(marked[2].diagnostics.length, 0, '没被记录的队员不许被标注');
+    assert.equal(marked[0], rows[0], '未受影响的行必须原样复用（不产生新对象）');
+    assert.deepEqual(rows[1].diagnostics, ['创建失败原因'], '入参必须不被修改（该数组同时是 Lead 请求前缀的一部分）');
+    // 空账本 = 原样返回（没有重试时不产生任何副作用）。
+    assert.equal(roster.annotateRetriedMembers(rows, new Map()).length, rows.length);
+    assert.equal(roster.annotateRetriedMembers(rows, {}).length, rows.length);
+    assert.equal(roster.annotateRetriedMembers(rows, null)[1], rows[1], '空账本时连对象都不该重建');
+    // 幂等：重复标注不加第二份。
+    assert.equal(roster.annotateRetriedMembers(marked, new Map([['a-id', '失败码 RATE_LIMIT · 第 2/5 次重试 · 等 800ms']]))[1].diagnostics.length, 2);
+    // 被标注的名字必须与截断标志能共存（两个标注器串联是生产路径）。
+    const both = roster.annotateRetriedMembers(roster.annotateTruncatedMembers(rows, new Set(['b-id'])), new Map([['a-id', 'x']]));
+    assert.equal(both[1].diagnostics.length, 2);
+    assert.equal(both[2].diagnostics.length, 1);
+    assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
+  });
+
   await check('提示词预算：系统提示词前缀不许膨胀（每多一个字，每次请求都多付一次钱）', () => {
     const budget = {
       PLAYBOOK: 3800,        // 调度模式方法论（Lead 与所有请求的前缀）。2026-10-04 从 4100 收到 3900、2026-10-04 再按审查 P2-10 收到 3800：只防「超预算」不防「贴边」，留余量给以后新增的纪律
