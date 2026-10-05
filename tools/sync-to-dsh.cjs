@@ -81,6 +81,10 @@ const FILES = [
   'tools/session-probe.cjs',
   'tools/history-audit.cjs',
   'tools/asar-probe.cjs',
+  // 下面两个是 package.json 的 files 里声明的文档，正式安装时也会被拷进去；
+  // 少了它们，已安装副本里会留着一份**过期的 README**，看起来像源码没同步成功。
+  'README.md',
+  'INTERFACES.md',
 ];
 
 function main() {
