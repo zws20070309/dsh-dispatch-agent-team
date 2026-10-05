@@ -468,6 +468,35 @@ function functionBodyOf(source, needle) {
     }
   });
 
+  await check('import 边界：纯逻辑模块只许 import node: 与 ./（把散在 4 处的说法变成可跑断言）', () => {
+    // 动机（2026-10-05 审查 §1-⑧）：这条事实此前散在 README 的目录树注释、INTERFACES 的
+    // 许可清单、各文件头三处**散文**里，代码级守卫是 0 命中。而它是有承重作用的：
+    // selftest / drift-check 能在**没有安装期 junction** 的机器上直接 import 这几个模块
+    // （selftest 文件头就是这么写的：零依赖、直接跑真代码）。一旦有人在 roster.js 里
+    // 顺手 import 一个 @deepseek-ai 包，体检脚本会在别的机器上直接崩，而这里是唯一会先红的地方。
+    // ⚠️ 参照项目的教训（ARCHITECTURE.md:110-112）：纯文档的边界声明会滞后失效——
+    // 所以这里借的是「可跑断言」那一半，不抄一份文档。
+    const PURE_MODULES = ['roster.js', 'playbook.js', 'cache.js', 'resume.js', 'text-clip.js'];
+    const offenders = [];
+    for (const file of PURE_MODULES) {
+      const source = readFileSync(path.join(LIB, file), 'utf8');
+      for (const match of source.matchAll(/^\s*import\s[^;]*?from\s+['"]([^'"]+)['"]/gmu)) {
+        const specifier = match[1];
+        if (specifier.startsWith('node:') || specifier.startsWith('./') || specifier.startsWith('../')) continue;
+        offenders.push(`${file} -> ${specifier}`);
+      }
+      // 动态 import 与 require 同样算（`await import('@deepseek-ai/...')` 一样会崩）。
+      for (const match of source.matchAll(/(?:await\s+import|require)\(\s*['"]([^'"]+)['"]/gu)) {
+        const specifier = match[1];
+        if (specifier.startsWith('node:') || specifier.startsWith('./')) continue;
+        offenders.push(`${file} -> ${specifier}（动态）`);
+      }
+    }
+    assert.deepEqual(offenders, [], `这些纯逻辑模块 import 了非 node 内建的东西（会让零依赖体检脚本在别的机器上崩）：${offenders.join(', ')}`);
+    // 反向：真正的宿主耦合模块**必须**能解析到那些包（否则 host 行起不来）——
+    // 这条不在这里断言（需要 junction），由 drift-check 的第 10e 条负责。
+  });
+
   await check('INTERFACES §1 的 roster 契约清单与真实导出逐项对账（双向）', () => {
     // 动机：这份清单是别人改插件时的**唯一接口文档**，飘了就等于骗人。
     // 2026-10-04 审查 P2-26/27：只做单向检查抓不到「代码加了导出、文档没补」，
