@@ -459,7 +459,7 @@ check('依赖解析 junction 可用（加载期硬依赖 + 体检脚本的依赖
   }
   const { createRequire } = require('node:module');
   const req = createRequire(path.join(PLUGIN_DIR, 'lib', 'tools.js'));
-  // ⚠️ 2026-10-05：以前**只探 dsh-tools 一个包**。结果是「体检全绿」与
+  // 注意：2026-10-05：以前**只探 dsh-tools 一个包**。结果是「体检全绿」与
   // 「integration-test exit 2」并存——本机实测 cordis 解析不到（junction 目录里没有这条），
   // 而 integration-test 需要五个包。同一条假绿灯在 repair.cjs 里也修了；
   // 下面那条 10e-2 闸门保证两份清单不会各自漂。
@@ -857,7 +857,7 @@ check('队员模型覆盖：显式 spawn 钉 > 实时角色配置 > 跟随 Lead�
 
 // 11c-2) 「调度模式只有我们的团队」这条边界的接线必须在 lib/preset.js 里真的存在 ——
 // 但**只允许**用「同名空段遮蔽官方 team:policy」这一种手段。
-// ⚠️ 不许在 preset 作用域里 `tools.restrict` 那九个官方工具名：官方是给**每个 agent 自己的
+// 注意：不许在 preset 作用域里 `tools.restrict` 那九个官方工具名：官方是给**每个 agent 自己的
 // 作用域**装工具（不是全局层），restrict 只认全局层名字 → 必然全部失败，刷出 9 条假故障
 // （2026-09-28 用户实际看到的红字）。真正的手段是在 profile patch 层关掉官方那一行（见 11c-3）。
 check('lib/preset.js 仍遮蔽官方 team:policy 段，且没有误用 tools.restrict', () => {
@@ -947,7 +947,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
   if (/name:\s*['"]team-off['"]/u.test(libText)) return 'lib/ 里仍然注册了 team-off 命令（用户明确要求去掉）';
   if (!/name:\s*['"]team['"]/u.test(libText)) return 'lib/ 里找不到命令定义 name: "team"';
   // 提示词也要跟着改：不许再教模型去用 `/team-off`（那个命令已经不存在）。
-  const playbookText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'playbook.js')).replace(/⛔[^\n]*/gu, '');
+  const playbookText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'playbook.js')).replace(/禁止：[^\n]*/gu, '');
   if (playbookText.includes('`/team-off`')) {
     return 'lib/playbook.js 的提示词里仍然教模型用 `/team-off`（那个命令已经不存在了）';
   }
@@ -1313,7 +1313,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     if (result.ok) {
       console.log(`  PASS  ${result.name}`);
       // 漏写 return 的检查等于「永远绿」——不能和真 PASS 混在一起（P2-19 根因之一）。
-      if (result.missingReturn === true) console.log('        · ⚠️ 该检查没有显式 return，按 PASS 处理但请补上返回值');
+      if (result.missingReturn === true) console.log('        · 注意：该检查没有显式 return，按 PASS 处理但请补上返回值');
     } else {
       failed += 1;
       console.log(`  FAIL  ${result.name}`);

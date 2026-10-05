@@ -1,6 +1,6 @@
 # 接口冻结文档（v1）—— 实现者必须严格遵守
 
-> **⚠️ 时效性（2026-09-28 修订）**：本文件冻结于 2026-09-27 17:35，代码在 2026-09-28 01:4x 做过一次
+> **注意：时效性（2026-09-28 修订）**：本文件冻结于 2026-09-27 17:35，代码在 2026-09-28 01:4x 做过一次
 > 整体改造（12 角色 / 共享队员卡 / 队员工具收窄 / 配置页 revision CAS）。**下面 §0.1 是勘误表：
 > 凡与勘误表冲突，一律以 `lib/` 现行代码与勘误表为准。** 各被否证的章节内也加了行内提示。
 > 未列入勘误表的条目（例如 webServer / dsh-commands / dsh-llm / `plugins.bundle.config` 槽位 /
@@ -40,7 +40,7 @@
 | 25 | §0.1 第 16、20 条与 §5「控制面/patch 的关系」 | **patch 层的顺序是语义的一部分（2026-09-28 的 P0）**。官方 `agent-team-profile` 的 patch 用 `- insert:` **新建** `agent-team` / `tool-agent-team` / `ui-agent-team`；patch 层按 `dsh.profile.bundles` 顺序应用（`dsh-app-boot` 的 `loadProfileDirectory` → `readProfilePatches` → `composeEntries`），而 DSH 插件页启用 bundle 时是 **append**（`dsh-plugin-manager` 的 `selectBundle`）。所以本包 patch 里的 `- id: tool-agent-team, disabled: true` 与 `- id: agent-team, config: {maxMembers: 48}` 在本机**都是静默无效的**（我们的 bundle 排在官方之前）→ 有效 `maxMembers` 退回官方默认 **8**（roster 是历史累计，8 次 spawn 后派不出人）。现行做法：**容量覆盖落在 profile 自己的 `cordis.patch.yml`**（在所有 bundle 层之后应用，`tools/repair.cjs --apply` 维护，`repair.cjs` / `drift-check.cjs` 都校验两份一致），本包 patch 里**不许**再出现顺序依赖的 `disabled` |
 | 26 | §0.1 第 16、20 条（官方团队面的关闭方式） | 官方**工具面/策略段**不再靠 bundle patch 关闭，而是在**调度模式的 preset 作用域**里抑制（`lib/preset.js` 的 `suppressOfficialTeam`）：逐个 `tools.restrict({ deny:[TEAM_TOOL_NAMES] })` 摘掉九个**同名**的官方工具（restrict 只过滤**继承面**；本作用域自己注册的 `/team`+开关工具与更深作用域自己注册的队员团队工具不受影响），再注册同名空段遮蔽 `team:policy`（`renderPrompt` 丢空段，`lib/client.js` 无关）。结果是**只有调度模式**看得到/继承不到官方那一套，**别的 preset 照旧**（这修正了第 16/20 条里「关闭官方工具行」的说法）。官方 **UI 行与域服务行保持启用**；新增常量 `OFFICIAL_TEAM_POLICY_SECTION = 'team:policy'`（`lib/roster.js`，官方段名真值） |
 | 27 | §3.1「顺序固定」清单（第 7 条） | 补一条**注册陷阱**：`ctx.effect(() => ctx.systemPrompt.section(...))` 里用**属性访问**取服务会按 **effect 回调所在 fiber** 的 `inject` 列表判定合法性 —— 回调与 `apply` 不是同一个 ctx，可能抛 `cannot get property "systemPrompt" without inject`，于是整段 PLAYBOOK **静默消失**（只留一条诊断）。现行写法：先在 `apply` 里 `serviceOf(ctx,'systemPrompt')` 取好服务再进 effect（`registerControls` 早就是这个手法）。集成测试断言「调度模式的提示词里**有** PLAYBOOK」，这条就是它的闸门 |
-| 28 | §0.1 第 26 条（官方团队面的关闭方式） | **第 26 条的做法被实测否证并已改掉**：官方九个团队工具**不在全局层** —— `dsh-experimental-tool-agent-team/lib/index.js:539-546` 的 `maybeInstall` 给**每一个** live agent 装进**它自己的 agent 作用域**（:225 注释逐字原话 "Team tools are registered only in an exact Agent scope"；:229 是近义句），而域服务 `tryMembership`（`dsh-experimental-agent-team/lib/index.js:397-426`）对任意非子代理 agent 都返回 `{role:"lead"}`。所以 preset 作用域的 `tools.restrict({deny:[名字]})` **必然全部失败**（restrict 只认全局层：`names unknown global tool "x"`；用户看到的就是那 9 条红字），而且 restrict 从不影响本作用域自己的注册。现行做法：**profile 的 patch 层整行 `disabled: true` 关掉官方 `tool-agent-team`**（`tools/repair.cjs --apply` 维护，顺序无关），调度模式只保留「同名空段遮蔽 `team:policy`」；`drift-check` 禁止 `lib/preset.js` 里再出现 `restrict`。⚠️ 附带事实：两边**同名同作用域**会抛 `tool "x" is already registered in this scope`，即官方行开着时本插件的九个工具**装不上**（角色/模型参数全丢）—— `lib/runtime.js` 的 `installTeamTools` 现在把这种情况记成**故障**（红色通道）并给出修法 |
+| 28 | §0.1 第 26 条（官方团队面的关闭方式） | **第 26 条的做法被实测否证并已改掉**：官方九个团队工具**不在全局层** —— `dsh-experimental-tool-agent-team/lib/index.js:539-546` 的 `maybeInstall` 给**每一个** live agent 装进**它自己的 agent 作用域**（:225 注释逐字原话 "Team tools are registered only in an exact Agent scope"；:229 是近义句），而域服务 `tryMembership`（`dsh-experimental-agent-team/lib/index.js:397-426`）对任意非子代理 agent 都返回 `{role:"lead"}`。所以 preset 作用域的 `tools.restrict({deny:[名字]})` **必然全部失败**（restrict 只认全局层：`names unknown global tool "x"`；用户看到的就是那 9 条红字），而且 restrict 从不影响本作用域自己的注册。现行做法：**profile 的 patch 层整行 `disabled: true` 关掉官方 `tool-agent-team`**（`tools/repair.cjs --apply` 维护，顺序无关），调度模式只保留「同名空段遮蔽 `team:policy`」；`drift-check` 禁止 `lib/preset.js` 里再出现 `restrict`。注意：附带事实：两边**同名同作用域**会抛 `tool "x" is already registered in this scope`，即官方行开着时本插件的九个工具**装不上**（角色/模型参数全丢）—— `lib/runtime.js` 的 `installTeamTools` 现在把这种情况记成**故障**（红色通道）并给出修法 |
 | 29 | §0.1 第 20 条（`/team-off` 已删除） | 补一条**会话日志的硬约束**，它决定了「删命令 ≠ 删历史」：会话日志 append-only 且 **seq 必须从 0 连续** —— `dsh-session/lib/types/surface.js:400`（`session event seq N is not contiguous; expected M`）、`dsh-session-persistence/lib/index.js:230`（`append seq mismatch`）、`dsh-session/lib/types/index.js:429`（seed 要求 `seq === index`）。所以「旧会话里已渲染的斜杠命令气泡」**不能靠删事件消除**（会让整份会话读不出来，重新编号还要动 `messageSeqs` / `sourceEventSeqs` / 投影缓存）。判「历史 vs 活命令」的唯一判据是会话日志里的 `command/run`：`tools/history-audit.cjs`（只读）一次给出时间线 + 与现行 `lib/` mtime 的对比 |
 | 30 | §0.1 第 21 条（0.2.0 逐条复核） | 追加两条 **0.2.0-rc.2** 实测事实（本轮从 `app.asar` 解包核对，12 967 文件 / 372 MB 全量）：① `dsh-experimental-agent-team` / `tool-agent-team` / `client-ui-agent-team` / `agent-team-profile` **不含任何斜杠命令注册**（`name:`/`registerCommand` 零命中，只有注释里的 task commands）→ 命令面 `team` 100% 属于本插件，`/team-off` 在任何官方版本里都不存在；② 全量扫 `team-off` **0 命中**。据此，页面上再出现 `/team-off` 只可能是**旧实例或旧会话历史**，不可能是官方行为 |
 | 31 | §7.5 `ctx.llm`（新增低层 API） | **`llm/stream` 瀑布与 `ctx.llm.stream(options)`**（缓存保活用，0.2.0-rc.2 实测）：`dsh-llm/lib/index.js:2367-2372` 的 `stream(options) { return this.streamWithRegistration(options) }` → `:2371` `this.ctx.waterfall(this, "llm/stream", options, () => this.adapterStream(options, prepared))`。监听器签名 `(options, next)`，**必须把 `next()` 的结果原样交出去**（可包一层但不得改内容）；`options` 至少含 `{provider, model, messages, tools?, system?, maxTokens?, temperature?, reasoningEffort?, stop?, signal?}`（`:2314-2320` 的 projectedOptions）。`dsh-agent-loop/lib/index.js:1072` 是真实调用点（`this.loopCtx.llm.stream(request)`）。因此插件**可以**在进程内发一次与真实请求同前缀的调用；本插件只用它做「1 token 续缓存」（`lib/cache.js`），且对非 Lead 请求完全旁路。drift-check 有两条闸门钉住这个事件名与 dispatch 形状。**另需注意作用域语义**：dsh-llm 的 thisArg 是 Llm 服务实例（不带 `Context.filter`），而 cordis 的 dispatch 是 `hook.global \|\| !filter \|\| filter.call(thisArg, hook.ctx)`（`@deepseek-ai/cordis/lib/index.js:258-264`）——**没有过滤器就是全局广播**，所以插件在 `apply(ctx)` 的子作用域里注册也能收到 `llm/stream`；集成测试用「子作用域注册 + 父作用域派发」把这条前提钉住了。`dsh-scope` 只对带 agent 的派发（`agent/request` 等）做过滤 |
@@ -74,7 +74,7 @@
   `version` 都是 `0.1.5-rc.2`），里面的 `installSection` / `settings.plugin.item` /
   `dsh-client-schema-form` 在这个运行时里**不存在**。
   **判断 API 是否存在，必须以 `app.asar`（0.2.0-rc.2）里的那一份为准。**
-  ⚠️ 反过来也成立：**这些包在插件目录里能被 `import.meta.resolve` 成功解析**（junction 到全局 CLI 的
+  注意：反过来也成立：**这些包在插件目录里能被 `import.meta.resolve` 成功解析**（junction 到全局 CLI 的
   0.1.5 副本）。所以「解析得到」不等于「是运行中的那一份」——这是一条静默的版本错配风险，
   不是 `ERR_MODULE_NOT_FOUND`。`tools/integration-test.cjs` 会在开头把实际解析到的版本打印出来，
   `tools/drift-check.cjs` 则把**两份**都打印出来。
@@ -97,7 +97,7 @@ export const CONFIG_FILENAME = 'dispatch-agent-team.json';
 export const ROLES;                 // [{id,label,labelEn,mission,duties[],writes,when}] —— 现在 12 个，按工作流阶段排序
 export const ROLE_IDS;              // string[]
 export const ROLE_BY_ID;            // Record<id, role>
-// ⚠️ 以下 5 个为 2026-09-28 新增（队员能力面真值，与角色无关；见 §0.1 第 3 条）：
+// 注意：以下 5 个为 2026-09-28 新增（队员能力面真值，与角色无关；见 §0.1 第 3 条）：
 export const TEAM_TOOL_NAMES;             // 九个团队工具名（真值在这里，不在 lib/tools.js）
 export const LEAD_ONLY_TEAM_TOOL_NAMES;   // ['spawn_teammate','interrupt_agent']
 export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减去上面两个，再加队员专用的 report_result 与 ask_lead
@@ -108,7 +108,7 @@ export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
 export const REPORT_TOOL_NAME;            // 'report_result'（队员专用）
 export const LEAD_TEAM_TOOL_NAMES;        // Lead 的安装名单（官方九个 + 本插件为 Lead 加的两个）
 export const OFFICIAL_TEAM_POLICY_SECTION;// 官方 team:policy 段名（preset 作用域遮蔽它）
-// ⚠️ 以下 5 个为 2026-10-04 新增（§8 三条建议落地）：
+// 注意：以下 5 个为 2026-10-04 新增（§8 三条建议落地）：
 export const BROADCAST_TOOL_NAME;         // 'broadcast_message'（Lead 专属）
 export const ASK_LEAD_TOOL_NAME;          // 'ask_lead'（队员专用）
 export const TRUNCATED_DIAGNOSTIC;        // 截断标志的固定文案（进成员行 diagnostics）
@@ -139,12 +139,12 @@ export function configuredRoleCount(config);
 ```js
 export const PLAYBOOK;            // 调度模式主提示词（preset scope）
 export const TEAM_POLICY;         // 团队协作策略（agent scope，开启后）
-export const TEAMMATE_CARD;                // ⚠️ 已替代 teammateCard(roleId)：与角色无关的共享队员卡（见 §0.1 第 4 条）
+export const TEAMMATE_CARD;                // 注意：已替代 teammateCard(roleId)：与角色无关的共享队员卡（见 §0.1 第 4 条）
 export function teammateBrief(roleId, name); // 角色简报，由 spawn_teammate 拼进 Lead 的派活提示词
-export function enableInstruction(rawInput); // ❌ 已删除（见 §0.1 第 38 条）：命令路径改用 teamCommandLine(rawInput)，工具路径不再注入
-export const DISABLE_INSTRUCTION;            // ❌ 已删除（见 §0.1 第 38/40 条）：工具路径的状态说明改走工具返回值 diagnostics
-export function teamCommandLine(rawInput);   // ✅ /team 注入的 user 消息正文 = 用户原文那一行（可能是 '/team'）
-export function wakeInstruction(name, note); // ✅ wake_teammate 发给队员的正文（固定「从断点续」措辞）
+export function enableInstruction(rawInput); // 否 已删除（见 §0.1 第 38 条）：命令路径改用 teamCommandLine(rawInput)，工具路径不再注入
+export const DISABLE_INSTRUCTION;            // 否 已删除（见 §0.1 第 38/40 条）：工具路径的状态说明改走工具返回值 diagnostics
+export function teamCommandLine(rawInput);   // 是 /team 注入的 user 消息正文 = 用户原文那一行（可能是 '/team'）
+export function wakeInstruction(name, note); // 是 wake_teammate 发给队员的正文（固定「从断点续」措辞）
 ```
 
 ## 3. `lib/runtime.js`（`builder-host` 写）—— 三模块共用单例
@@ -153,7 +153,7 @@ export function wakeInstruction(name, note); // ✅ wake_teammate 发给队员�
 两者解析到同一文件 URL，因此 Node ESM 模块缓存保证是**同一实例**。
 
 ```js
-/** ⚠️ 只对了一半：只有需要 ctx 的函数才收 ctx（见 §0.1 第 5 条）。本模块不 import 任何 dsh 包。 */
+/** 注意：只对了一半：只有需要 ctx 的函数才收 ctx（见 §0.1 第 5 条）。本模块不 import 任何 dsh 包。 */
 
 export async function getConfigPath(ctx);        // -> Promise<string>；<dshHome>/dispatch-agent-team.json
 export async function loadConfig(ctx);           // -> 净化后的配置（磁盘为准，带 mtime 缓存）
@@ -208,11 +208,11 @@ export function sessionMemory();           // -> 会话级团队记忆快照（�
 1. 幂等：已开启则直接返回。
 2. 记 `enabledRoots.add(rootId)`；把 rootId→disposers[] 存起来。
 3. 在 **`agent.ctx`**（不是宿主 ctx）上注册：
-   - `ctx.systemPrompt.section({ name: 'dispatch:team-policy', order: 600, text: TEAM_POLICY })`  ← ⚠️ 是 **600**，不是 60（§0.1 第 6 条）
+   - `ctx.systemPrompt.section({ name: 'dispatch:team-policy', order: 600, text: TEAM_POLICY })`  ← 注意：是 **600**，不是 60（§0.1 第 6 条）
    - 九个团队工具（见 §4）
    - `agent/request` waterfall 监听（仅当 root 自己也有角色配置时；一般没有，可跳过）
 4. 对所有 `ctx.agents.list()` 里**已经存在**的本团队队员补装（冷恢复/重开同理）；
-   并对 root 的**每个** `agent/created` 以后创建的队员，在其 `agent.ctx` 上注册（⚠️ 现行实现比本文档多三步，见 §0.1 第 7/8 条）：
+   并对 root 的**每个** `agent/created` 以后创建的队员，在其 `agent.ctx` 上注册（注意：现行实现比本文档多三步，见 §0.1 第 7/8 条）：
    - 共享队员卡段 `ctx.systemPrompt.section({ name: 'dispatch:teammate-card', order: 600, text: TEAMMATE_CARD })`
      —— **与角色无关**，所有队员逐字节相同（旧写法 `teammateCard(deriveRole(name))` 已删除）
    - **清空**被摘掉工具的用法段（`TEAMMATE_SECTION_MUTES`：`tool:goal` / `tool:workflow`，同名空段遮蔽）
@@ -328,14 +328,14 @@ export { TEAM_TOOL_NAMES };                                            // 名字
 
 ## 5. `lib/preset.js`（`builder-preset` 写）
 
-> ⚠️ **本节与 §5.2 / §5.3 已过时且危险，先读 §0.1 第 15/16 条**：
+> 注意：**本节与 §5.2 / §5.3 已过时且危险，先读 §0.1 第 15/16 条**：
 > `apply()` **只注册一个提示词段**，`inject` 只有 `['systemPrompt']`；
 > 两个命令与两个开关工具由 `registerControls(ctx)` 导出、在**宿主平面**注册
 > （`lib/index.js` 调用）。在 preset 子树里发布能力会让**整份 preset 变 broken**（README §8.2）。
 
 ```js
 export const name = '@zws/dsh-dispatch-agent-team/preset';
-export const inject = ['systemPrompt'];   // ⚠️ 只有这一个（旧写法多声明四个服务，会让 preset 半整体不 apply）
+export const inject = ['systemPrompt'];   // 注意：只有这一个（旧写法多声明四个服务，会让 preset 半整体不 apply）
 export function apply(ctx) { ... }        // 注册提示词段 + 控制面（preset 层，只对本 preset 可见），整段 try/catch
 export function registerControls(ctx);    // 只由 apply() 在**调度模式的 preset scope** 里调用（宿主平面调用 = 越界）
 ```
@@ -349,7 +349,7 @@ ctx.effect(() => ctx.systemPrompt.section({
 
 ### 5.2 命令入口：**只有** `/team`（**没有** `/team-off`）
 
-⚠️ 命令与开关工具由 `apply()` 在 preset 子树里注册（见 §0.1 第 19/20 条）：
+注意：命令与开关工具由 `apply()` 在 preset 子树里注册（见 §0.1 第 19/20 条）：
 **注册作用域决定可见范围**——preset 层只有调度模式的会话能看到，宿主平面会变成所有 preset 都能看到（越界）。
 **关闭团队不用命令**：用户说「关掉团队」，Lead 调 `disable_agent_team` 工具。
 
@@ -389,7 +389,7 @@ ctx.effect(() => ctx.commands.register({
    形状与官方 `createUserMessage` 同形（`dsh-llm/lib/types/message.js:34-58`），且 `MessageId`
    是纯类型品牌、运行时不校验。
 4. 返回 `CommandResult`：**`{ kind: 'success' | 'error', text: string }`**。
-   ⚠️ 0.1.7 `dsh-commands/lib/index.js:184-204` 的 `normalizeResult()`：**没有 `kind` 字段直接抛
+   注意：0.1.7 `dsh-commands/lib/index.js:184-204` 的 `normalizeResult()`：**没有 `kind` 字段直接抛
    `TypeError`（"handler must return a CommandResult"）**；`kind:'success'` 时 `text` 可选但必须是
    string；`kind:'error'` 时 `text` 必须非空。**不要返回 `{ok:true,text}`。**
 
@@ -411,7 +411,7 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     var module = { exports: {} }; var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
     const React = require('react');
-    exports.inject = ['slots', 'locale'];   // ⚠️ 两个（§0.1 第 17 条）
+    exports.inject = ['slots', 'locale'];   // 注意：两个（§0.1 第 17 条）
     exports.apply = function (ctx) { ... };
     return module.exports;
   }});
@@ -434,7 +434,7 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
 - 数据与写入**全部走我们自己的 host 路由**（先例：mcp-manager 的 `apiCall()`，`lib/client.js:90-101`）：
   - `POST /zws-dispatch-agent-team/api`，header 必须带 `content-type: application/json`
     与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照 mcp-manager `:94`）。
-  - ops（⚠️ 现行实现比这里多 `revision` / `diagnostics`，见 §0.1 第 18 条）：
+  - ops（注意：现行实现比这里多 `revision` / `diagnostics`，见 §0.1 第 18 条）：
     `{op:'get'}` → `{ok:true, config, roles:[...], path, revision, diagnostics}`；
     `{op:'list-models'}` → `{ok:true, groups, failures}`；
     `{op:'set', args:{roles, revision}}` → `{ok:true, config, revision}`，revision 不一致时

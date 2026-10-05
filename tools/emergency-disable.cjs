@@ -92,7 +92,7 @@ if (fs.existsSync(patchPath)) {
   console.log(`[emergency-disable] cordis.patch.yml 的 selectedDefault = ${selectedDefault}`);
   if (selectedDefault === OUR_PRESET_ID) {
     console.log('');
-    console.log(`  ⚠️ selectedDefault 指向本插件的 preset "${OUR_PRESET_ID}"。一旦本插件被禁用，`);
+    console.log(`  注意：selectedDefault 指向本插件的 preset "${OUR_PRESET_ID}"。一旦本插件被禁用，`);
     console.log('     新建会话会报 `agent-preset/not-found: Unknown agent preset: dispatch-mode`。');
     console.log('     请把那一行改成 `selectedDefault: minimal-grayscale`（或删掉该行）。');
     console.log('');
@@ -127,7 +127,7 @@ if (!removeBundle) {
   // 应急场景刻意**不**自动改 cordis.patch.yml（保持「最小动作」），但必须把后果讲清楚（P1-5）：
   // 托管块还留在 profile 层，官方 Agent Teams 的九个团队工具会继续处于被关闭状态。
   console.log('');
-  console.log('⚠️ 本工具没有动 profile 的 cordis.patch.yml。如果之前跑过 repair.cjs --apply，');
+  console.log('注意：本工具没有动 profile 的 cordis.patch.yml。如果之前跑过 repair.cjs --apply，');
   console.log('   那段 dispatch-agent-team:managed 托管块仍在生效——它会**继续关闭官方** tool-agent-team 行，');
   console.log('   于是官方 Agent Teams 的九个团队工具在所有 preset 里都不可用。');
   console.log(`   要恢复官方团队：node "${path.join(__dirname, 'repair.cjs')}" --revert --profile "${profileDir}"`);

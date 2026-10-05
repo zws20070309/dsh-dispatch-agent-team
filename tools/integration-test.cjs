@@ -435,7 +435,7 @@ async function main() {
   // 这是 loader 真正调用的那个入口，改动最容易在这里埋雷（一个拼错的引用就能让插件起不来）。
   // 配置读写必须落在**临时 DSH_HOME**，绝不能碰真实的 ~/.dsh/dispatch-agent-team.json。
   //
-  // ⚠️ 踩过的坑（2026-09-28，真的写坏过用户的配置文件）：只设 `process.env.DSH_HOME` **不够**。
+  // 注意：踩过的坑（2026-09-28，真的写坏过用户的配置文件）：只设 `process.env.DSH_HOME` **不够**。
   // `resolveDshHome()` 的候选顺序是「settings 推导 → DSH_HOME → ~/.dsh」，而它用
   // 「<候选>/profiles 是不是目录」做**存在性确认** —— 临时目录下没有 profiles/，于是它会跳过
   // DSH_HOME、选中真实存在的 ~/.dsh，测试里的 set/reset 就写到了真配置上。
@@ -932,7 +932,7 @@ async function main() {
 
   // A) 真 cordis 瀑布：监听器必须被调用，且下游流逐字通过
   //
-  // ⚠️ 这里刻意**在子作用域（preset.ctx）注册**、从**父作用域（root）派发** —— 这正是生产里的形状：
+  // 注意：这里刻意**在子作用域（preset.ctx）注册**、从**父作用域（root）派发** —— 这正是生产里的形状：
   // 插件在 `apply(ctx)` 拿到的 ctx 上注册，而 dsh-llm 在自己的 ctx 上
   // `this.ctx.waterfall(this, "llm/stream", …)` 派发（`thisArg` 是 Llm 服务实例，不带作用域过滤器）。
   // cordis 的 dispatch 是「hook.global || !filter || filter(...)」——没有过滤器就**全局广播**，
@@ -1857,7 +1857,7 @@ async function main() {
     const spawnedRequests = [];
     const spawnRuntime = {
       peekConfig: () => ({ version: 1, roles: { builder: { provider: 'p1', model: 'm1' } }, cache: { keepalive: { routes: {} } } }),
-      // ⚠️ 参数顺序是 (ctx, route)：漏掉第一个参数会把 ctx 当 route 传回去（这里踩过一次，route 变成 undefined）。
+      // 注意：参数顺序是 (ctx, route)：漏掉第一个参数会把 ctx 当 route 传回去（这里踩过一次，route 变成 undefined）。
       preflightRoute: async (_ctx, route) => ({ ok: true, route, diagnostics: [] }),
       pinSpawnRoute: (name, route) => pinned.push({ name, route }),
     };
