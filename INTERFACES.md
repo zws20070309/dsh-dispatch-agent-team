@@ -184,8 +184,13 @@ export function disposeAll();              // 卸载全部注册并清内部状�
 export function setStatusRefresh(fn);      // 注入「重算并写状态文件」的回调（lib/index.js 用它做 settled 阶段重写）
 export function installKeepalive(ctx);     // 挂 llm/stream 瀑布（缓存保活 + 统计）；幂等
 export function keepaliveStats();          // -> 保活/缓存命中统计快照（插件页与状态文件都读它）
-export function recentReports();           // -> 最近的队员报告（浅拷贝）
-export function recordReport(name, report);// 记一条队员报告：report_result 的落账口
+export function recentReports();           // -> {items[], dropped, cap}；items 是最近的队员报告（浅拷贝）
+                                            //    dropped = 被记录上限挤掉的条数（面板要如实说「另有 N 条未展示」）
+export function recordReport(name, report);// 记一条队员报告：report_result 的落账口；**返回记录对象**（供下面那条补写）
+export function markReportDelivered(entry, delivered);
+                                            // 投递**之后**补写该记录的 delivered：
+                                            //   插件页记录与 Lead 邮箱是两套口径，不补写就会出现
+                                            //   「页面显示已交报告、Lead 从未收到」（2026-10-05 审查 §1-⑤）
 export function truncatedMemberIds();      // -> Set<agentId>；上一轮撞输出上限且未交付的队员（list_agents 标注用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
