@@ -670,6 +670,79 @@ function functionBodyOf(source, needle) {
     assert.ok(body.includes('diagnostics.push('), '状态说明应当走工具返回值 diagnostics');
   });
 
+  // ── lib/resume.js：会话级团队开关记忆的关键时间量（2026-10-05 审查 §1-③）─────────────
+  //
+  // 为什么要专门测这一组：resume.js **早就支持注入时钟**（sanitizeStore 收 now 参数），
+  // 但此前没有任何测试走这条路 —— 全仓 grep 'resume' 于 selftest 是零命中，
+  // integration-test 只在真实时钟下用它（写与读在同一次运行内，记录年龄≈0）。
+  // 于是 `7 * 24 * 60 * 60 * 1000` 少写一个 `* 1000`（7 天写成 7 分钟）这类一行笔误，
+  // 38 项 selftest + 56 项 drift-check + integration 全都不会红，
+  // 表现却是「用户过几天重启 DSH，团队没自动恢复」——正是 README §8.10 已经发生过一次的事故类型。
+  // 这组用例全部走**纯函数** sanitizeStore（完全不落盘），与 selftest 的零依赖形态一致。
+  await check('resume.sanitizeStore：TTL 边界两侧（注入时钟，防「7 天写成 7 分钟」这类笔误）', async () => {
+    const resume = await load('resume.js');
+    const now = 1_800_000_000_000;
+    const withAge = (ageMs) => resume.sanitizeStore({
+      version: resume.SESSIONS_VERSION,
+      updatedAt: now,
+      sessions: { 'session-old': { enabledAt: now - ageMs, lastSeenAt: now - ageMs, source: 'command' } },
+    }, now).sessions;
+    // TTL 的两侧：刚过期与还没过期必须分叉（把常量改动锚到行为上，而不是断言常量等于某个数）。
+    assert.equal(Object.keys(withAge(resume.SESSION_TTL_MS - 1)).length, 1, 'TTL 内 1 毫秒的记录必须保留');
+    assert.equal(Object.keys(withAge(resume.SESSION_TTL_MS + 1)).length, 0, '刚过 TTL 的记录必须丢掉');
+    assert.equal(Object.keys(withAge(0)).length, 1, '刚写的记录必须保留');
+    // 量级锚点：TTL 是「天」级、不是「分钟」级。7*24*60*60*1000 写少一个 *1000 会变成 7 分钟，
+    // 这条断言会在那一刻红（11 分钟大的记录：正确实现保留，7 分钟实现丢弃）。
+    assert.equal(Object.keys(withAge(11 * 60 * 1000)).length, 1, 'TTL 至少要有小时级——10 分钟级的 TTL 是笔误');
+    assert.ok(resume.SESSION_TTL_MS >= 24 * 60 * 60 * 1000, 'TTL 必须 >= 1 天（团队记忆至少要跨一个工作日）');
+  });
+
+  await check('resume.sanitizeStore：版本不符整份丢弃、字段白名单、坏时间戳用 now 顶上', async () => {
+    const resume = await load('resume.js');
+    const now = 1_800_000_000_000;
+    const row = { enabledAt: now, lastSeenAt: now, source: 'tool' };
+    // 版本不符 → 整份丢弃（宁可让用户重开一次团队，也不猜旧形状）。
+    assert.deepEqual(resume.sanitizeStore({ version: resume.SESSIONS_VERSION + 1, sessions: { a: row } }, now).sessions, {});
+    assert.deepEqual(resume.sanitizeStore(null, now).sessions, {});
+    assert.deepEqual(resume.sanitizeStore({ version: resume.SESSIONS_VERSION, sessions: [] }, now).sessions, {});
+    // 字段白名单：非白名单字段不进结果（文件被手改坏也不带入运行时）。
+    const dirty = resume.sanitizeStore({
+      version: resume.SESSIONS_VERSION,
+      updatedAt: now,
+      sessions: {
+        'session-a': { enabledAt: now, lastSeenAt: now, source: 'command', evil: 'x', __proto__: { polluted: 1 } },
+        'session-b': { lastSeenAt: 'not-a-number', enabledAt: -5 },
+        '': row,
+        'session-c': 'not-an-object',
+      },
+    }, now);
+    assert.deepEqual(Object.keys(dirty.sessions).sort(), ['session-a', 'session-b'], '空 id 与非对象记录必须丢掉');
+    assert.equal(dirty.sessions['session-a'].evil, undefined, '白名单外的字段不许进结果');
+    assert.equal(dirty.sessions['session-a'].source, 'command');
+    assert.equal(dirty.sessions['session-b'].lastSeenAt, now, '坏时间戳用 now 顶上（不让一个坏字段废掉整份）');
+    assert.equal(dirty.sessions['session-b'].enabledAt, now);
+    assert.equal(Object.prototype.polluted, undefined, '不允许原型污染');
+  });
+
+  await check('resume.sanitizeStore：超过 MAX_SESSIONS 时淘汰最旧的、且保序（新的在前）', async () => {
+    const resume = await load('resume.js');
+    const now = 1_800_000_000_000;
+    const sessions = {};
+    for (let index = 0; index < resume.MAX_SESSIONS + 25; index += 1) {
+      // 越早的 index 越旧：lastSeenAt 递增。
+      sessions[`session-${index}`] = { enabledAt: now, lastSeenAt: now - (resume.MAX_SESSIONS + 25 - index) * 1000 };
+    }
+    const kept = resume.sanitizeStore({ version: resume.SESSIONS_VERSION, updatedAt: now, sessions }, now).sessions;
+    const ids = Object.keys(kept);
+    assert.equal(ids.length, resume.MAX_SESSIONS, '超出上限必须裁到 MAX_SESSIONS');
+    assert.equal(ids[0], `session-${resume.MAX_SESSIONS + 24}`, '最新的必须排在最前（淘汰顺序依赖它）');
+    assert.equal(kept[`session-0`], undefined, '最旧的必须被淘汰');
+    // 保序的另一面：留着的那批仍按 lastSeenAt 从新到旧。
+    for (let index = 1; index < ids.length; index += 1) {
+      assert.ok(kept[ids[index - 1]].lastSeenAt >= kept[ids[index]].lastSeenAt, '保留项必须按 lastSeenAt 降序');
+    }
+  });
+
   await check('resolveMemberRoute：显式 spawn > 实时角色配置 > 跟随 Lead（2026-10-01 修的「跟随 Lead 不生效」）', () => {
     const config = { version: 1, roles: { builder: { provider: 'p1', model: 'm1' } }, cache: { keepalive: { routes: {} } } };
     const roleRoute = roster.resolveRoleRoute(config, 'builder');
