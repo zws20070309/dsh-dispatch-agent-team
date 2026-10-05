@@ -32,7 +32,7 @@
 #    provider/model/reasoning_effort 三个参数不再注册（dsh-tool-subagent/lib/index.js:387-389、
 #    :412-425）；`tool:subagent` 提示词段**不受影响**（它只由 backgroundMode 决定，:576-580）。
 #    `tool-subagent-fork` 行本来就没写这个 flag，行为不变。
-#    ⚠️ 与官方 model-selection-settings 服务的关系：本机该服务是默认值（enabled=false、
+#    注意：与官方 model-selection-settings 服务的关系：本机该服务是默认值（enabled=false、
 #    allowedModels=[]，profiles/desktop/cordis.yml:493-494 没有 config 块）。不用去关它——
 #    它自己那行不写这个 flag 就没人读它；反过来，如果只把开关打开而不选模型，
 #    新会话会在 model-selection-settings.js:59 抛错（"requires at least one allowed model"）。
@@ -209,7 +209,7 @@
                 name: '@deepseek-ai/dsh-tool-subagent-control'
               - id: tool-subagent-list-agents
                 name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
-              # ⚠️ 这里**刻意不写** `modelSelectionSettings: true`（极简灰度那一行是写的）。
+              # 注意：这里**刻意不写** `modelSelectionSettings: true`（极简灰度那一行是写的）。
               # 见本文件头「与极简灰度的三处差异」第 3 条：调度模式里「给谁挑模型」只有一个
               # 入口（本插件的配置页：每个角色一个模型/强度），不叠加官方那套。
               - id: tool-subagent

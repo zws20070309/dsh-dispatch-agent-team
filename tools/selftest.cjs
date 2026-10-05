@@ -301,7 +301,7 @@ function functionBodyOf(source, needle) {
 
   await check('模型可见文本零 emoji（用户硬要求；代码注释里的不算）', () => {
     // 覆盖全部会注入模型的文本：三段提示词 + 每个角色的派活简报 + 唤醒文案 + 命令行。
-    // 修复前的现场：PLAYBOOK 曾命令 Lead 用 ❓/➡️ 排版（2026-10-04 审查 P1-2）。
+    // 修复前的现场：PLAYBOOK 曾命令 Lead 用 问号/箭头 排版（2026-10-04 审查 P1-2）。
     for (const [label, text] of visibleModelTexts(playbook, roster)) {
       const found = text.match(MODEL_TEXT_EMOJI);
       assert.ok(found === null, label + ' 含 emoji：' + JSON.stringify([...new Set(found || [])]));
@@ -474,7 +474,7 @@ function functionBodyOf(source, needle) {
     // selftest / drift-check 能在**没有安装期 junction** 的机器上直接 import 这几个模块
     // （selftest 文件头就是这么写的：零依赖、直接跑真代码）。一旦有人在 roster.js 里
     // 顺手 import 一个 @deepseek-ai 包，体检脚本会在别的机器上直接崩，而这里是唯一会先红的地方。
-    // ⚠️ 参照项目的教训（ARCHITECTURE.md:110-112）：纯文档的边界声明会滞后失效——
+    // 注意：参照项目的教训（ARCHITECTURE.md:110-112）：纯文档的边界声明会滞后失效——
     // 所以这里借的是「可跑断言」那一半，不抄一份文档。
     const PURE_MODULES = ['roster.js', 'playbook.js', 'cache.js', 'resume.js', 'text-clip.js'];
     const offenders = [];
@@ -992,9 +992,9 @@ function functionBodyOf(source, needle) {
 });
 
 /**
- * 模型可见文本的 emoji 判定：Emoji_Presentation/杂项符号(2600-27BF,含 ⚠❓➡)/装饰符/变体选择符 U+FE0F。
+ * 模型可见文本的 emoji 判定：Emoji_Presentation/杂项符号(2600-27BF,含 注意：问号箭头)/装饰符/变体选择符 U+FE0F。
  * 不含箭头区段 2190-21FF：`→`(U+2192) 是普通箭头、无 emoji 呈现，审查报告的判定是它不违反字面要求。
- * 只用于「会注入模型」的文本；代码注释里的 ⚠️/⛔ 不在此列（它们不进系统提示词）。
+ * 只用于「会注入模型」的文本；代码注释里的 注意：/禁止：不在此列（它们不进系统提示词）。
  */
 const MODEL_TEXT_EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{2753}\u{2754}\u{27A1}]/gu;
 

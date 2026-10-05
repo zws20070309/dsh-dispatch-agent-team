@@ -296,7 +296,7 @@ if (!fs.existsSync(PROFILE_PATCH)) {
       if (start >= 0 && end > start) {
         next = patchText.slice(0, start) + MANAGED_BLOCK + patchText.slice(end + MANAGED_END.length);
       } else if (match !== null) {
-        // ⚠️ 必须补一个换行：`match[0]` 已经把那一行的结尾换行吃掉了，不补的话下一行会被
+        // 注意：必须补一个换行：`match[0]` 已经把那一行的结尾换行吃掉了，不补的话下一行会被
         // 我们块尾的注释吞掉（2026-09-28 实际发生过：`ui-skin-claude-style` 那一行被注释掉）。
         next = patchText.replace(match[0], `${MANAGED_BLOCK}\n`);
       } else {
@@ -306,7 +306,7 @@ if (!fs.existsSync(PROFILE_PATCH)) {
       // 写完立刻自检：解析一遍，确认块尾没有把下一行粘进注释里。
       const reparsed = next.split('\n').some((line) => line.includes(MANAGED_END) && line.trim() !== MANAGED_END);
       console.log(reparsed
-        ? '  ⚠️ 自检：managed 块尾与下一行粘在一起了，请把这段贴给 lead'
+        ? '  注意：自检：managed 块尾与下一行粘在一起了，请把这段贴给 lead'
         : '  → 自检：managed 块尾换行正常');
       console.log(`  → 已写入并备份到 ${path.basename(backup)}`);
     } else {
@@ -410,7 +410,7 @@ if (!junctionOk) {
 }
 // 真实解析一次，证明 import 不会再在加载期崩。
 //
-// ⚠️ 2026-10-05 修正（审查 §6 第 2 条的「体检假绿灯」）：这里**只探过一个包**时，
+// 注意：2026-10-05 修正（审查 §6 第 2 条的「体检假绿灯」）：这里**只探过一个包**时，
 // 体检会报「依赖 OK」，而 `tools/integration-test.cjs` 实际静态 import 的是**五个**包
 // （@deepseek-ai/cordis / dsh-commands / dsh-scope / dsh-system-prompt / dsh-tools）。
 // 本机实测：dsh-tools 解析得到，而 cordis 当时解析不到（junction 目录里没有这个条目）——

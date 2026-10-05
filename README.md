@@ -44,7 +44,7 @@ node tools/install.cjs
 然后跑一次 `node tools/repair.cjs --apply`（原因见 §1.3）。
 想先看命令会做什么：`node tools/install.cjs --dry-run`。
 
-> ⚠️ **安装会把 profile 指向「你运行 install.cjs 的那个目录」**（pnpm 的 `link:` 依赖）。
+> 注意：**安装会把 profile 指向「你运行 install.cjs 的那个目录」**（pnpm 的 `link:` 依赖）。
 > 如果你另外还留着一份副本（例如 `~/.dsh/plugins/dsh-dispatch-agent-team`），那份就变成**死代码**：
 > 改它不会生效，却看起来像生效了。请只保留一份作为工作目录，或明确知道哪一份是活的
 > （`node tools/repair.cjs` 会打印 profile 里 `@zws/...` 实际链接到的路径）。
@@ -71,7 +71,7 @@ node tools\install.cjs
    默认用桌面端自带的那份 CLI：`<安装目录>\resources\runtime\cli\bin\dsh.cmd` ——
    它以 `manageDesktopProfile: true` 启动，因此**允许**管 desktop profile，并且用内置 pnpm，
    连 PATH 里装没装 pnpm 都不要求。
-   ⚠️ **PATH 上常见的 `dsh` 是独立 CLI，它会直接拒绝 desktop profile**
+   注意：**PATH 上常见的 `dsh` 是独立 CLI，它会直接拒绝 desktop profile**
    （`profile "desktop" is managed exclusively by the Electron application`），所以脚本按
    「`--cli` 指定 → 桌面自带 → PATH」顺序试，并在失败时说明原因。
 2. 官方命令成功后自动跑 `node tools\repair.cjs --apply`，补上官方 reconcile **不管**的两件硬前置
@@ -115,7 +115,7 @@ node tools\install.cjs
 
 - **插件 → 已安装** 里会出现「调度模式智能体团队」，点进去就是配置页（角色 / 模型 / 思考强度 / 保存）。
 - **推理模式选择器**里会出现新的 preset「**调度模式**」。
-  ⚠️ 本插件**不**把 `selectedDefault` 改成调度模式（2026-09-27 事故后的安全选择，见 §8.1）：
+  注意：本插件**不**把 `selectedDefault` 改成调度模式（2026-09-27 事故后的安全选择，见 §8.1）：
   新会话默认仍是原来的 preset，要手选一次。想改默认：把 profile 的 `cordis.patch.yml` 里
   `agent-preset-registry.selectedDefault` 改成 `dispatch-mode`。理由见 §8.1 教训第 2 条 ——
   preset 找不到会让**新建会话直接失败**，故障面远大于「默认 preset 不是你想要的」。
@@ -131,7 +131,7 @@ node tools\integration-test.cjs   # 真链路：真 cordis + dsh-tools + systemP
 node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替身，真渲染组件）
 ```
 
-⚠️ 只有 `client-smoke-test` 完全不需要依赖解析；`selftest`（会 import `lib/tools.js`）与
+注意：只有 `client-smoke-test` 完全不需要依赖解析；`selftest`（会 import `lib/tools.js`）与
 `integration-test`、`drift-check` 都要先有 §1.3 那个 junction，否则报 `ERR_MODULE_NOT_FOUND`
 —— 那是「还没跑 repair --apply」，不是插件坏了。
 
@@ -172,7 +172,7 @@ node tools\client-smoke-test.cjs  # 浏览器半渲染冒烟（迷你 React 替�
 - 别的会话不受影响（记录按会话 id）；说「关掉团队」会立刻删掉这条记录，下次重启不会自己开回来。
 - 怎么确认它在工作：插件配置页底部「会话记忆」一行（见 §10.5）。
 
-> ⚠️ **不要用 `/智能体团队` 这类自造斜杠命令**：命令名在 host 侧只允许 ASCII
+> 注意：**不要用 `/智能体团队` 这类自造斜杠命令**：命令名在 host 侧只允许 ASCII
 > （`/^[a-z][a-z0-9_-]*$/u`），而未注册的 `/xxx` 输入会被 Web 客户端的命令面板**吞掉**——
 > 既不报错，也不会发给模型，也就是**什么都不会发生**。详见 §5.1。
 
@@ -354,7 +354,7 @@ dsh-dispatch-agent-team/
 ├── tools/
 │   ├── lib-dsh-home.cjs             # DSH 主目录 / profile 目录的唯一解析口径（认 DSH_HOME）
 │   ├── lib-atomic-write.cjs         # tmp+rename 原子写（profile 关键文件不许留半份）
-│   ├── install.cjs                 # ★ 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
+│   ├── install.cjs                 # 一条命令装进桌面端 profile（走官方 dsh plugin，见 §1.1）
 │   ├── drift-check.cjs             # 官方升级漂移检测（59 项，升级后必跑）
 │   ├── repair.cjs                  # 安装状态体检 / 崩溃恢复后的修复
 │   ├── emergency-disable.cjs       # DSH 起不来时的一键退出
@@ -393,7 +393,7 @@ dsh-dispatch-agent-team/
 | 官方 bundle 的行 | 我们的处理 | 为什么 |
 |---|---|---|
 | `agent-team`（域服务 `ctx.agentTeams`） | **保留官方实现**，容量参数由 **profile 的 patch 层**覆盖（不是我们的 bundle patch，原因见 §8.6） | durable roster / 邮箱 / 任务 DAG / revision CAS 都在这 1871 行里。重造它才是「官方一升级就坏」的最大风险 |
-| `tool-agent-team`（九个官方工具 + `team:policy` 段） | 由 **profile 的 patch 层整行关闭**（`tools/repair.cjs --apply` 维护）；调度模式的 preset 作用域再遮蔽它的 `team:policy` 段 | ⛔ 它与本插件的九个工具**同名、同作用域**（官方给每个 agent 都装，源码行号见 §8.7），两边不可能共存：不关它，本插件的工具就装不上，角色/模型参数全丢 |
+| `tool-agent-team`（九个官方工具 + `team:policy` 段） | 由 **profile 的 patch 层整行关闭**（`tools/repair.cjs --apply` 维护）；调度模式的 preset 作用域再遮蔽它的 `team:policy` 段 | 禁止：它与本插件的九个工具**同名、同作用域**（官方给每个 agent 都装，源码行号见 §8.7），两边不可能共存：不关它，本插件的工具就装不上，角色/模型参数全丢 |
 | `ui-agent-team`（成员列表 / 任务看板） | 官方行保持启用；我们另用自有行 id `dispatch-agent-team-panel` **再挂一份同一个包**（`cordis.patch.yml:43-48`） | 客户端模块按 specifier 去重执行（dsh-client-modules 的 executedBundleUrls），两行并存不会双渲染；这样即使用户关掉官方 `ui-agent-team` 行，成员列表与任务看板也还在 |
 
 也就是说：**本插件的团队功能（角色 / 模型 / 思考强度 / 工具收窄 / 派活提示词）100% 由本插件提供，
@@ -406,8 +406,8 @@ dsh-dispatch-agent-team/
 
 | 会话的 preset | `/team` 命令 | `enable_agent_team` / `disable_agent_team` | 官方 Agent Teams | 本插件的团队 |
 |---|---|---|---|---|
-| **调度模式** | ✅ 能看到 | ✅ 能看到 | ❌ 工具行在 profile 层被关闭（官方域服务与 UI 仍在），策略段另被同名空段遮蔽 | ✅ **唯一的团队**（角色 / 模型 / 收窄的工具面都由本插件提供） |
-| 极简灰度 / 标准 / 其它 | ❌ 看不到 | ❌ 看不到 | ❌ 与调度模式同样不可用（那是**关掉**，不是强加） | ❌ 用不了（`runtime.enable` 还会再挡一次） |
+| **调度模式** | 是 能看到 | 是 能看到 | 否 工具行在 profile 层被关闭（官方域服务与 UI 仍在），策略段另被同名空段遮蔽 | 是 **唯一的团队**（角色 / 模型 / 收窄的工具面都由本插件提供） |
+| 极简灰度 / 标准 / 其它 | 否 看不到 | 否 看不到 | 否 与调度模式同样不可用（那是**关掉**，不是强加） | 否 用不了（`runtime.enable` 还会再挡一次） |
 
 三道闸：
 
@@ -416,7 +416,7 @@ dsh-dispatch-agent-team/
 2. **官方工具行在 profile 层关闭**（`tools/repair.cjs --apply` 维护这一段）：官方九个团队工具与我们
    **同名**，而且官方是把它们装进**每个 agent 自己的作用域**（§8.7 有源码行号）。同一作用域同名
    注册会抛 `tool "x" is already registered in this scope` —— 不关官方行，本插件的工具就装不上，
-   角色 / 模型 / 强度参数全部丢失。⛔ 不要试图用 preset 作用域的 `tools.restrict` 去摘它们：
+   角色 / 模型 / 强度参数全部丢失。禁止：不要试图用 preset 作用域的 `tools.restrict` 去摘它们：
    restrict 只认**全局层**的名字（官方报错原文 `names unknown global tool "x"`），必然全部失败并刷出
    9 条假故障（2026-09-28 用户实际看到的就是这 9 条）。`drift-check` 有闸门禁止 `lib/preset.js` 里
    出现 `restrict`。
@@ -454,7 +454,7 @@ dsh-dispatch-agent-team/
 所以我们对 `agent-team` 行的 config 做了**整段覆盖**（patch 按 id 是整段替换、不深合并，
 因此 5 个字段全部显式重申），把 `maxMembers` 提到 **48**（12 个角色 × 4 次），`maxTasks` 提到 **512**。
 
-⚠️ **这份覆盖必须落在 `~/.dsh/profiles/<profile>/cordis.patch.yml`（profile 自己的 patch 层）**，
+注意：**这份覆盖必须落在 `~/.dsh/profiles/<profile>/cordis.patch.yml`（profile 自己的 patch 层）**，
 因为官方是用 `- insert:` **新建** `agent-team` 行的，而 bundle 的 patch 按 `dsh.profile.bundles`
 顺序应用 —— 我们的 bundle 若排在官方之前，这份 config 就落在「还不存在的行」上、**静默失效**
 （2026-09-28 实测：有效 `maxMembers` 退回 8。见 §8.6）。

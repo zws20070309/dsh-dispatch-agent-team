@@ -12,7 +12,7 @@
 # 我们**保留域服务行不动**：那 1871 行是持久化与授权的唯一实现，重造它才是
 # 「官方一升级就坏」的最大风险（复用现有 > 创造接口）。
 #
-# ⚠️ 为什么这里**不**写 `- id: tool-agent-team / ui-agent-team, disabled: true`（2026-09-28 实测教训）
+# 注意：为什么这里**不**写 `- id: tool-agent-team / ui-agent-team, disabled: true`（2026-09-28 实测教训）
 # patch 层按 `dsh.profile.bundles` 顺序应用，而官方是用 `insert` **新建**那三行的：
 # 我们的层若排在官方层**之前**，那两条 disable 就落在「还不存在的行」上 → **静默失效**。
 # 实测（2026-09-28）：官方九工具在所有 preset 里都可见，`agent-team` 的 maxMembers 被官方默认值 8
@@ -28,7 +28,7 @@
 #     本文件下面仍然写一份同样的值：就地可用（当我们的层恰好排在官方之后时直接生效），
 #     而 tools/repair.cjs 与 tools/drift-check.cjs 会确保 profile 层那份存在且与本文件一致。
 #
-# ⚠️ 注意：官方 bundle 自己的 patch 还 disable 了 host 平面的 tool-subagent-control /
+# 注意：官方 bundle 自己的 patch 还 disable 了 host 平面的 tool-subagent-control /
 # tool-subagent-list-agents / tool-subagent / tool-subagent-fork 四行。我们保持官方 bundle 启用，
 # 所以那四个 disable 继续生效——**不要**在本文件里再动它们，否则会和 preset 作用域的 subagent 行
 # 产生同名工具冲突。
