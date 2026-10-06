@@ -265,13 +265,238 @@ async function main() {
     });
 
     check('正常加载：未保存改动时会提示「有未保存改动」', () => {
-      const select = findAll(tree, (node) => node.type === 'select')[0];
+      // 注意：页面上现在有多个 select（统一选择 + 每个角色一行），这里要的是**角色行**那个。
+      const list = findAll(tree, (node) => node.props !== undefined && node.props.className === 'dat-list')[0];
+      const select = findAll(list, (node) => node.type === 'select')[0];
       select.props.onChange({ target: { value: 'p1\u0000m1' } });
       const after = page.repaint();
       const afterText = textOf(after);
       if (!afterText.includes('有未保存改动')) return '改了模型但没有未保存提示';
       const save = findAll(after, (node) => node.type === 'button' && textOf(node).includes('保存'))[0];
       if (save.props.disabled === true) return '改了模型之后「保存」仍然禁用';
+      return true;
+    });
+  }
+
+  // ── 1.5) 统一选择队员模型（2026-10-06 新增）────────────────────────────────
+  // 用户诉求原话：「外层调研的上面加一个统一选择队员模型，可以一次性把所有队员的模型都选择了」。
+  // 所以除了「能一次改全部」，还要钉住两件事：**位置在角色列表之上**、**它只是快捷方式**
+  // （不引入第二套配置来源，保存仍走同一个 roles 载荷）。
+  {
+    const page = await mount({
+      get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: '1:1', diagnostics: [] },
+      'list-models': {
+        ok: true,
+        groups: [{ id: 'p1', name: 'Provider 1', models: [
+          { id: 'm1', name: 'Model 1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+          { id: 'm2', name: 'Model 2', reasoning: { efforts: [{ id: 'low', name: 'Low' }] } },
+        ] }],
+        failures: [],
+      },
+    });
+    const tree = page.tree();
+    const bulk = findAll(tree, (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0];
+
+    check('统一选择：控件渲染出来，且在角色列表**之上**（用户指定的位置）', () => {
+      if (bulk === undefined) return '页面上没有 .dat-bulk 控件';
+      const wrap = findAll(tree, (node) => node.props !== undefined && node.props.className === 'dat-wrap')[0];
+      if (wrap === undefined) return '找不到 .dat-wrap';
+      const kids = wrap.props.children;
+      const bulkAt = kids.findIndex((child) => child !== null && child !== undefined && child.props !== undefined && child.props.className === 'dat-bulk');
+      const listAt = kids.findIndex((child) => child !== null && child !== undefined && child.props !== undefined && child.props.className === 'dat-list');
+      if (bulkAt < 0) return '统一选择控件不在渲染树里';
+      if (listAt < 0) return '角色列表不在渲染树里';
+      if (bulkAt > listAt) return `统一选择在角色列表**之后**（bulkAt=${bulkAt} listAt=${listAt}）——用户要求在上面`;
+      return true;
+    });
+
+    check('统一选择：默认（无配置）显示「跟随 Lead」，且标出作用于几个角色', () => {
+      const select = findAll(bulk, (node) => node.type === 'select')[0];
+      if (select === undefined) return '统一选择控件里没有 select';
+      if (select.props.value !== '') return `默认值应为空（跟随 Lead），实际 ${JSON.stringify(select.props.value)}`;
+      const text = textOf(bulk);
+      if (!text.includes('统一选择队员模型')) return '缺少标题文案';
+      if (!text.includes(String(ROLES.length))) return `没有标出作用角色数 ${ROLES.length}：${text}`;
+      return true;
+    });
+
+    check('统一选择：选一次模型 → 所有角色都被设为该模型，并提示有未保存改动', () => {
+      const select = findAll(bulk, (node) => node.type === 'select')[0];
+      select.props.onChange({ target: { value: 'p1\u0000m1' } });
+      const after = page.repaint();
+      const list = findAll(after, (node) => node.props !== undefined && node.props.className === 'dat-list')[0];
+      // 每个角色行各有一个模型下拉：都应变成 p1/m1。
+      // 每个角色行里有**两个** select（模型 + 思考强度），只取模型那个（行内第一个）。
+      const rows = findAll(list, (node) => node.props !== undefined && node.props.className === 'dat-row');
+      const values = rows.map((row) => findAll(row, (node) => node.type === 'select')[0].props.value);
+      const wrong = values.filter((value) => value !== 'p1\u0000m1');
+      if (wrong.length > 0) return `仍有 ${wrong.length} 个角色没被改到：${JSON.stringify(values)}`;
+      if (!textOf(after).includes('有未保存改动')) return '统一改完没有未保存提示';
+      return true;
+    });
+
+    // 交互与结算放在 check 之外（与本文件其余用例同形：check 的回调是同步的）。
+    {
+      const select = findAll(bulk, (node) => node.type === 'select')[0];
+      select.props.onChange({ target: { value: 'p1\u0000m1' } });
+      const after = await page.settle();
+      const save = findAll(after, (node) => node.type === 'button' && textOf(node).includes('保存'))[0];
+      save.props.onClick();
+      await flush();
+    }
+    check('统一选择：改完保存，roles 载荷里三个角色都在（走的是同一个 set 接口）', () => {
+      const call = sent.find((entry) => entry.op === 'set');
+      if (call === undefined) return '没有发出 set 请求';
+      const roles = call.args.roles;
+      const ids = Object.keys(roles === undefined ? {} : roles);
+      if (ids.length !== ROLES.length) return `roles 只带上了 ${ids.length} 个角色（应为 ${ROLES.length}）`;
+      for (const id of ids) {
+        if (roles[id].provider !== 'p1' || roles[id].model !== 'm1') return `角色 ${id} 的路由不对：${JSON.stringify(roles[id])}`;
+      }
+      return true;
+    });
+  }
+
+  // ── 1.6) 统一选择的边界语义 ────────────────────────────────────────────────
+  {
+    // 已有配置：researcher 用 p1/m1+high，其余两个用 p1/m2+low —— 正好造出「不一致」。
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: {
+          researcher: { provider: 'p1', model: 'm1', reasoningEffort: 'high' },
+          scout: { provider: 'p1', model: 'm2', reasoningEffort: 'low' },
+          builder: { provider: 'p1', model: 'm2', reasoningEffort: 'low' },
+        } },
+        roles: ROLES,
+        revision: '1:1',
+        diagnostics: [],
+      },
+      'list-models': {
+        ok: true,
+        groups: [{ id: 'p1', name: 'Provider 1', models: [
+          { id: 'm1', name: 'Model 1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+          { id: 'm2', name: 'Model 2', reasoning: { efforts: [{ id: 'low', name: 'Low' }] } },
+        ] }],
+        failures: [],
+      },
+    });
+    const tree = page.tree();
+    const bulk = findAll(tree, (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0];
+    const bulkSelect = findAll(bulk, (node) => node.type === 'select')[0];
+    const mixKey = '\u0000mixed';
+
+    check('统一选择：各角色不一致时显示「不一致」占位，**不**谎称「跟随 Lead」', () => {
+      if (bulkSelect.props.value !== mixKey) return `应为混合占位值，实际 ${JSON.stringify(bulkSelect.props.value)}`;
+      const options = findAll(bulkSelect, (node) => node.type === 'option');
+      const mixedOption = options.find((node) => node.props.value === mixKey);
+      if (mixedOption === undefined) return '缺少混合占位项';
+      if (mixedOption.props.disabled !== true) return '混合占位项应当是禁用（不可选中）';
+      if (!textOf(mixedOption).includes('不一致')) return `占位文案不对：${textOf(mixedOption)}`;
+      return true;
+    });
+
+    check('统一选择：选「跟随 Lead」= 清空全部角色（不是只清一行）', () => {
+      bulkSelect.props.onChange({ target: { value: '' } });
+      const after = page.repaint();
+      const list = findAll(after, (node) => node.props !== undefined && node.props.className === 'dat-list')[0];
+      const rows = findAll(list, (node) => node.props !== undefined && node.props.className === 'dat-row');
+      const values = rows.map((row) => findAll(row, (node) => node.type === 'select')[0].props.value);
+      const wrong = values.filter((value) => value !== '');
+      if (wrong.length > 0) return `仍有 ${wrong.length} 个角色没被清空：${JSON.stringify(values)}`;
+      return true;
+    });
+
+    // 单独 mount：上面那条「清空全部」会改掉共享草稿，接着测强度保留就会读到已被清空的状态。
+    const effortPage = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { researcher: { provider: 'p1', model: 'm1', reasoningEffort: 'high' } } },
+        roles: ROLES,
+        revision: '1:1',
+        diagnostics: [],
+      },
+      'list-models': {
+        ok: true,
+        groups: [{ id: 'p1', name: 'Provider 1', models: [
+          { id: 'm1', name: 'Model 1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+          { id: 'm2', name: 'Model 2', reasoning: { efforts: [{ id: 'low', name: 'Low' }] } },
+        ] }],
+        failures: [],
+      },
+    });
+    let effortAfter = effortPage.repaint();
+    // 第一步：统一设成 m1。researcher 原本 effort=high，m1 广告 high → 应当保留。
+    findAll(findAll(effortAfter, (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0], (node) => node.type === 'select')[0]
+      .props.onChange({ target: { value: 'p1\u0000m1' } });
+    effortAfter = effortPage.repaint();
+    // 第二步：再统一设成 m2（只广告 low）→ high 不再被支持，应退回「模型默认」。
+    findAll(findAll(effortAfter, (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0], (node) => node.type === 'select')[0]
+      .props.onChange({ target: { value: 'p1\u0000m2' } });
+    effortAfter = effortPage.repaint();
+
+    check('统一选择：思考强度按新模型重算 —— 仍支持则保留，不支持则退回「模型默认」', () => {
+      const list = findAll(effortAfter, (node) => node.props !== undefined && node.props.className === 'dat-list')[0];
+      const rows = findAll(list, (node) => node.props !== undefined && node.props.className === 'dat-row');
+      // 统一设成 m2 后，所有角色的强度都应为「模型默认」（m2 只广告 low，原本的 high 不合法）。
+      const efforts = rows.map((row) => findAll(row, (node) => node.type === 'select')[1].props.value);
+      const wrong = efforts.filter((value) => value !== '');
+      if (wrong.length > 0) return `不支持的档位没有被退回模型默认：${JSON.stringify(efforts)}`;
+      return true;
+    });
+
+    // 反向：档位**仍被支持**时必须保留（否则统一选择会把用户已选的强度悄悄清掉）。
+    {
+      const keepPage = await mount({
+        get: {
+          ok: true,
+          config: { version: 1, roles: { researcher: { provider: 'p1', model: 'm1', reasoningEffort: 'high' } } },
+          roles: ROLES,
+          revision: '1:1',
+          diagnostics: [],
+        },
+        'list-models': {
+          ok: true,
+          groups: [{ id: 'p1', name: 'Provider 1', models: [
+            { id: 'm1', name: 'Model 1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+            { id: 'm3', name: 'Model 3', reasoning: { efforts: [{ id: 'high', name: 'High' }, { id: 'low', name: 'Low' }] } },
+          ] }],
+          failures: [],
+        },
+      });
+      const before = keepPage.repaint();
+      findAll(findAll(before, (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0], (node) => node.type === 'select')[0]
+        .props.onChange({ target: { value: 'p1\u0000m3' } });
+      const afterKeep = keepPage.repaint();
+      check('统一选择：新模型仍支持原档位时保留该档位（不悄悄清掉用户已选的强度）', () => {
+        const list = findAll(afterKeep, (node) => node.props !== undefined && node.props.className === 'dat-list')[0];
+        const rows = findAll(list, (node) => node.props !== undefined && node.props.className === 'dat-row');
+        const effort = findAll(rows[0], (node) => node.type === 'select')[1].props.value;
+        if (effort !== 'high') return `m3 仍广告 high，却变成了 ${JSON.stringify(effort)}`;
+        return true;
+      });
+    }
+
+    const page2 = await mount({
+      get: { ok: true, config: { version: 1, roles: { scout: { provider: 'p9', model: 'm9' } } }, roles: ROLES, revision: '1:1', diagnostics: [] },
+      'list-models': { ok: false, error: 'ctx.llm 不可用' },
+    });
+    const bulk2 = findAll(page2.tree(), (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0];
+    if (bulk2 !== undefined) {
+      const sel = findAll(bulk2, (node) => node.type === 'select')[0];
+      if (sel !== undefined) sel.props.onChange({ target: { value: '' } });
+    }
+    check('统一选择：模型目录读不到时仍可用（能一次把所有角色改回「跟随 Lead」）', () => {
+      if (bulk2 === undefined) return '目录读不到时统一选择控件整个消失了';
+      const select = findAll(bulk2, (node) => node.type === 'select')[0];
+      if (select === undefined) return '统一选择控件里没有 select';
+      if (select.props.disabled === true) return '目录读不到时统一选择被禁用（应当仍能把全部改回跟随 Lead）';
+      const after = page2.repaint();
+      const list = findAll(after, (node) => node.props !== undefined && node.props.className === 'dat-list')[0];
+      const rows = findAll(list, (node) => node.props !== undefined && node.props.className === 'dat-row');
+      const values = rows.map((row) => findAll(row, (node) => node.type === 'select')[0].props.value);
+      const wrong = values.filter((value) => value !== '');
+      if (wrong.length > 0) return `仍有 ${wrong.length} 个角色没被清空：${JSON.stringify(values)}`;
       return true;
     });
   }
