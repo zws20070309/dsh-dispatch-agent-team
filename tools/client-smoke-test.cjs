@@ -486,6 +486,25 @@ async function main() {
       const sel = findAll(bulk2, (node) => node.type === 'select')[0];
       if (sel !== undefined) sel.props.onChange({ target: { value: '' } });
     }
+    const page3 = await mount({
+      get: { ok: true, config: { version: 1, roles: {
+        researcher: { provider: 'gone', model: 'm9' },
+        scout: { provider: 'gone', model: 'm9' },
+        builder: { provider: 'gone', model: 'm9' },
+      } }, roles: ROLES, revision: '1:1', diagnostics: [] },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1', reasoning: { efforts: [] } }] }], failures: [] },
+    });
+    const b3 = findAll(page3.tree(), (node) => node.props !== undefined && node.props.className === 'dat-bulk')[0];
+    check('统一选择：已保存的模型不在当前目录时，下拉显示的就是那个真实值（不退回第一项）', () => {
+      const b = b3;
+      if (b === undefined) return '控件不存在';
+      const sel = findAll(b, (node) => node.type === 'select')[0];
+      if (sel.props.value !== 'gone\u0000m9') return `下拉值应为已保存的 gone/m9，实际 ${JSON.stringify(sel.props.value)}`;
+      const opts = findAll(sel, (node) => node.type === 'option').map((o) => o.props.value);
+      if (opts[0] !== '' || opts[1] !== 'gone\u0000m9') return `选项顺序应为[跟随Lead, 缺失占位, 目录]，实际 ${JSON.stringify(opts)}`;
+      return true;
+    });
+
     check('统一选择：模型目录读不到时仍可用（能一次把所有角色改回「跟随 Lead」）', () => {
       if (bulk2 === undefined) return '目录读不到时统一选择控件整个消失了';
       const select = findAll(bulk2, (node) => node.type === 'select')[0];
