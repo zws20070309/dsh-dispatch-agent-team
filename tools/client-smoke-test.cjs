@@ -505,6 +505,148 @@ async function main() {
       return true;
     });
 
+    // ── 统一思考强度（2026-10-06）────────────────────────────────────────────
+    // 用户追问「为啥不能统一思考强度」。结论：能，但只在**模型已统一**时才有确定含义，
+    // 因为档位是每个模型各自广告的。下面把「能统一」与「为什么此时不能」两侧都钉住。
+    {
+      // 场景 A：模型已统一为 p1/m1（广告 high/low）→ 强度可统一。
+      const effortUnify = await mount({
+        get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: '1:1', diagnostics: [] },
+        'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [
+          { id: 'm1', name: 'M1', reasoning: { efforts: [{ id: 'high', name: 'High' }, { id: 'low', name: 'Low' }] } },
+        ] }], failures: [] },
+      });
+      let treeE = effortUnify.tree();
+      findAll(findAll(treeE, (n) => n.props !== undefined && n.props.className === 'dat-bulk')[0], (n) => n.type === 'select')[0]
+        .props.onChange({ target: { value: 'p1\u0000m1' } });
+      treeE = effortUnify.repaint();
+      const bulkE = findAll(treeE, (n) => n.props !== undefined && n.props.className === 'dat-bulk')[0];
+      const effortSel = findAll(bulkE, (n) => n.type === 'select')[1];
+
+      check('统一思考强度：模型统一后控件可用，且列出该模型广告的档位', () => {
+        if (effortSel === undefined) return '统一选择控件里没有第二个下拉（思考强度）';
+        if (effortSel.props.disabled === true) return '模型已统一，思考强度却仍被禁用';
+        const ids = findAll(effortSel, (node) => node.type === 'option').map((o) => o.props.value);
+        if (!ids.includes('high') || !ids.includes('low')) return `档位不全：${JSON.stringify(ids)}`;
+        if (!ids.includes('')) return '缺少「不指定（模型默认）」选项';
+        return true;
+      });
+
+      check('统一思考强度：选一次 → 所有角色都拿到该档位，并提示有未保存改动', () => {
+        effortSel.props.onChange({ target: { value: 'high' } });
+        const after = effortUnify.repaint();
+        const rows = findAll(findAll(after, (n) => n.props !== undefined && n.props.className === 'dat-list')[0],
+          (n) => n.props !== undefined && n.props.className === 'dat-row');
+        const efforts = rows.map((row) => findAll(row, (node) => node.type === 'select')[1].props.value);
+        const wrong = efforts.filter((value) => value !== 'high');
+        if (wrong.length > 0) return `仍有 ${wrong.length} 个角色没被改到：${JSON.stringify(efforts)}`;
+        if (!textOf(after).includes('有未保存改动')) return '统一改完没有未保存提示';
+        return true;
+      });
+
+      {
+        const after = await effortUnify.settle();
+        findAll(after, (n) => n.type === 'button' && JSON.stringify(n.props.children).includes('保存'))[0].props.onClick();
+        await flush();
+      }
+      check('统一思考强度：保存载荷里每个角色都带上了 model + reasoningEffort（成对）', () => {
+        const call = sent.find((entry) => entry.op === 'set');
+        if (call === undefined) return '没有发出 set 请求';
+        const roles = call.args.roles || {};
+        const ids = Object.keys(roles);
+        if (ids.length !== ROLES.length) return `roles 只带了 ${ids.length} 个角色`;
+        for (const id of ids) {
+          if (roles[id].model !== 'm1') return `${id} 的 model 丢了：${JSON.stringify(roles[id])}`;
+          if (roles[id].reasoningEffort !== 'high') return `${id} 的 reasoningEffort 不是 high：${JSON.stringify(roles[id])}`;
+        }
+        return true;
+      });
+
+      check('统一思考强度：统一成「不指定」时清掉全部档位（而不是只清一行）', () => {
+        const cur = findAll(findAll(effortUnify.repaint(), (n) => n.props !== undefined && n.props.className === 'dat-bulk')[0], (n) => n.type === 'select')[1];
+        cur.props.onChange({ target: { value: '' } });
+        const after = effortUnify.repaint();
+        const rows = findAll(findAll(after, (n) => n.props !== undefined && n.props.className === 'dat-list')[0],
+          (n) => n.props !== undefined && n.props.className === 'dat-row');
+        const efforts = rows.map((row) => findAll(row, (node) => node.type === 'select')[1].props.value);
+        const wrong = efforts.filter((value) => value !== '');
+        if (wrong.length > 0) return `仍有 ${wrong.length} 个角色没被清空：${JSON.stringify(efforts)}`;
+        return true;
+      });
+    }
+
+    // 场景 B：各角色模型不一致 → 强度控件必须**可见但禁用**，并写明原因与下一步。
+    {
+      const mixedModels = await mount({
+        get: { ok: true, config: { version: 1, roles: {
+          researcher: { provider: 'p1', model: 'm1' },
+          scout: { provider: 'p1', model: 'm2' },
+          builder: { provider: 'p1', model: 'm2' },
+        } }, roles: ROLES, revision: '1:1', diagnostics: [] },
+        'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [
+          { id: 'm1', name: 'M1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } },
+          { id: 'm2', name: 'M2', reasoning: { efforts: [{ id: 'low', name: 'Low' }] } },
+        ] }], failures: [] },
+      });
+      const bulkM = findAll(mixedModels.tree(), (n) => n.props !== undefined && n.props.className === 'dat-bulk')[0];
+
+      check('统一思考强度：模型不一致时禁用并说明「先统一模型」（不是把控件藏起来）', () => {
+        const sel = findAll(bulkM, (n) => n.type === 'select')[1];
+        if (sel === undefined) return '控件整个消失了 —— 用户只会看到「没有统一思考强度」却不知道为什么';
+        if (sel.props.disabled !== true) return '模型不一致时思考强度不该可用（档位是每个模型各自广告的）';
+        const shown = textOf(bulkM);
+        if (!shown.includes('模型不一致')) return `没有给出原因：${shown}`;
+        if (!shown.includes('先')) return '没有给出下一步动作（先统一模型）';
+        return true;
+      });
+
+      check('统一思考强度：模型不一致时，不得把「第一个角色的档位」当成所有人的候选', () => {
+        // 这条补的是上面那条 Mutation 测出来的盲区：只断言「禁用」时，
+        // 若实现改成「不禁用且列出第一个角色的档位」，界面会**骗人**（那些档位对别的角色非法），
+        // 而禁用类断言不会响。这里直接钉住「不许 advertise 任何档位」。
+        const sel = findAll(bulkM, (n) => n.type === 'select')[1];
+        if (sel === undefined) return '控件不存在';
+        const ids = findAll(sel, (node) => node.type === 'option').map((o) => o.props.value).filter((v) => v !== '');
+        if (ids.length > 0) return `模型不一致却列出了档位 ${JSON.stringify(ids)}（那些档位对别的角色可能非法）`;
+        return true;
+      });
+
+      check('统一思考强度：模型不在目录 / 目录读不到时，禁用之余必须给出**准确**原因', () => {
+        // 这两条是矩阵自检（六种状态逐个打印）发现的：控件禁用了却一条解释都没有，
+        // 用户只会以为功能坏了。而且两种情况的原因**不同**，不能共用一句话
+        //（「模型不在目录里」在目录整个读不到时是假指控）。
+        // 这里只做静态检查：文案必须存在，且两种场景引用的 key 不是同一个。
+        const src = require('node:fs').readFileSync(CLIENT, 'utf8');
+        if (!src.includes('bulkEffortNoCatalog')) return '目录读不到的场景没有专门的说明文案';
+        if (!src.includes('bulkEffortMixedModels')) return '模型不一致的场景没有说明文案';
+        if (!src.includes('bulkEffortNoModel')) return '跟随 Lead 的场景没有说明文案';
+        if (!src.includes('bulkEffortNone')) return '模型无档位的场景没有说明文案';
+        // 目录缺失分支必须排在「record === undefined」之前，否则会被误报成「模型不在目录里」。
+        const noCatAt = src.indexOf('bulkEffortNoCatalog');
+        const unknownAt = src.indexOf("? text('effortUnknown')");
+        if (noCatAt < 0 || unknownAt < 0 || noCatAt > unknownAt) {
+          return '目录缺失的判断必须排在「模型不在目录」之前（否则会误报原因）';
+        }
+        return true;
+      });
+
+      check('统一思考强度：模型不一致时，模型下拉本身仍可用（先统一模型这条路要通）', () => {
+        const sel = findAll(bulkM, (n) => n.type === 'select')[0];
+        if (sel.props.disabled === true) return '模型下拉也被禁用了，用户没有任何出路';
+        return true;
+      });
+
+      check('统一思考强度：「跟随 Lead」时禁用并说明强度依附于模型', () => {
+        findAll(bulkM, (n) => n.type === 'select')[0].props.onChange({ target: { value: '' } });
+        const after = mixedModels.repaint();
+        const b2 = findAll(after, (n) => n.props !== undefined && n.props.className === 'dat-bulk')[0];
+        const sel = findAll(b2, (n) => n.type === 'select')[1];
+        if (sel.props.disabled !== true) return '全部跟随 Lead 时强度不该可用';
+        if (!textOf(b2).includes('依附于模型')) return `没有给出原因：${textOf(b2)}`;
+        return true;
+      });
+    }
+
     check('统一选择：模型目录读不到时仍可用（能一次把所有角色改回「跟随 Lead」）', () => {
       if (bulk2 === undefined) return '目录读不到时统一选择控件整个消失了';
       const select = findAll(bulk2, (node) => node.type === 'select')[0];
