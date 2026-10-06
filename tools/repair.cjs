@@ -183,19 +183,39 @@ if (installed) {
     console.log(`- 安装方式是同一份文件：${sameFile ? '是（link/junction）' : `否（profile=${realInstalled}）`}`);
     if (!sameFile) {
       // 这是「改源码不会生效」的实锤（2026-10-04 审查 P1-3：宿主跑的是安装副本，
-      // 源码目录的修改停在原地）。只打印路径太容易被无视，所以把**具体哪几个模块更新**列出来，
-      // 并直接升为问题项（不是提示），逼着用户去重跑 install。
+      // 源码目录的修改停在原地）。只打印路径太容易被无视，所以把**具体哪几个模块不一致**列出来，
+      // 并直接升为问题项（不是提示），逼着用户去同步或重装。
+      //
+      // 判据是**内容**，不是 mtime（2026-10-07 修正）：旧实现比 `mtimeMs`，于是
+      // 「install.cjs 复制时保留了源文件 mtime」「两边都改过但改得一样」「sync 之后又 touch 过」
+      // 这些情况都会报出**内容其实一致**的文件「不同步」——哭狼一次，用户就学会无视这条红字，
+      // 而这条红字本来是用来防「改了源码没生效」的真问题的。sync-to-dsh.cjs 比的就是内容
+      // （readFileSync 逐字节），两个脚本口径必须一致，否则同一个状态一边说一致一边说不一致。
+      //
+      // 清单用 PACKAGE_FILES（drift-check 有闸门守着它不漏 lib/*.js），不再另抄一份硬编码列表：
+      // 旧的那份只列了 10 个 lib 文件，漏了 presets/locale/tools，且新增文件时闸门查不到它。
       const drifted = [];
-      for (const relative of ['lib/index.js', 'lib/preset.js', 'lib/runtime.js', 'lib/tools.js', 'lib/roster.js', 'lib/playbook.js', 'lib/cache.js', 'lib/resume.js', 'lib/text-clip.js', 'lib/client.js']) {
+      for (const relative of PACKAGE_FILES) {
         try {
-          const a = fs.statSync(path.join(pluginDir, relative)).mtimeMs;
-          const b = fs.statSync(path.join(realInstalled, '..', relative)).mtimeMs;
-          if (Math.abs(a - b) > 1000) drifted.push(`${relative}（源码 ${new Date(a).toISOString()} vs 已装 ${new Date(b).toISOString()}）`);
-        } catch { /* 副本里没这个文件：由下面的文件清单检查报，别在这里重复 */ }
+          const a = fs.readFileSync(path.join(pluginDir, relative));
+          const b = fs.readFileSync(path.join(realInstalled, '..', relative));
+          if (!a.equals(b)) drifted.push(`${relative}（源码 ${a.length}B vs 已装 ${b.length}B）`);
+        } catch { /* 任一侧没这个文件：由下面的文件清单检查报，别在这里重复 */ }
       }
-      problems.push(`profile 链接的不是这份源码目录，**源码里的修改不会生效**。已装：${realInstalled}`
-        + (drifted.length > 0 ? `；两边不同步的文件：${drifted.join('、')}` : '')
-        + '。修法：完全退出 DSH，在**源码目录**跑 node tools/install.cjs（pnpm 会把 link: 指到你运行命令的那个目录），再跑本脚本确认这一条变成「是」。');
+      const syncHint = '修法：完全退出 DSH 后 node tools/sync-to-dsh.cjs（比内容、只写差异文件），再重启。';
+      if (drifted.length > 0) {
+        // 内容真的不一致 = 源码里有改动没进 DSH 加载的那份 = 真故障，保持 problem。
+        problems.push(`profile 加载的不是这份源码目录，且**两边内容不一致：源码里的这些修改不会生效**：${drifted.join('、')}。`
+          + `已装：${realInstalled}。` + syncHint
+          + '（若是换了目录/首次安装，则在**源码目录**跑 node tools/install.cjs —— pnpm 会把 link: 指到你运行命令的那个目录。）');
+      } else {
+        // 两份文件但内容一致：这是 sync-to-dsh.cjs 规定的正常工作流（真实目录 + 同步；
+        // junction 指向工作区被该脚本文件头明确判为不可行）。报 problem 会让这条红字**永远亮着**，
+        // 用户于是学会无视它，真出问题时同样没人看 —— 所以降级为提示。
+        notes.push(`profile 加载的是安装副本（${realInstalled}），不是这份源码目录；**当前两边内容一致**，所以现有改动没有丢。`
+          + '但改完 `lib/*.js` 不会自动生效：' + syncHint
+          + '（改 `lib/client.js` 只需刷新页面；改 `presets/*.patch.yml` 重新加载插件即可。）');
+      }
     }
   } catch { /* realpath 失败不影响体检结论 */ }
 }
