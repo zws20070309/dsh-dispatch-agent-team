@@ -527,6 +527,10 @@ async function main() {
       ctx.provide('webServer', fakeWebServer);
       ctx.provide('agentPresets', fakeAgentPresets);
       ctx.provide('logger', { warn() {}, info() {}, error() {} });
+      // 附件准入需要它（dsh-commands/lib/types/index.js:333 `ctx.get('attachments')`；
+      // 缺了会返回「no attachment store is composed」而不是走准入）。
+      // 本用例只提交 file 类型，admitCommandAttachments 对 file 不碰 store，故空对象足够。
+      ctx.provide('attachments', {});
     },
   });
   await tick();
@@ -1707,6 +1711,125 @@ async function main() {
     if (names.includes(roster.REPORT_TOOL_NAME)) return 'Lead 竟然拿到了 report_result';
     return true;
   });
+
+  // ── 8.1b) /team 必须**接受附件**（2026-10-07 用户实测：贴图 + /team 被宿主拒
+  //      「/team 不接受附件，请先移除附件」）。
+  //
+  //      判据在宿主执行器里，不在本插件：dsh-commands/lib/types/index.js:330
+  //      `if (command.definition.input?.attachments !== true) return settle({kind:'error', ...})`，
+  //      客户端把它渲染成 notice.attachmentsUnsupported（dsh-client-ui-commands/lib/client.js:111）。
+  //      所以这里必须**穿过真 execute()** 打一遍：只调 handler 会绕过这道判据、给假绿灯。
+  //
+  //      注意 `view(agent)` = `layers.merge(agent)`（:401）把 agent **本身**当 scope key
+  //      （官方 dsh-scope/README.md:34 `createScope(ctx, agent)` 同形），所以探针的 agent
+  //      直接用自己的对象；全局注册的命令对任意 scope 都可见（merge 先铺 global 层）。
+  {
+    const commandsService = root.get('commands');
+    const fileRef = Object.freeze({
+      id: 'att-1', name: 'shot.png', bytes: 1234, digest: 'sha256:abc',
+      hostPath: '/tmp/att-1', mediaType: 'image/png',
+    });
+    const releaseResolver = commandsService.registerFileReceiptResolver(() => fileRef);
+    const submission = [{ type: 'file', receiptId: 'r-1' }];
+    const probeAgent = { id: 'attach-probe-agent', session: { id: 'attach-probe-session', append() {} } };
+    const seen = [];
+    const disposer = commandsService.register({
+      name: 'attach-probe',
+      description: 'probe: 与 /team 同形状的 attachments 声明（宿主准入行为由它代表）',
+      input: { hint: 'probe', attachments: true },
+      handler: (invocation) => { seen.push(invocation.attachments); return { kind: 'success' }; },
+    });
+    const exec = await commandsService.execute(
+      probeAgent, '/attach-probe 看这张图', submission, new AbortController().signal);
+    // 探针定义**先不回收**：下面还要用同一条声明测图片分支（提前 disposer 会让 execute
+    // 因命令不存在返回 undefined，从而把「没测到」伪装成「通过」）。
+
+    check('宿主准入：声明了 input.attachments:true 的命令，附件被准入成持久块交给 handler', () => {
+      if (exec?.result?.kind !== 'success') {
+        return `宿主返回 ${exec?.result?.kind}：${String(exec?.result?.text).slice(0, 140)}`;
+      }
+      const blocks = seen[0] ?? [];
+      if (blocks.length !== 1 || blocks[0]?.type !== 'file' || blocks[0]?.attachment?.name !== 'shot.png') {
+        return `handler 收到的 attachments 不对：${JSON.stringify(blocks)}`;
+      }
+      return true;
+    });
+
+    // 负向对照：不声明的命令，宿主**确实**拒 —— 证明上一条 PASS 不是恒真、判据仍然在。
+    const rejectedAgent = { id: 'noattach-agent', session: { id: 'noattach-session', append() {} } };
+    const rejectDisposer = commandsService.register({
+      name: 'noattach-probe',
+      description: 'probe: 不声明 attachments',
+      input: { hint: 'probe' },
+      handler: () => ({ kind: 'success' }),
+    });
+    const rejected = await commandsService.execute(
+      rejectedAgent, '/noattach-probe x', submission, new AbortController().signal);
+    rejectDisposer();
+    check('负向对照：未声明 attachments 的命令 + 附件，宿主仍拒（判据没被绕过）', () => {
+      if (rejected?.result?.kind !== 'error') {
+        return `未声明附件的命令竟然被放行：${JSON.stringify(rejected?.result)}`;
+      }
+      if (!String(rejected.result.text).includes('does not accept attachments')) {
+        return `拒因不是附件判据：${String(rejected.result.text).slice(0, 140)}`;
+      }
+      return true;
+    });
+    releaseResolver();
+
+    // 用户的真实场景是**贴图**：图片走的是另一条准入分支（宿主 admitEncodedImages）。
+    // 这里不 mock 宿主内部的规范化流水线（那只会自我确认），只钉住关键事实：
+    // 图片提交**不再被附件闸拒**。断言先要求宿主真的应答了（undefined = 命令没注册，
+    // 那是「没测到」不是「通过」），再排除附件拒因。
+    const imageOutcome = await commandsService.execute(probeAgent, '/attach-probe 看图',
+      [{ type: 'image', mediaType: 'image/png', data: 'not-real-base64' }],
+      new AbortController().signal);
+    disposer();
+    check('图片提交同样过了附件闸（用户场景是贴图，不是只有 file 类型）', () => {
+      if (imageOutcome === undefined) {
+        return '宿主没有应答（探针命令未注册？）——这是没测到，不能算通过';
+      }
+      const text = String(imageOutcome.result?.text ?? '');
+      if (text.includes('does not accept attachments')) {
+        return `图片提交仍被附件闸拒：${text.slice(0, 140)}`;
+      }
+      return true;
+    });
+
+    // 真正的回归守卫：/team 自己的定义必须带上这个声明（缺了就是用户截图那条报错）。
+    check('/team 的定义声明了 input.attachments:true（用户贴图被拒的根因）', () => {
+      const definition = commandsService.find(KEY_CMD, 'team');
+      if (definition?.input?.attachments !== true) {
+        return `input.attachments = ${JSON.stringify(definition?.input?.attachments)} —— 宿主会拒带附件的 /team`;
+      }
+      return true;
+    });
+    check('/team 的 descriptor 把 attachments 能力透给客户端（允许贴图，而不是提交后才报错）', () => {
+      const desc = commandsService.list(KEY_CMD).find((d) => d.name === 'team');
+      if (desc === undefined) return 'list() 里没有 /team';
+      if (desc.input?.attachments !== true) return `descriptor.input.attachments = ${JSON.stringify(desc.input?.attachments)}`;
+      return true;
+    });
+
+    // 注入形状：附件必须跟着用户那一行进同一条 user 消息（否则宿主放行了、模型却看不到图）。
+    const injectAgent = { id: 'inject-attach', session: { id: 'inject-attach' }, followup(m) { this.msg = m; } };
+    runtime.inject(injectAgent, '/team 看这张图', Object.freeze([Object.freeze({ type: 'file', attachment: fileRef })]));
+    check('runtime.inject：附件在前、用户原文在后并入同一条 user 消息（与官方 /plan 同形）', () => {
+      const content = injectAgent.msg?.content ?? [];
+      if (content.length !== 2) return `content 长度 ${content.length}：${JSON.stringify(content.map((b) => b?.type))}`;
+      if (content[0]?.type !== 'file' || content[0]?.attachment?.name !== 'shot.png') return `第 1 块不是附件：${JSON.stringify(content[0])}`;
+      if (content[1]?.type !== 'text' || content[1]?.text !== '/team 看这张图') return `第 2 块不是正文：${JSON.stringify(content[1])}`;
+      return true;
+    });
+    check('runtime.inject：不传附件时形状与旧版逐字一致（不影响既有 8.1 断言）', () => {
+      const plain = { id: 'inject-plain', session: { id: 'inject-plain' }, followup(m) { this.msg = m; } };
+      runtime.inject(plain, '/team');
+      const content = plain.msg?.content ?? [];
+      if (content.length !== 1) return `content 长度 ${content.length}（应为 1）`;
+      if (content[0]?.type !== 'text' || content[0]?.text !== '/team') return JSON.stringify(content[0]);
+      return true;
+    });
+  }
 
   {
     // 2026-10-01 18:26 现场（用户截图）：模型自己调 enable_agent_team 时，我们曾用 agent.followup 注入一句

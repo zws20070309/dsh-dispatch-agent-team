@@ -195,8 +195,10 @@ export function peekRevision();            // -> number；配置文件的修订�
 export function notes();                   // -> string[]；注册期信息快照（浅拷贝）
 export function diagnostics();             // -> string[]；故障快照（浅拷贝，外部改不到内部数组）
 export function recordBootNote(message, kind); // 记一条注册期记录；kind='info' 走信息通道，其余走故障通道
-export function inject(agent, text);       // 把 text 作为 user 消息投给该 agent 的下一个 turn；**抛错**而非返回 {ok:false}，
-                                           //    否则 preset.js 的 tryInject 会把失败当成功（静默吞错）
+export function inject(agent, text, attachments?); // 把 text（+ 可选的宿主已准入附件块）作为 user 消息
+                                           //    投给该 agent 的下一个 turn；**抛错**而非返回 {ok:false}，
+                                           //    否则 preset.js 的 tryInject 会把失败当成功（静默吞错）。
+                                           //    附件块放在正文**之前**，与官方 /plan 注入同形（§5.2）
 export function pinSpawnRoute(name, route);// 给某个队员钉路由；**只**由 spawn 的显式参数产生（§0.1 第 41 条）
 export function watchAgents(ctx);          // 幂等订阅 agent/created、agent/disposed、session/event（截断记账的入口）
 export function reconcileAgents(ctx);      // 给所有活体 agent 补齐安装：冷恢复 + 补装的统一入口
@@ -380,15 +382,31 @@ ctx.effect(() => ctx.systemPrompt.section({
 ctx.effect(() => ctx.commands.register({
   name: 'team',
   description: '智能体团队（仅调度模式）：为当前会话开启 Agent Teams 协作。关闭：直接说「关掉团队」，Lead 会调用 disable_agent_team。',
-  input: { hint: '可选：补充你的意图，例如「只做调研」「先审计划」' },
-  async handler(invocation) { /* invocation.agent / invocation.rawInput */ },
+  input: { hint: '可选：补充你的意图，例如「只做调研」「先审计划」', attachments: true },
+  async handler(invocation) { /* invocation.agent / invocation.rawInput / invocation.attachments */ },
 }), 'dispatch-preset: /team');
 ```
+
+**`input.attachments: true` 是必需的（2026-10-07 用户实测）**：宿主执行器按这一位判定要不要收附件
+（`dsh-commands/lib/types/index.js:330` `if (command.definition.input?.attachments !== true)
+return settle({kind:'error', text:'/x does not accept attachments'})`），客户端把它渲染成
+「/team 不接受附件，请先移除附件」（`dsh-client-ui-commands/lib/client.js:111`
+`notice.attachmentsUnsupported`）。**不声明 = 用户贴图 + `/team` 直接被拒**，
+而「贴一张截图让团队查」恰恰是调度模式最常见的入口之一。官方 `/plan`、`/goal` 都声明了它
+（`dsh-plan-mode/lib/index.js:187`、`dsh-command-goal/lib/index.js:181`）。
+
+声明后宿主会先做**准入**（`:338` `admitCommandAttachments`）再把已持久化的块交给 handler：
+图片规范化落盘成 `ImageBlock`，文件按只读路径引用成 `FileBlock`（`dsh-attachment` README：
+非图片文件不设类型与大小限制）。所以 handler 拿到的 `invocation.attachments` 是
+**冻结的持久块数组**，不是浏览器原始数据；无附件时是空数组（`:48` `NO_ATTACHMENTS` 共享常量）。
+本插件的做法与官方 `/plan` 逐字同形：**附件在前、用户原文在后，并入同一条 user 消息**
+（`dsh-plan-mode/lib/index.js:217-223`）。
 
 `handler` 要做：
 1. `const agent = invocation.agent`；拿不到就返回一条 `success` 说明无法定位会话。
 2. `const result = await runtime.enable(ctx, agent, {source:'command', rawInput: invocation.rawInput})`。
-3. 成功后把 `enableInstruction(rawInput)` 作为**一条 user 消息注入**，让 Lead 立刻按团队方式继续。
+3. 成功后把 `teamCommandLine(rawInput)` **连同 `invocation.attachments`** 作为**一条 user 消息注入**，
+   让 Lead 立刻按团队方式继续（附件必须一起进，否则宿主放行了、模型却看不到图）。
    **注入写法已定（builder-preset 实测后裁定）**：**自造 message 对象**，不要 import
    `@deepseek-ai/dsh-llm`：
    ```js

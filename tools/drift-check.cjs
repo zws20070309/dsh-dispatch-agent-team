@@ -287,6 +287,34 @@ check('dsh-commands 的命令名正则未变（仍是 ASCII-only）', () => {
   return true;
 });
 
+// 6b) 命令附件闸：宿主按 `definition.input.attachments === true` 决定收不收附件
+//     （2026-10-07 用户实测：/team 贴图被拒「不接受附件，请先移除附件」，判据在
+//      dsh-commands/lib/types/index.js:330）。本插件靠 `input: {attachments: true}` 过闸，
+//      所以这个字段名与这条判据必须钉住：宿主一旦改名（比如 acceptsAttachments），
+//      我们的声明会**静默失效** —— 插件照常加载、/team 照常能用，只有带附件时又变回那条报错。
+const commandsTypes = asar.read('dsh/node_modules/@deepseek-ai/dsh-commands/lib/types/index.js') || '';
+check('宿主仍按 definition.input.attachments 决定命令可否收附件（/team 的声明依赖它）', () => {
+  if (commandsTypes === '') return '读不到 dsh-commands/lib/types/index.js';
+  if (!commandsTypes.includes('input?.attachments !== true')) {
+    return '判据写法变了：确认宿主是否仍用 input.attachments 这个字段名 —— 若改名，'
+      + 'lib/preset.js 里 /team 的 `input: {attachments: true}` 会静默失效（带附件又被拒）';
+  }
+  if (!commandsTypes.includes('does not accept attachments')) {
+    return '宿主不再返回「does not accept attachments」：附件闸可能已整体移除（那是改进，可去掉我们的顾虑）';
+  }
+  return true;
+});
+check('官方 /plan、/goal 仍声明 attachments: true（我们照抄的先例仍然成立）', () => {
+  const plan = asar.read('dsh/node_modules/@deepseek-ai/dsh-plan-mode/lib/index.js') || '';
+  const goal = asar.read('dsh/node_modules/@deepseek-ai/dsh-command-goal/lib/index.js') || '';
+  if (plan === '' || goal === '') return '读不到 dsh-plan-mode 或 dsh-command-goal 的 lib/index.js';
+  const missing = [['/plan', plan], ['/goal', goal]].filter(([, text]) => !text.includes('attachments: true')).map(([n]) => n);
+  if (missing.length > 0) {
+    return `${missing.join('、')} 不再声明 attachments: true —— 这个字段可能已被官方废弃，检查 /team 的写法`;
+  }
+  return true;
+});
+
 // 7) 客户端槽位 plugins.bundle.config 仍由 plugin-manager 声明
 const pluginManagerClient = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-plugin-manager/lib/client.js') || '';
 check('plugins.bundle.config 槽位仍存在', () => {
