@@ -1021,6 +1021,11 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
         asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-workflow/lib/index.js') || '',
         // TEAMMATE_TOOL_DENY 里的 ask_user_question 出处在这里（2026-10-04 P2-30 加入名单）。
         asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-ask-user/lib/index.js') || '',
+        // skill 的出处（2026-10-07 补）：`skill` 由 preset 行 tool-skill 注册在 **preset 作用域**，
+        // 而 restrict 的 restrictableNames 取自「全局 + 作用域链祖先」（dsh-tools view() :2960-2973），
+        // 所以队员作用域**摘得掉**它 —— 这条名单必须认得出它，否则 12g 的报警会混进一条
+        // 「找不到出处」的假因（本轮实测：两个 FAIL 一起报，真因被埋在假因里）。
+        asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-skill/lib/index.js') || '',
       ];
       // preset 里 `toolName: subagent_fork` 这种：名字来自行 config，不在官方包源码里。
       const declaredToolNames = new Set(
@@ -1116,6 +1121,92 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       const needed = roleCount * 3;
       if (maxMembers < needed) {
         return `maxMembers=${maxMembers} < 角色数 ${roleCount} × 3 = ${needed}：长任务里会撞 TEAM_MEMBER_LIMIT（历史累计，名字不复用）`;
+      }
+      return true;
+    });
+
+    // 12g) skill：队员必须保留它，且官方「工具可见性 ↔ 技能目录」的绑定必须仍然成立。
+    //
+    // 为什么要有这一组（2026-10-07）：`skill` 由 preset 行带来（presets/dispatch-mode.patch.yml:142-146），
+    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:472-482），所以队员天然能用 —— 这件事此前**零闸门**。
+    // 失效方式与 2026-10-07 修掉的「/team 静默拒收附件」同类：插件照常加载、/team 照常可用，
+    // 只是全队再也不会用技能（目录不注入 = 模型不知道有哪些技能，工具还在也等于没用）。
+    // 官方实现是**两处**共同决定的，所以这里分两条钉：判据（工具身份比较）+ 事件作用域（按 agent 过滤）。
+    check('TEAMMATE_TOOL_DENY 里没有 skill（摘掉它会连带取消技能目录，且是静默的）', () => {
+      if (roster.TEAMMATE_TOOL_DENY.includes('skill')) {
+        return 'TEAMMATE_TOOL_DENY 含 skill：官方只在 skill 工具可见时注入 <available_skills>'
+          + '（dsh-tool-skill/lib/index.js:207），所以队员会**同时**失去工具与技能目录 ——'
+          + ' 插件照常加载、/team 照常可用，只是全队再也不会用技能。若确实要禁止队员用技能，'
+          + '请同时改掉 tools/integration-test.cjs §2.5 那组断言并在这里写明理由';
+      }
+      // preset 行是 skill 能力的来源：行被删掉时队员当然也没有 skill，但那属于「能力面缺一行」，
+      // 由 11a/11b 的行比对负责；这里只确认我们没在**收窄名单**里主动摘掉它。
+      return true;
+    });
+
+    check('官方 skill 目录仍按「skill 工具可见性」绑定（我们靠这条语义让队员自动拿到目录）', () => {
+      const skillToolSource = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-skill/lib/index.js') || '';
+      if (skillToolSource === '') return '读不到 dsh-tool-skill/lib/index.js';
+      // 判据原文：`ctx.tools.get(skillTool.name, agent) === skillTool ? … : { skills: [] }`
+      // 即「解析到的定义不是我这个注册对象 → 目录为空」。身份比较（===）是这条语义的核心：
+      // 改成「非 undefined」会让同名遮蔽出来的另一份定义也拿到目录。
+      if (!skillToolSource.includes('ctx.tools.get(skillTool.name, agent) === skillTool')) {
+        return 'skill 目录的可见性判据变了（不再是 `ctx.tools.get("skill", agent) === skillTool`）——'
+          + ' 队员能不能自动拿到技能目录这件事需要重新核对，lib/roster.js 的收窄名单要跟着复核';
+      }
+      if (!skillToolSource.includes('"agent/pre-step"')) {
+        return 'skill 目录不再挂在 agent/pre-step 上 —— 注入时机变了，integration-test §2.5 的仿真要重写';
+      }
+      if (!skillToolSource.includes('kind: "skill-catalog"')) {
+        return '目录消息的 source.kind 不再是 "skill-catalog" —— integration-test 按这个字段找目录，会变成空断言';
+      }
+      return true;
+    });
+
+    check('agent/pre-step 仍按 agent 作用域过滤（队员各自拿一份目录的前提）', () => {
+      const invariant = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/invariant.js') || '';
+      if (invariant === '') return '读不到 dsh-scope/lib/invariant.js';
+      // 没有这条过滤器，agent/pre-step 会变成全局广播：一个队员装配时**所有** agent 都会收到
+      // 目录（甚至包括已经关闭团队的会话）。integration-test 里两条「队员/Lead 各自收到目录」
+      // 的断言依赖它就是按 agent 过滤的。
+      if (!/"agent\/pre-step":\s*\(args\)\s*=>\s*args\[0\]\["agent"\]/u.test(invariant)) {
+        return 'agent/pre-step 的作用域过滤器不再是 `args[0]["agent"]` —— 目录注入会广播给所有 agent，'
+          + 'integration-test §2.5 的断言前提不成立';
+      }
+      return true;
+    });
+
+    check('技能目录的注入形态仍是 user 消息（所以不会破坏队员共用的系统提示词前缀）', () => {
+      const skillToolSource = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-skill/lib/index.js') || '';
+      if (skillToolSource === '') return '读不到 dsh-tool-skill/lib/index.js';
+      // 这条是**缓存纪律**的闸门：目录以 user/message 注入（而不是 systemPrompt 段）时，
+      // 它落在消息序列里，队员之间共用的系统提示词前缀逐字节不变 —— lib/playbook.js 的
+      // TEAMMATE_CARD 设计（所有队员同一份前缀）才继续成立。
+      // 官方哪天改成注册 systemPrompt 段，目录就会进入**系统提示词**，前缀会随技能集变化。
+      if (!skillToolSource.includes('createUserMessage(')) {
+        return '技能目录不再用 createUserMessage 注入 —— 若改成系统提示词段，队员的共享前缀会随技能集变化，'
+          + 'lib/playbook.js 的 TEAMMATE_CARD 缓存前提要重新评估';
+      }
+      return true;
+    });
+
+    // 12h) preset 里必须真的装着 skill 两件套（工具 + 文件系统 provider）。
+    // 只查「行还在」不够：两行是一对 —— 少了 skill-filesystem，skill 工具能调但永远查不到任何技能
+    // （ctx.skills 没有 provider），失败同样是静默的。
+    // 判据复用 11a 的 rowSignatures（行锚定解析 id/name），不自己拼正则：包名里有 `@` 与 `/`，
+    // 手写转义会引入无效转义（本轮真踩过：Invalid regular expression: Invalid escape）。
+    check('调度模式 preset 仍声明 skill-filesystem + tool-skill 这一对', () => {
+      const rows = new Map(rowSignatures(ourPresetPatch).map((row) => [row.id, row]));
+      const problems = [];
+      for (const [id, name] of [['skill-filesystem', '@deepseek-ai/dsh-skill-filesystem'], ['tool-skill', '@deepseek-ai/dsh-tool-skill']]) {
+        const row = rows.get(id);
+        if (row === undefined) { problems.push(`preset 里没有 ${id} 这一行`); continue; }
+        if (row.name !== name) { problems.push(`${id} 的 name 变成了 ${row.name || '(空)'}，期望 ${name}`); continue; }
+        if (row.disabled) problems.push(`${id} 被 disabled 了`);
+      }
+      if (problems.length > 0) {
+        return problems.join('；') + ' —— 少 skill-filesystem 时 skill 工具永远查不到技能，'
+          + '少 tool-skill 时技能目录不会注入；两种都是静默的';
       }
       return true;
     });

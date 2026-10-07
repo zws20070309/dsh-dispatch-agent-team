@@ -100,11 +100,19 @@ async function main() {
   let scopePkg;
   let dshTools;
   let dshSystemPrompt;
+  // 技能三件套：preset 里真实声明了 skill-filesystem / tool-skill（dispatch-mode.patch.yml:142-146），
+  // 所以它们和上面四个一样是**硬依赖** —— 解析不到就是安装期接线坏了。
+  let dshSkill;
+  let skillFs;
+  let toolSkill;
   try {
     cordis = await import('@deepseek-ai/cordis');
     scopePkg = await import('@deepseek-ai/dsh-scope');
     dshTools = await import('@deepseek-ai/dsh-tools');
     dshSystemPrompt = await import('@deepseek-ai/dsh-system-prompt');
+    dshSkill = await import('@deepseek-ai/dsh-skill');
+    skillFs = await import('@deepseek-ai/dsh-skill-filesystem');
+    toolSkill = await import('@deepseek-ai/dsh-tool-skill');
   } catch (error) {
     console.error('[integration-test] 解析不到官方运行时模块，先修依赖接线：');
     console.error(`  ${error && error.message ? error.message : String(error)}`);
@@ -134,10 +142,24 @@ async function main() {
   require('node:fs').mkdirSync(path.join(tempHome, 'profiles'), { recursive: true });
   process.env.DSH_HOME = tempHome;
 
+  // 技能夹具（2026-10-07 新增 §2.5）：两个 SKILL.md，一个正常、一个 `disable-model-invocation: true`。
+  // 为什么要用**真的** SKILL.md 而不是 stub：这条闸门要证明的是「谁能调 skill」与「目录注入」
+  // 由**同一个可见性判据**决定，而 `disable-model-invocation` 的过滤发生在官方 provider 里
+  // （dsh-skill-filesystem/lib/index.js:853-856 → invocation.modelInvocable:false），
+  // 用 stub 就把这一段换成了我自己写的等价物，测的就不是官方那条路径了。
+  const skillFixture = require('node:fs').mkdtempSync(path.join(require('node:os').tmpdir(), 'dispatch-itest-skills-'));
+  const skillsRoot = path.join(skillFixture, 'skills');
+  const writeSkill = (dir, frontmatter, body) => {
+    require('node:fs').mkdirSync(path.join(skillsRoot, dir), { recursive: true });
+    require('node:fs').writeFileSync(path.join(skillsRoot, dir, 'SKILL.md'), `---\n${frontmatter}\n---\n\n${body}\n`, 'utf8');
+  };
+  writeSkill('probe-visible', 'name: probe-visible\ndescription: 集成测试夹具：模型可调用的技能', '# 正文\n夹具正文。');
+  writeSkill('probe-hidden', 'name: probe-hidden\ndescription: 集成测试夹具：禁止模型调用\ndisable-model-invocation: true', '# 正文\n不该进目录。');
+
   // 临时目录登记 + **进程退出兜底清理**：本文件有好几条早退路径（解析不到官方模块、隔离断言不成立、
   // 断言失败后 process.exit(1)）。只靠末尾那一次 rmSync 会留下垃圾目录 —— 2026-10-01 实测在 %TEMP%
   // 里攒了 5 个 `dispatch-itest-home-*` 与 40+ 个 `dispatch-itest-race-*`。这里统一兜住。
-  const tempDirs = [tempHome];
+  const tempDirs = [tempHome, skillFixture];
   process.on('exit', () => {
     for (const dir of tempDirs) {
       try { require('node:fs').rmSync(dir, { recursive: true, force: true }); } catch { /* 收尾失败不影响结论 */ }
@@ -232,6 +254,27 @@ async function main() {
   });
   for (const name of PRESET_TOOL_NAMES) presetTools.register(syntheticTool(name));
 
+  // ── preset 平面上的技能三件套（照生产形状：dispatch-mode.patch.yml:142-146 就是这么两行）──
+  // 为什么必须放在 preset 平面而不是 root：`tool-skill` 是 preset 行的贡献，队员作用域是它的
+  // **子作用域** —— 只有这个形状才能证明「收窄队员时 skill 会怎样」。挂在 root 上就变成了
+  // 「全局工具被摘」，测不到本插件真正依赖的那条继承语义。
+  root.plugin(dshSkill.SkillRegistry ?? dshSkill.default, {});
+  await tick();
+  preset.ctx.plugin(skillFs, {
+    dshHome: tempHome,
+    agentsHome: path.join(skillFixture, 'agents'),
+    bundledSkillDir: path.join(skillFixture, 'bundled'),
+    // 关掉默认根：否则会去扫真实的 ~/.agents/skills 与 ~/.dsh —— 测试结论会随用户机器上的
+    // 技能数量变化，而且会把用户自己的技能名带进断言。
+    includeDefaultRoots: false,
+    customSkillDirs: [skillsRoot],
+    watch: false,
+  });
+  await tick();
+  preset.ctx.plugin(toolSkill, {});
+  await tick();
+  await tick();
+
   // ── agent 作用域：Lead + 两个不同角色的队员（同一个 preset 祖先） ─────────────
   const leadScope = createScope(root, KEY.lead, { parent: KEY.preset });
   const scoutScope = createScope(root, KEY.scout, { parent: KEY.preset });
@@ -319,6 +362,116 @@ async function main() {
     const after = root.get('tools').view(KEY.scout).visible.get('send_message');
     if (after === undefined) return 'own 层的 send_message 被 restrict 摘掉了 —— 官方语义不是这样，设计前提不成立';
     if (after.description.includes('synthetic')) return 'restrict 把继承面的同名工具放行回来了（应当是 own 层赢）';
+    return true;
+  });
+
+  // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
+  //
+  // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:472-482），所以队员天然保留它 ——
+  // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
+  // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
+  // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
+  //
+  // 官方机制（对着装机 0.2.0-rc.2 逐行核过）：dsh-tool-skill/lib/index.js:203-236 在
+  // `agent/pre-step` 上注入一条 **user 消息**（source.kind = "skill-catalog"），而 :207 的判据是
+  // `ctx.tools.get("skill", agent) === skillTool` —— **谁能调这个工具，谁才有目录**；
+  // 该事件的作用域过滤器就是 agent 本身（dsh-scope/lib/invariant.js:17 `"agent/pre-step": (args) => args[0]["agent"]`）。
+  // 因为它是 user 消息而不是提示词段，队员的共享系统提示词前缀不受影响（缓存设计不动）。
+  //
+  // 生产里 agent 的 scope key 就是 agent 自己（dsh-agent-loop:778 `createScope(loopCtx, this)`），
+  // 而本文件的夹具用独立 KEY 对象当 key —— 两者是同一件事。所以这里把 session 挂在**既有的 KEY**
+  // 上，让它在瀑布里同时充当「作用域 key」与「agent」：夹具身份与上面所有断言完全一致（不新建作用域，
+  // 也不改动任何既有断言的输入）。
+  const skillKeyOf = (key, id) => {
+    key.session = {
+      id,
+      header: { cwd: skillFixture },
+      // 目录历史的三件套（dsh-tool-skill:332-336 读 session.surface.nodes / seq / eventAt）：
+      // 空历史 + seq 0 = 「本会话还没发过目录」，正是首步要走的发布分支。
+      surface: { nodes: [] },
+      seq: 0,
+      eventAt: () => undefined,
+    };
+    return key;
+  };
+  skillKeyOf(KEY.lead, 'lead-agent');
+  skillKeyOf(KEY.scout, 'scout-agent');
+  skillKeyOf(KEY.builder, 'builder-agent');
+
+  const skillTool = root.get('tools').view(KEY.preset).visible.get('skill');
+  check('skill 三件套真的装上了（夹具自检：否则下面几条会变成空断言）', () => {
+    if (skillTool === undefined) return 'preset 平面上没有 skill 工具 —— 夹具没装成，本组断言无意义';
+    if (root.get('skills') === undefined) return 'skills 服务没起来（SkillRegistry 没装上）';
+    return true;
+  });
+
+  check('队员与 Lead 都保留 skill 工具（TEAMMATE_TOOL_DENY 不该含它）', () => {
+    if (roster.TEAMMATE_TOOL_DENY.includes('skill')) {
+      return 'TEAMMATE_TOOL_DENY 里出现了 skill —— 队员会同时失去 skill 工具与技能目录（官方按可见性绑定），'
+        + '而这是静默的：插件照常加载，只是全队再也不会用技能';
+    }
+    for (const [label, key] of [['Lead', KEY.lead], ['队员 scout', KEY.scout], ['队员 builder', KEY.builder]]) {
+      // 用 `!== skillTool` 而不是「非 undefined」：可见性判据本身是**身份**比较
+      // （dsh-tool-skill:207），同名遮蔽出来的另一个对象会让目录静默不注入。
+      if (root.get('tools').get('skill', key) !== skillTool) return `${label} 看不到 skill 工具（被收窄摘掉了？）`;
+    }
+    return true;
+  });
+
+  const runPreStep = async (agent) => {
+    const controller = new AbortController();
+    return root.waterfall(
+      'agent/pre-step',
+      { agent, messages: [], signal: controller.signal },
+      () => ({ kind: 'enter', messages: [] }),
+    );
+  };
+  /** 取这一步被注入的技能目录正文；没有注入返回 undefined。 */
+  const catalogTextOf = (decision) => {
+    const message = (decision.messages || []).find((item) => item.source !== undefined && item.source.kind === 'skill-catalog');
+    return message === undefined ? undefined : message.content.map((block) => block.text ?? '').join('\n');
+  };
+
+  const scoutCatalog = catalogTextOf(await runPreStep(KEY.scout));
+  const leadCatalog = catalogTextOf(await runPreStep(KEY.lead));
+
+  check('队员的上下文里真的有技能目录（不是「按名字点名才能用」）', () => {
+    if (scoutCatalog === undefined) {
+      return '队员没收到 <available_skills> —— 官方只在 skill 工具可见时注入目录（dsh-tool-skill:207），'
+        + '说明队员这条路径上的可见性判据已经不成立';
+    }
+    if (!scoutCatalog.includes('<available_skills>')) return `收到的目录消息里没有 <available_skills>：${scoutCatalog.slice(0, 160)}`;
+    if (!scoutCatalog.includes('probe-visible')) return `目录里没有夹具技能 probe-visible：${scoutCatalog.slice(0, 160)}`;
+    // `disable-model-invocation: true` 的技能必须被过滤掉（dsh-skill-filesystem:853-856 把它
+    // 翻成 modelInvocable:false，dsh-tool-skill:217 再 filter(isModelInvocable)）——
+    // 它在目录里出现 = 队员会照着调一个必然抛错的技能（:147/:150 抛 "not available for model invocation"）。
+    if (scoutCatalog.includes('probe-hidden')) {
+      return 'disable-model-invocation 的技能混进了目录 —— 队员会调它然后拿到 not available for model invocation';
+    }
+    return true;
+  });
+
+  check('Lead 的上下文里也有技能目录（目录是按 agent 各发一份，不是只给队员）', () => {
+    if (leadCatalog === undefined) return 'Lead 没收到技能目录';
+    if (!leadCatalog.includes('probe-visible')) return `Lead 的目录里没有夹具技能：${leadCatalog.slice(0, 160)}`;
+    return true;
+  });
+
+  // 负对照：证明上面两条断言真的会因为「skill 不可见」而红，而不是恒真。
+  const KEY_SKILL_DENIED = { name: 'skill-denied-agent' };
+  const skillDeniedScope = createScope(root, KEY_SKILL_DENIED, { parent: KEY.preset });
+  skillDeniedScope.ctx.get('tools').restrict({ deny: ['skill'] });
+  await tick();
+  skillKeyOf(KEY_SKILL_DENIED, 'skill-denied-agent');
+  const deniedCatalog = catalogTextOf(await runPreStep(KEY_SKILL_DENIED));
+  check('负对照：摘掉 skill 后工具与技能目录**同时**消失（这就是上面几条要拦的静默失效）', () => {
+    if (root.get('tools').get('skill', KEY_SKILL_DENIED) !== undefined) {
+      return 'deny skill 没生效 —— 负对照不成立，上面两条断言可能是假绿灯';
+    }
+    if (deniedCatalog !== undefined) {
+      return '工具摘了但目录还在 —— 「可见性绑定」不成立，本组断言的前提要重写（dsh-tool-skill:207）';
+    }
     return true;
   });
 

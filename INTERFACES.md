@@ -9,7 +9,7 @@
 本文件由 Lead 冻结。**不要修改本文件，也不要修改已存在的 `lib/roster.js` / `lib/playbook.js` /
 `package.json` / `cordis.patch.yml` / `presets/*.yml`**。需要接口变更时向 `lead` 发消息。
 
-## 0.1 勘误表（2026-09-28 起；43 条，全部有 `file:line` 依据）
+## 0.1 勘误表（2026-09-28 起；44 条，全部有 `file:line` 依据）
 
 | # | 本文档原文位置 | 现在的真相 |
 |---|---|---|
@@ -55,6 +55,7 @@
 | 40 | §5（给 agent 投递消息的三种语义） | **`agent.send(message, target, wakeup)` 的三个目标不是一回事**（`dsh-agent-loop/lib/index.js:800-814`）：`followup(input)` = `send(input, 'next-turn', true)`、`steer(input)` = `send(input, 'next-step', true)`、`inject(input)` = `send(input, 'next-step', false)`。**`next-turn` 那一条会显示在用户界面上**：客户端 `QueueDock` 从 Session 的 `inbox` 投影**读取 `next-turn`**（`dsh-client-ui-conversation/README.zh.md` 原话），用户在输入框上方看到排队行、还要点「插入/插话」——2026-10-01 18:26 我们注入的「团队已开启」就是这么跑到用户输入框里的（用户原话：「不要突然排队一句话行不？」）。**判据**：只有**用户自己打的字**才允许走 `followup`（本插件只有 `/team` 的注入）；插件想让模型知道的状态一律放进**工具返回值**，要打断当前轮用 `steer`。另：系统提示词与工具目录**每个 step 重新组装**（`:907` 的 preStep → `systemPrompt.assemble()`，`:1063` 的 `buildRequest(…, assembly.tools, …)`），所以「开团后必须注入一句提醒」这个前提本身是错的。drift-check 有闸门钉住这三条 |
 | 41 | §4（队员的模型/强度覆盖） | **队员模型覆盖的优先级**（2026-10-01 修正）：只有 `spawn_teammate` 的**显式参数**（`provider`+`model` / `reasoning_effort`）才允许被钉住（`lib/runtime.js` 的 `spawnRoutes` 与 `spawnEfforts` 两个账本，agent 销毁时清空）；**角色配置必须每次请求实时读**（`resolveRoleRoute(peekConfig(), role)`），合成用纯函数 `resolveMemberRoute(explicit, roleRoute, explicitEffort)`（`lib/roster.js`），返回 `undefined` = 不覆盖 = 跟随 Lead。旧写法把**角色配置解析出来的路由**也钉进 `spawnRoutes`，于是「跟随 Lead」/改配置对**已经在跑的队员**永远不生效（用户 2026-10-01 报的：面板改回「跟随 Lead」后队员仍跑 spawn 时刻的旧模型）。对照事实：官方 `spawn` provider 让子代理**每请求**跟随父代理当前选择（用户日志里 `red-team` 在 Lead 换模型后 2 分钟内跟着换），所以「不覆盖」就是正确的「跟随 Lead」；而 `spawn_teammate` 显式给的路由仍必须真的生效，否则返回值里的 `route` 是假的 |
 | 42 | §0.1 / §7.5（**本轮审查新增的官方事实，全部从 0.2.0-rc.2 的 `app.asar` 复核**） | ① **`ReactLoopAgent` 实例上没有 `name` 字段**（`dsh-agent-loop/lib/index.js:747-789` 的构造只赋 `id`/`session`/`options`/`ctx`）：任何「从 agent 拿名字」的写法都会拿到 `undefined`，队员名只能从 `ctx.agentTeams.tryMembership(agent)` 取——它返回 `{role, name, id, root}`（`dsh-experimental-agent-team/lib/index.js:405-410`）。本插件唯一踩这个坑的是 `report_result` 的报告头（已改为从 membership 取，`lib/tools.js` 的 `callerName`）；派活署名那条**不是缺陷**——`installMember` 一直用的就是 `membership.name`（`lib/runtime.js:1045-1053`），审查时被否证的子代理结论不再照抄。 ② `session/event` 是**不按 agent 过滤的全局广播**（`dsh-scope/lib/invariant.js:26` 把它标为 `null`），官方 agent-team 自己就监听它（`:1720-1722`），所以插件可以合法地用它记账：`turn/end` 的 `reason.kind === 'max-tokens'`（`:1151` 产生、`:979` 聚合、`:1027-1030` 落事件）现已驱动 §2.6 的截断标志。 ③ `agentPresets.compositionInventory()` 在**任何 await 之前**同步快照各 preset 的定义（`dsh-agent-preset-registry/lib/index.js:793`），所以状态文件里 preset 行内容的「准」只取决于快照时刻——本插件改为 boot/settled 两阶段写 + `ctx.loader.await()` 事件时机（官方先例：`dsh-app-boot/lib/index.js:3489`、`:4084`）。 ④ `ask_user_question` 对委派调用者是**硬拒**：`dsh-user-questions/lib/index.js:531-535` 的 `assertLiveRoot` 抛 `DELEGATED_CALLER`，但弹窗已在宿主全局排队；因此它进了 `TEAMMATE_TOOL_DENY`。 ⑤ `mountPreset` 只在 preset 的 `activate()` 里调一次（`:262`、`:534`），`agent/bind`/`session/join` **不会**重放它——「preset 子树每会话跑一次」是错的，实测口径见 README §6.1。 |
+| 44 | §3.5（技能）与 §3.1 第 4 步（队员收窄） | **`skill` 对队员是「能用且目录自动注入」，不是「按名字点名才可用」**（2026-10-07 查证并补闸门）。① 工具来源：preset 行 `skill-filesystem` + `tool-skill`（`presets/dispatch-mode.patch.yml:142-146`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:472-482`）；`lib/tools.js:621-622` 的 `include` 只过滤本插件自己那 15 个团队工具（注释原话「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。② 目录注入：`dsh-tool-skill/lib/index.js:203-236` 挂在 `agent/pre-step`，注入一条 **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），判据是 `:207` 的 `ctx.tools.get("skill", agent) === skillTool`——**身份比较**，即「谁能调这个工具，谁才有目录」；该事件按 agent 过滤（`dsh-scope/lib/invariant.js:17` `"agent/pre-step": (args) => args[0]["agent"]`），所以每个 agent 各一份，队员也有。③ 因为是 user 消息而非系统提示词段，队员共用的提示词前缀**不受影响**（§2 的缓存纪律 / `TEAMMATE_CARD` 逐字节相同仍成立）。④ **失效方式**：把 `skill` 加进 `TEAMMATE_TOOL_DENY` 会让队员**同时**失去工具与目录，而插件照常加载、`/team` 照常可用——与 2026-10-07 修掉的「`/team` 静默拒收附件」同类，故新增 `drift-check` 12g 五条 + `integration-test` §2.5 五条（含负对照：显式 `deny: ['skill']` 后工具与目录同时消失）。⑤ 附带事实：`SKILL.md` 写 `disable-model-invocation: true` 时不进目录（`:217` 的 `filter(isModelInvocable)`），按名字调**直接抛错** `skill "X" is not available for model invocation`（`:147`/`:150`）；旧键名（`disableModelInvocation` / `modelInvocable` / `userInvocable`）被官方拒掉（`dsh-skill-filesystem:850-852` 报 unsupported），只能用短横线写法。⑥ 顺带修掉一处**假因**：`drift-check` 12b 的「名字出处」来源清单原先没有 `dsh-tool-skill`，于是「把 skill 加进名单」时会同时报出「找不到出处」这条假原因，把真因（12g）埋在噪音里——已把该包补进来源清单。 |
 | 43 | §2（新增能力）与 §0.1（工具面计数） | **2026-10-04 落地三件团队工具 + 一条工程纪律**，全部有真跑断言：① `broadcast_message`（Lead 专属，`lib/roster.js` 的 `planBroadcastTargets` + `lib/tools.js`）：一次把同一条消息发给多个队员；**默认只发 running/provisioning**，因为官方 `send_message` 对 inactive 目标会启动新 turn（投递链 `dispatchOnce` → `steerHostSubagentPrompt` → `deliverFollowup` 的 coldResume），「广播全体」会把停着的队员全部拉起来干活；被跳过的目标逐个给出可操作理由，要唤醒必须显式 `include_inactive: true`；**显式点名**（`targets`）不受该闸门限制——点名本身就是 Lead 的决定，等价于单独 `send_message`。② `ask_lead`（队员专属，`lib/roster.js` 的 `askLeadMessage`）：队员中途提需要拍板的问题；走官方 `sendMessage(→ lead)` 并加固定前缀 `[阻塞·等答复]`/`[可继续]` + `[需 Lead 决策]`，因为官方投递框架只写发件人（`dsh-experimental-agent-team/lib/index.js:971-976`）没有类型位；投递失败不静默，返回 `ok:false` + diagnostics 指路 `report_result` 的 `needs_decision`。③ **截断标志**（`lib/runtime.js` 的 `noteTurnEndReason`/`truncatedMemberIds` + `lib/roster.js` 的 `annotateTruncatedMembers`）：监听 `session/event` 的 `turn/end`，`reason.kind === 'max-tokens'` 时记账（正常收尾/中止/报错都清除），`list_agents` 把固定文案并进该队员行的 **diagnostics** 字段——不新增字段是因为 `diagnostics` 官方 schema 里已有，从而**不动 Lead 的工具目录 = 不动每次请求的缓存前缀**。写入点是监听器与集成测试**共用的同一个函数**，被测的就是生产路径。④ 队员工具面因此从 8 个变 **9 个**（+`ask_lead`），`TEAMMATE_TOOL_DENY` 增 `ask_user_question`（官方 `dsh-user-questions/lib/index.js:531-535` 的 `assertLiveRoot` 对委派调用者抛 `DELEGATED_CALLER`，弹窗却已在宿主全局排队）。⑤ PLAYBOOK 预算闸门按报告 P2-10 的建议从 `≤4100` 收到 `≤3800`（实测 3783，含 §一/§六 去重、§五 字段用法下沉、长句瘦身；27 个必备关键词全部保留）。⑥ 工程纪律（本轮事故的防复发）：测量提示词长度必须用**模块运行时值**（`import` 后读 `.length`），不许用字符串切片——本轮曾据此误判 `TEAMMATE_CARD` 超限并做「压缩」，用字符串替换误伤模板字符串、删掉整个 `teammateBrief`，导致模块语法崩。现已回滚并加结构完整性闸门（`tools/selftest.cjs`：三常量 + `teammateBrief` + `wakeInstruction` + 反引号成对 + 正文长度下限）。 |
 
 
@@ -101,7 +102,7 @@ export const ROLE_BY_ID;            // Record<id, role>
 export const TEAM_TOOL_NAMES;             // 九个团队工具名（真值在这里，不在 lib/tools.js）
 export const LEAD_ONLY_TEAM_TOOL_NAMES;   // ['spawn_teammate','interrupt_agent']
 export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减去上面两个，再加队员专用的 report_result 与 ask_lead
-export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）
+export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）。**不许含 'skill'**：见 §3.5
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
 // 以下 4 个是 2026-09-30 起的既有导出（工具名与 Lead 名单的真值都在这里）：
 export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
@@ -236,6 +237,7 @@ export function sessionMemory();           // -> 会话级团队记忆快照（�
      —— **与角色无关**，所有队员逐字节相同（旧写法 `teammateCard(deriveRole(name))` 已删除）
    - **清空**被摘掉工具的用法段（`TEAMMATE_SECTION_MUTES`：`tool:goal` / `tool:workflow`，同名空段遮蔽）
    - **收窄继承面工具** `ctx.tools.restrict({ deny: [name] })`，逐个名字 try/catch（`TEAMMATE_TOOL_DENY`）
+     —— **`skill` 故意不在名单里**（见 §3.4）
    - 只有 **9 个**团队工具（`MEMBER_TEAM_TOOL_NAMES`；= 官方九个去掉 `spawn_teammate` / `interrupt_agent`，再加队员专用的 `report_result` 与 `ask_lead`）
    - **模型/强度覆盖**（见 §3.2）
    - 另外尽力注册一个**同名空段** `dispatch:playbook`（order 1、text `''`）来遮蔽 preset 层的
@@ -286,6 +288,40 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 拿 `reasoning.efforts`。**拿不到 reasoning 元数据的模型就不要给 efforts**（官方硬规则：
 `dsh-client-ui-model-selection/README.md:32`「An adapter without reasoning metadata leaves the Effort row absent」）。
 **先把这一步真跑通再往下写**：在同 profile 里用真实调用验证（写个临时脚本或先跑 host 路由的 GET）。
+
+### 3.5 技能（skill）：队员**保留**它，且目录会自动注入
+
+**结论**：Lead 与每个队员都能调 `skill`，而且**不需要用户点名** —— 技能目录会注入到每个 agent 的上下文里。
+两条官方事实（对着装机 0.2.0-rc.2 复核）：
+
+1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:472-482`）。
+   注意 `lib/tools.js:621-622` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
+   （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
+2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
+   **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），
+   判据是 `:207` 的 `ctx.tools.get("skill", agent) === skillTool` —— **谁能调这个工具，谁才有目录**。
+   该事件按 agent 过滤（`dsh-scope/lib/invariant.js:17` `"agent/pre-step": (args) => args[0]["agent"]`），
+   所以每个 agent 各拿一份，队员也有。
+
+**为什么这个设计对本插件友好**：目录是 **user 消息**而不是系统提示词段，所以它**不影响**队员共用的
+系统提示词前缀（§2 的缓存纪律 / `TEAMMATE_CARD` 逐字节相同那条）。**不要**为了「让队员看到技能」
+去注册什么提示词段 —— 那会打掉缓存命中率，而且完全没必要。
+
+**两条硬约束（改这里之前先读）**：
+
+- **不要把 `skill` 加进 `TEAMMATE_TOOL_DENY`**：可见性是**绑定**的，队员会**同时**失去工具与目录，
+  而插件照常加载、`/team` 照常可用 —— 静默失效。`drift-check` 12g 与 `integration-test` §2.5 各有一条闸门。
+- `SKILL.md` 的 frontmatter 写 `disable-model-invocation: true` 时：它**不进目录**
+  （`dsh-tool-skill:217` 的 `filter(isModelInvocable)`），且**按名字调会直接抛错**
+  `skill "X" is not available for model invocation`（`:147`/`:150`）。这类技能只能用户本人调用。
+  旧键名（`disableModelInvocation` / `modelInvocable` / `userInvocable`）会被官方拒掉
+  （`dsh-skill-filesystem:850-852` 报 unsupported），只能用短横线写法。
+
+**测试怎么覆盖的**：`integration-test` §2.5 用**真的** `SKILL.md` 夹具 + 真的
+`SkillRegistry` / `skill-filesystem` / `tool-skill` 装在 **preset 平面**（生产形状），
+断言队员与 Lead 都拿到目录、`disable-model-invocation` 的技能被过滤掉，并有负对照
+（显式 `deny: ['skill']` 后工具与目录**同时**消失）。
 
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
