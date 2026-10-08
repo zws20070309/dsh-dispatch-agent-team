@@ -1198,6 +1198,166 @@ function functionBodyOf(source, needle) {
     assert.ok(!convo.rows.some((r) => /parent/.test(r.text)), '浮窗里出现了父会话的内容');
   });
 
+  await check('buildGraph：Lead 派活条数 = spawn 次数 + 后续 team/message 条数（用户 #3）', () => {
+    // 回归：实测（session-898e4c64）Lead 用 spawn_teammate 派了 3 个队员，
+    // 而 team/message 只有 2 条补充消息。只数 team/message 时另外两个队员显示「Lead 派活 0 条」。
+    const LEAD = 'lead-1';
+    const A = 'a-1';
+    const B = 'b-1';
+    const leadEvents = [
+      { type: 'tool/call', seq: 0, time: 1, data: { name: 'spawn_teammate', arguments: '{"name":"alpha","role":"builder"}' } },
+      { type: 'tool/call', seq: 1, time: 2, data: { name: 'spawn_teammate', arguments: '{"name":"beta","role":"verify"}' } },
+      { type: 'team/member', seq: 2, time: 3, data: { member: { id: A, name: 'alpha' } } },
+      { type: 'team/member', seq: 3, time: 4, data: { member: { id: B, name: 'beta' } } },
+      // 只给 alpha 发两条后续消息
+      { type: 'team/message/queued', seq: 4, time: 5, data: { message: { id: 'q1', senderName: 'lead', targetId: A, content: [] } } },
+      { type: 'team/message/queued', seq: 5, time: 6, data: { message: { id: 'q2', senderName: 'lead', targetId: A, content: [] } } },
+    ];
+    const leadStats = graph.foldSession(leadEvents);
+    const g = graph.buildGraph({
+      leadId: LEAD, leadName: 'lead',
+      members: [{ id: A, name: 'alpha', role: 'teammate' }, { id: B, name: 'beta', role: 'teammate' }],
+      statsBySession: new Map([[LEAD, leadStats]]),
+      tasks: [],
+    });
+    const ea = g.edges.find((e) => e.kind === 'dispatch' && e.to === 'alpha');
+    const eb = g.edges.find((e) => e.kind === 'dispatch' && e.to === 'beta');
+    assert.equal(ea.weight, 3, `alpha 应为 1 spawn + 2 消息 = 3，实际 ${ea.weight}`);
+    assert.equal(ea.spawned, 1);
+    assert.equal(ea.messaged, 2);
+    assert.equal(eb.weight, 1, `beta 应为 1 spawn + 0 消息 = 1（旧实现显示 0），实际 ${eb.weight}`);
+    assert.equal(eb.spawned, 1);
+    assert.equal(eb.messaged, 0);
+  });
+
+  await check('foldSession：TODO 只反映当前轮（新一轮开始清空上一轮）（用户 #6）', () => {
+    // 回归：实测 builder-copyid 的 turn 1 在 seq=520 结束、turn 2 在 seq=523 开始，
+    // 最后一次 todo/write 在 seq=514（4/0/4）。不清空的话第二轮仍显示 4/0/4。
+    const twoTurns = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      { type: 'todo/write', seq: 1, time: 1100, data: { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'completed' }] } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'turn/start', seq: 3, time: 3000, data: { turn: 2 } },
+      // turn 2 没有 todo/write
+    ]);
+    assert.equal(twoTurns.todo.total, 0, `第二轮没写 TODO 就该是 0/0/0，实际 ${JSON.stringify(twoTurns.todo)}`);
+    // 单轮会话不受影响：turn/start 在 todo/write 之前，写完立刻填回来
+    const oneTurn = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      { type: 'todo/write', seq: 1, time: 1100, data: { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }, { content: 'c', status: 'pending' }] } },
+    ]);
+    assert.equal(oneTurn.todo.done, 1);
+    assert.equal(oneTurn.todo.running, 1);
+    assert.equal(oneTurn.todo.total, 3);
+  });
+
+  await check('effectiveRuntimeMs：未闭合 turn 也要算运行时长（额度中断后不再显示「—」）（用户 #4）', () => {
+    // 回归：runtimeMs 原本只在 turn/end 结算；额度耗尽/被杀的会话永远没有 turn/end，
+    // 于是 runtime=0 → 卡片与浮窗都显示「—」，可它明明跑了几十分钟。
+    const cut = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 10000, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 1, time: 40000, data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 60, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+      // 没有 turn/end（额度耗尽）
+    ]);
+    assert.equal(cut.runtimeMs, 0, '前提：闭合部分确实是 0');
+    assert.equal(cut.openTurns.size, 1, '前提：确实有一个未闭合 turn');
+    // 最后一条事件时间 40000 − turn 起点 10000 = 30000ms
+    assert.equal(graph.effectiveRuntimeMs(cut), 30000, `有效运行时长应为 30000ms，实际 ${graph.effectiveRuntimeMs(cut)}`);
+    // buildGraph 必须用有效值 → 节点有 runtime 与 tps
+    const g = graph.buildGraph({
+      leadId: 'L', leadName: 'lead', members: [],
+      statsBySession: new Map([['L', cut]]), tasks: [],
+    });
+    assert.equal(g.nodes[0].runtimeMs, 30000);
+    assert.ok(g.nodes[0].tps > 0, `tps 应 > 0，实际 ${g.nodes[0].tps}`);
+    assert.equal(g.nodes[0].openTurns, 1, '未闭合 turn 数要如实暴露给客户端');
+  });
+
+  await check('buildGraph：承接边方向按主导信息流，不随名单顺序漂移（用户 #7）', () => {
+    // 回归：旧实现把 pair 内**先遇到的**那条当 from（由名单顺序决定）→ 双向边里约一半流光反着播。
+    const mk = (wrote, read) => {
+      const s = graph.emptyStats();
+      for (const f of wrote) s.wrote.add(f);
+      for (const f of read) s.read.add(f);
+      return s;
+    };
+    // zeta 写了 3 个文件被 alpha 读；alpha 只写 1 个被 zeta 读 → 主导方向 zeta → alpha
+    const zeta = mk(['f1', 'f2', 'f3'], ['g1']);
+    const alpha = mk(['g1'], ['f1', 'f2', 'f3']);
+    const build = (order) => graph.buildGraph({
+      leadId: 'L', leadName: 'lead',
+      members: order === 1
+        ? [{ id: 'a', name: 'alpha', role: 'teammate' }, { id: 'z', name: 'zeta', role: 'teammate' }]
+        : [{ id: 'z', name: 'zeta', role: 'teammate' }, { id: 'a', name: 'alpha', role: 'teammate' }],
+      statsBySession: new Map([['L', graph.emptyStats()], ['a', alpha], ['z', zeta]]),
+      tasks: [],
+    });
+    const e1 = build(1).edges.find((e) => e.kind === 'handoff');
+    const e2 = build(2).edges.find((e) => e.kind === 'handoff');
+    assert.equal(e1.from, 'zeta', `主导方向应为 zeta → alpha，实际 ${e1.from} → ${e1.to}`);
+    assert.equal(e2.from, 'zeta', `名单顺序变了方向不该变，实际 ${e2.from} → ${e2.to}`);
+    assert.equal(e1.weight, 4, `两个方向合计 4 个文件，实际 ${e1.weight}`);
+    assert.equal(e1.both, true, '双向边必须标记 both（客户端据此播反向流光）');
+  });
+
+  await check('leadForSession：团队结束后从日志 header.parentSession 恢复 Lead（用户 #5）', async () => {
+    // 回归：额度耗尽 → 队员 agent 全部销毁 → 用户点队员会话打开工作区时
+    // 报「找不到会话 … 对应的活动 agent」，整页打不开。
+    //
+    // ⚠️ 这条断言的关键是**替身必须复刻官方 jsonl 后端的形状**：
+    // session 头是日志第 1 行，被 scanLog 当 meta 消费（dsh-session-persistence-jsonl:2801），
+    // `read()` 只返回 events（同文件 :2825 / :62）→ **events 里没有 type==='session'**。
+    // 第一版替身把 session 头留在 events 里，于是掩盖了「读 events 找不到 parentSession」的死代码。
+    const runtimeMod = await load('runtime.js');
+    const LEAD = 'session-recover-lead';
+    const MEMBER = 'recover-member';
+    const memberEvents = [
+      { type: 'subagent/descriptor', seq: 0, time: 1, data: {} },
+      { type: 'assistant/message', seq: 1, time: 2, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 } } },
+    ];
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 3, data: { member: { id: MEMBER, name: 'builder-r' } } },
+      { type: 'turn/start', seq: 1, time: 4, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 5000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const persistence = {
+      open: async (id) => {
+        const key = String(id).replace(/^session-/, '');
+        const isMember = key === MEMBER;
+        const events = isMember ? memberEvents : leadEvents;
+        return {
+          // 官方形状：header 单独一份（第 1 行），events 不含 session 头。
+          header: isMember ? { type: 'session', id: MEMBER, parentSession: LEAD } : { type: 'session', id: LEAD },
+          inheritedEventCount: 0,
+          read: async () => ({ events }),
+          close: async () => {},
+        };
+      },
+    };
+    // 场景：**没有任何活体 agent**（额度耗尽后全部销毁）。
+    const ctx = {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+    };
+    const found = await runtimeMod.leadForSession(ctx, MEMBER);
+    assert.equal(found.ok, true, `恢复失败：${JSON.stringify(found)}`);
+    assert.equal(found.historyOnly, true, '要标记成历史快照');
+    assert.equal(found.lead.id, LEAD, `Lead id 应为 ${LEAD}，实际 ${found.lead?.id}`);
+    // 合成的 lead **不能**带假 session：带了会让 statsForSession 走活体增量路径 → 统计全 0。
+    assert.equal(found.lead.session, undefined, '合成 lead 不许带 session（否则持久路径被短路，统计变 0）');
+    // 沿 parentSession 恢复出的 lead 必须能画出成员（走 collectGraph 的持久路径）
+    const g = await graph.collectGraph({
+      ctx,
+      agentTeams: { listMembers: () => { throw new Error('TEAM_NOT_MEMBER'); }, listTasks: () => [] },
+      leadAgent: found.lead,
+      isTeamEnabled: () => true,
+    });
+    assert.equal(g.ok, true, JSON.stringify(g));
+    const names = g.graph.nodes.map((n) => n.name).sort().join(',');
+    assert.equal(names, 'builder-r,lead', `应从 Lead 日志重建成员，实际 ${names}`);
+    assert.ok(g.notes.some((n) => n.includes('重建')), '要如实说明这是历史快照');
+  });
+
   console.log('');
   console.log('lib/tools.js（report_result 的形状校验）');
 
