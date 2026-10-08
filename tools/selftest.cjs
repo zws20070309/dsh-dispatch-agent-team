@@ -1358,6 +1358,69 @@ function functionBodyOf(source, needle) {
     assert.ok(g.notes.some((n) => n.includes('重建')), '要如实说明这是历史快照');
   });
 
+  await check('leadForSession：带 session- 前缀的队员 id 与 Lead 自己会话都能恢复（用户 #5 缺口②③）', async () => {
+    // 两个真实缺口（2026-10-08 用真日志实测发现）：
+    //   ② 持久层按目录名**精确匹配**，而队员目录是裸 uuid、Lead 目录带 session- 前缀
+    //      （实测 `open('session-ca6e6ecd-…')` 抛、`open('ca6e6ecd-…')` 成功）
+    //      → open 必须前缀双试，否则带前缀的队员 id 打不开。
+    //   ③ **Lead 自己的会话没有 parentSession**，而官方成员面板在 Lead 会话里也显示入口
+    //      → 「在 Lead 会话里点进入工作区」在团队结束后必须也能恢复（靠投影缓存判 members>1）。
+    const runtimeMod = await load('runtime.js');
+    const LEAD = 'session-recover-lead2';
+    const MEMBER = 'recover-member2';
+    const memberEvents = [{ type: 'assistant/message', seq: 0, time: 2, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 } } }];
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 3, data: { member: { id: MEMBER, name: 'builder-r2' } } },
+      { type: 'turn/start', seq: 1, time: 4, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 5000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    // 严格复刻官方形状：header 单独一份；**只认精确目录名**（所以前缀双试才有意义）。
+    const persistence = {
+      open: async (id) => {
+        const isLead = id === LEAD;
+        const isMember = id === MEMBER;
+        if (!isLead && !isMember) throw new Error(`no log for ${id}`);
+        return {
+          header: isMember ? { type: 'session', id: MEMBER, parentSession: LEAD } : { type: 'session', id: LEAD },
+          inheritedEventCount: 0,
+          read: async () => ({ events: isMember ? memberEvents : leadEvents }),
+          close: async () => {},
+        };
+      },
+    };
+    // 投影缓存：**只有 Lead 的会话**有 members（>1）。这是缺口③ 的唯一判据。
+    const projectionCache = {
+      cachedSnapshot: (header) => (header?.id === LEAD
+        ? { values: { agentTeam: { members: [{ id: LEAD, role: 'lead', name: 'lead' }, { id: MEMBER, role: 'teammate', name: 'builder-r2' }], tasks: [{ id: 'task-1', status: 'pending' }] } }, asOfSeq: 9 }
+        : undefined),
+    };
+    const ctx = {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : name === 'sessionProjectionCache' ? projectionCache : undefined),
+    };
+    // ② 带前缀的队员 id
+    const prefixed = await runtimeMod.leadForSession(ctx, `session-${MEMBER}`);
+    assert.equal(prefixed.ok, true, `带前缀的队员 id 应能恢复：${JSON.stringify(prefixed)}`);
+    assert.equal(prefixed.lead.id, LEAD);
+    // ③ Lead 自己的会话
+    const asLead = await runtimeMod.leadForSession(ctx, LEAD);
+    assert.equal(asLead.ok, true, `Lead 自己的会话应能恢复：${JSON.stringify(asLead)}`);
+    assert.equal(asLead.historyOnly, true);
+    assert.equal(asLead.lead.id, LEAD);
+    assert.equal(asLead.lead.session, undefined, '合成 lead 不许带 session');
+    // 负对照：不存在的 id 必须失败（不能因为兜底把什么都当团队）
+    const missing = await runtimeMod.leadForSession(ctx, 'nope-9999');
+    assert.equal(missing.ok, false, '不存在的 id 必须失败');
+    // 负对照：投影缓存里 members 只有 lead 一个 → 不算团队
+    const loneCache = { cachedSnapshot: () => ({ values: { agentTeam: { members: [{ id: LEAD, role: 'lead' }] } } }) };
+    const ctxLone = {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : name === 'sessionProjectionCache' ? loneCache : undefined),
+    };
+    const lone = await runtimeMod.leadForSession(ctxLone, LEAD);
+    assert.equal(lone.ok, false, 'members 只有 lead 一个时不该判成团队（实测 213 份缓存里只有 9 份 members 非空）');
+  });
+
   console.log('');
   console.log('lib/tools.js（report_result 的形状校验）');
 
