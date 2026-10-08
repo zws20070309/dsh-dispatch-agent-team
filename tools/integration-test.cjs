@@ -2152,6 +2152,66 @@ async function main() {
       return true;
     });
 
+    // ── 工作区聊天框：teamQuestions / teamSend（用户 2026-10-08 要求「把界面直接接到聊天框」）──
+    //
+    // 分流是硬要求：Lead 走 sessionController.prompt；队员（origin==='subagent'）走
+    // subagents.prompt —— 因为官方 prompt 通道对 subagent 恒拒（session/agent-busy）。
+    const sentPrompts = [];
+    const sentSubagents = [];
+    // chatCtx 必须把 agents 转发给真实 root（leadForSession 靠它找活体 Lead），
+    // 只额外补上 sessionController / subagents 两个「发送通道」服务。
+    const chatCtx = {
+      get: (name) => {
+        if (name === 'sessionController') {
+          return { prompt: async (req) => { sentPrompts.push(req); return { accepted: true }; } };
+        }
+        if (name === 'subagents') {
+          return { prompt: async (req) => { sentSubagents.push(req); return { messageId: 'msg-1' }; } };
+        }
+        try { return root.get(name); } catch { return undefined; }
+      },
+    };
+    // Lead 会话 → sessionController.prompt
+    const sendLead = await restarted.teamSend(chatCtx, 'graph-session-1', 'graph-session-1', '下一步做什么？');
+    check('teamSend：给 Lead 发消息走 sessionController.prompt（mode=queue + requestId）', () => {
+      if (sendLead.ok !== true) return JSON.stringify(sendLead);
+      if (sentPrompts.length !== 1) return `prompt 调用 ${sentPrompts.length} 次`;
+      const req = sentPrompts[0];
+      if (req.mode !== 'queue') return `mode=${req.mode}`;
+      if (typeof req.requestId !== 'string' || req.requestId === '') return '缺 requestId';
+      if (!Array.isArray(req.content) || req.content[0]?.text !== '下一步做什么？') return JSON.stringify(req.content);
+      return true;
+    });
+    // 队员会话 → subagents.prompt（不能走 prompt 通道）
+    const memberId = [...membershipById.keys()].find((k) => k !== graphLead.id);
+    if (memberId !== undefined) {
+      const sendMember = await restarted.teamSend(chatCtx, 'graph-session-1', memberId, '补充：用 Private');
+      check('teamSend：给队员发消息走 subagents.prompt（parentSessionId/childSessionId/mode=continuable）', () => {
+        if (sendMember.ok !== true) return JSON.stringify(sendMember);
+        if (sentSubagents.length !== 1) return `subagents.prompt 调用 ${sentSubagents.length} 次`;
+        const req = sentSubagents[0];
+        if (req.mode !== 'continuable') return `mode=${req.mode}`;
+        if (req.delivery !== 'queue') return `delivery=${req.delivery}`;
+        if (req.childSessionId !== memberId) return `child=${req.childSessionId}`;
+        if (typeof req.parentSessionId !== 'string' || req.parentSessionId === '') return '缺 parentSessionId';
+        return true;
+      });
+    }
+    // check() 是同步的，所以先把异步结果取出来再断言。
+    const emptyBefore = sentPrompts.length;
+    const emptySend = await restarted.teamSend(chatCtx, 'graph-session-1', 'graph-session-1', '   ');
+    check('teamSend：空消息被拒（不发空 prompt 给宿主）', () => {
+      if (emptySend.ok !== false) return '空消息被接受了';
+      if (sentPrompts.length !== emptyBefore) return '空消息仍触发了 prompt';
+      return true;
+    });
+    const askedQuestions = await restarted.teamQuestions(chatCtx, 'graph-session-1', 'graph-session-1');
+    check('teamQuestions：能读出日志里的 ask_user_question（带选项）', () => {
+      if (askedQuestions.ok !== true) return JSON.stringify(askedQuestions);
+      if (!Array.isArray(askedQuestions.questions)) return 'questions 不是数组';
+      return true;
+    });
+
     fakeDomain.listMembers = realListMembers;
     restarted.disable(root, graphLead);
     const gi = agents.indexOf(graphLead);
