@@ -2136,6 +2136,22 @@ async function main() {
       return true;
     });
 
+    // 前缀绕过：白名单按归一化后的 id 比对（两边都去掉 session-）。
+    // 域服务的 member.id 是裸 uuid，而 Lead 的会话 id 带 session- 前缀 ——
+    // 若只归一化一边，`session-<合法 id>` 会被判成越权（正常请求被误拒），
+    // 反过来若两边都不归一化，`<裸 id>` 又会漏过白名单（越权读成功）。
+    const convoPrefixed = await restarted.teamConversation(root, 'graph-session-1', 'session-graph-session-1');
+    check('teamConversation：带 session- 前缀的合法 id 不被误拒（归一化两侧都做）', () => {
+      if (convoPrefixed.ok !== true) return `被误拒了：${JSON.stringify(convoPrefixed)}`;
+      return true;
+    });
+    const convoForeignPrefixed = await restarted.teamConversation(root, 'graph-session-1', 'session-someone-elses-session');
+    check('teamConversation：带前缀的越权 id 仍被拒（前缀不能绕过白名单）', () => {
+      if (convoForeignPrefixed.ok !== false) return `越权成功了：${JSON.stringify(convoForeignPrefixed)}`;
+      if (!convoForeignPrefixed.error.includes('本团队')) return convoForeignPrefixed.error;
+      return true;
+    });
+
     fakeDomain.listMembers = realListMembers;
     restarted.disable(root, graphLead);
     const gi = agents.indexOf(graphLead);
