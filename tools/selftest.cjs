@@ -1419,6 +1419,48 @@ function functionBodyOf(source, needle) {
     assert.ok(!names2.includes('ghost'), `不属于本团队的幽灵成员必须被跳过，实际 ${names2}`);
   });
 
+  await check('extractQuestions：从日志抽 ask_user_question（问题/表头/选项），供工作区聊天框显示', () => {
+    // 用户 2026-10-08：「他提问的时候我在工作区看不到也收不到任何的提问信息」。
+    // 数据源必须是**会话日志**而不是官方 userQuestions 投影 —— 后者只跟踪 mode:'timed'，
+    // 本机默认 legacy → 投影恒空且不报错（dsh-user-questions/.../projection.js:200-215）。
+    const rows = graph.extractQuestions([
+      { type: 'tool/call', seq: 0, time: 100, data: { name: 'read', arguments: '{"file_path":"a"}' } },
+      {
+        type: 'tool/call', seq: 1, time: 200,
+        data: {
+          name: 'ask_user_question',
+          arguments: JSON.stringify({
+            questions: [{
+              id: 'repo_visibility',
+              header: '远程仓库',
+              question: '远程仓库用哪个名字和可见性？',
+              multi_select: false,
+              options: [
+                { label: 'git + Private（推荐）', description: '私有，之后可一条命令改公开。' },
+                { label: 'git + Public', description: '公开，任何人可见。' },
+              ],
+            }],
+          }),
+        },
+      },
+    ], 10);
+    assert.equal(rows.length, 1, `应抽出 1 条提问，实际 ${rows.length}`);
+    const q = rows[0];
+    assert.equal(q.id, 'repo_visibility');
+    assert.equal(q.header, '远程仓库');
+    assert.ok(q.question.includes('可见性'), q.question);
+    assert.equal(q.options.length, 2, `选项数应为 2，实际 ${q.options.length}`);
+    assert.ok(q.options[0].label.includes('Private'));
+    assert.ok(q.options[0].description.includes('私有'));
+    assert.equal(q.multi, false);
+    // 非 ask 工具调用不该产出任何问题
+    const none = graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'read', arguments: '{}' } }], 10);
+    assert.equal(none.length, 0);
+    // 坏 JSON / 缺 questions 字段也不能抛
+    assert.equal(graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'ask_user_question', arguments: '{bad' } }], 10).length, 0);
+    assert.equal(graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'ask_user_question', arguments: '{}' } }], 10).length, 0);
+  });
+
   await check('leadForSession：带 session- 前缀的队员 id 与 Lead 自己会话都能恢复（用户 #5 缺口②③）', async () => {
     // 两个真实缺口（2026-10-08 用真日志实测发现）：
     //   ② 持久层按目录名**精确匹配**，而队员目录是裸 uuid、Lead 目录带 session- 前缀

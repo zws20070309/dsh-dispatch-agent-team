@@ -235,7 +235,22 @@ export async function teamConversation(ctx, sessionId, targetId, limit?);
                                             //    浮动窗口的对话尾部。**只**允许读该会话所在团队
                                             //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
                                             //    同样跳过 fork 继承前缀（否则浮窗里显示的是 Lead 的对话）。
-export async function leadForSession(ctx, sessionId); // 上面两者共用的「成员会话 → Lead agent」解析：
+export async function teamQuestions(ctx, sessionId, targetId);
+                                            //    工作区聊天框：读某个成员「向用户提过的问」
+                                            //    （`ask_user_question` 工具调用）。数据源是**会话日志**
+                                            //    而不是官方 `userQuestions` 投影 —— 后者只跟踪
+                                            //    `mode: "timed"`，本机默认 legacy → 投影恒空且不报错
+                                            //    （dsh-user-questions/lib/types/projection.js:200-215）。
+export async function teamSend(ctx, sessionId, targetId, text);
+                                            //    工作区聊天框：发一条用户消息。**必须按会话类型分流**：
+                                            //    Lead → `sessionController.prompt({sessionId,content,mode:'queue',requestId})`
+                                            //      （dsh-api-session-controller/lib/index.js:850）；
+                                            //    队员（origin==='subagent'）→ prompt 恒被拒
+                                            //      （同文件 :126-132 对 origin 恒 true → `session/agent-busy`），
+                                            //      改走 `subagents.prompt({parentSessionId,childSessionId,
+                                            //      mode:'continuable',delivery:'queue',content})`
+                                            //      （dsh-subagent/lib/index.js:3011），且父会话必须活着。
+export async function leadForSession(ctx, sessionId); // 上面几个共用的「成员会话 → Lead agent」解析：
                                             //    先按 id（含/不含 session- 前缀两种键）找活体 agent，
                                             //    再用域服务 membership.root 回到 Lead。
 ```
