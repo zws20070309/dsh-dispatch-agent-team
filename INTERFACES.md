@@ -220,6 +220,15 @@ export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点
 export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
+export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
+                                            //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。
+                                            //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
+export async function teamConversation(ctx, sessionId, targetId, limit?);
+                                            //    浮动窗口的对话尾部。**只**允许读该会话所在团队
+                                            //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
+export async function leadForSession(ctx, sessionId); // 上面两者共用的「成员会话 → Lead agent」解析：
+                                            //    先按 id（含/不含 session- 前缀两种键）找活体 agent，
+                                            //    再用域服务 membership.root 回到 Lead。
 ```
 
 ### 3.1 `enable()` 必须做的事（顺序固定）
@@ -509,7 +518,11 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     `{op:'get'}` → `{ok:true, config, roles:[...], path, revision, diagnostics}`；
     `{op:'list-models'}` → `{ok:true, groups, failures}`；
     `{op:'set', args:{roles, revision}}` → `{ok:true, config, revision}`，revision 不一致时
-    `{ok:false, conflict:true, revision, error}`；`{op:'reset'}` → `{ok:true, config, revision}`。
+    `{ok:false, conflict:true, revision, error}`；`{op:'reset'}` → `{ok:true, config, revision}`；
+    `{op:'team-graph', args:{sessionId}}` → `{ok:true, graph:{nodes,edges,tasks,totals}, leadSessionId, notes}`
+    （工作区画布的唯一数据源，见 §3 的 teamGraph；未开团队时 `{ok:false, notEnabled:true}`）；
+    `{op:'team-conversation', args:{sessionId, targetId, limit}}` → `{ok:true, rows:[{kind,text,time}]}`
+    （浮动窗口的对话尾部；targetId 不属于该团队 → `{ok:false}`）。
 - UI 要求（「原版 UI 味道」：灰阶、细边框、12–13px、克制，**不要花哨、不要浓 AI 味**）：
   - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（mcp-manager 的 CSS 可抄）。
   - 每个角色一行：角色名（中文）+ 角色 id（等宽小字）+ 使命一句话；「模型」下拉；「思考强度」下拉。

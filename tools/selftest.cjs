@@ -478,7 +478,7 @@ function functionBodyOf(source, needle) {
     // 顺手 import 一个 @deepseek-ai 包，体检脚本会在别的机器上直接崩，而这里是唯一会先红的地方。
     // 注意：参照项目的教训（ARCHITECTURE.md:110-112）：纯文档的边界声明会滞后失效——
     // 所以这里借的是「可跑断言」那一半，不抄一份文档。
-    const PURE_MODULES = ['roster.js', 'playbook.js', 'cache.js', 'resume.js', 'text-clip.js'];
+    const PURE_MODULES = ['roster.js', 'playbook.js', 'cache.js', 'resume.js', 'text-clip.js', 'graph.js'];
     const offenders = [];
     for (const file of PURE_MODULES) {
       const source = readFileSync(path.join(LIB, file), 'utf8');
@@ -917,6 +917,144 @@ function functionBodyOf(source, needle) {
     assert.equal(cache.resolveKeepalivePolicy({}).mode, 'auto');
     assert.equal(cache.resolveKeepalivePolicy({}).source, 'route-family:generic');
     assert.equal(cache.DEFAULT_TTL_SECONDS, 300);
+  });
+
+  console.log('');
+  console.log('lib/graph.js（工作区画布：事件折叠与建图，全部是真实数据的判据）');
+
+  const graph = await load('graph.js');
+
+  await check('normId / normalizePath：id 去前缀、路径取尾 4 段且拒空', () => {
+    assert.equal(graph.normId('session-abc'), 'abc');
+    assert.equal(graph.normId('abc'), 'abc');
+    assert.equal(graph.normId(''), '');
+    assert.equal(graph.normalizePath('D:\\x\\y\\z\\w\\lib\\client.js'), 'z/w/lib/client.js');
+    assert.equal(graph.normalizePath('C:/a/b/c/d/e.txt'), 'b/c/d/e.txt');
+    assert.equal(graph.normalizePath(''), null);
+    assert.equal(graph.normalizePath(undefined), null);
+  });
+
+  await check('foldEvents：usage 按 token-meter 同款 last-wins 去重（同 turn/step 覆盖不是累加）', () => {
+    const s = graph.foldSession([
+      { type: 'assistant/message', seq: 1, time: 10, data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 5, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+      // 同一 turn/step 的第二次结算（重试后修正）：替换，不叠加。
+      { type: 'assistant/message', seq: 2, time: 20, data: { turn: 1, step: 1, usage: { inputTokens: 120, outputTokens: 8, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+    ]);
+    assert.equal(s.usage.uncachedInputTokens, 120);
+    assert.equal(s.usage.outputTokens, 8);
+    assert.equal(s.usage.cacheReadTokens, 900);
+    // pressureFrom = input + cacheRead + cacheWrite（prompt 侧，不含 output），与官方同式。
+    assert.equal(s.pressureTokens, 120 + 900);
+  });
+
+  await check('foldEvents：llm/retry-started 关掉替换槽，让重试的那次重新计入', () => {
+    const base = { type: 'assistant/message', data: { turn: 2, step: 1, usage: { inputTokens: 50, outputTokens: 3, cacheReadTokens: 10, cacheWriteTokens: 0 } } };
+    const s = graph.foldSession([
+      { ...base, seq: 1, time: 1 },
+      { type: 'llm/retry-started', seq: 2, time: 2, data: { turn: 2, step: 1 } },
+      { ...base, seq: 3, time: 3, data: { turn: 2, step: 1, usage: { inputTokens: 60, outputTokens: 4, cacheReadTokens: 10, cacheWriteTokens: 0 } } },
+    ]);
+    // 关掉替换槽后第二条不再被当成「同 turn/step 的替换」，而是各自计入 → 50+60。
+    assert.equal(s.usage.uncachedInputTokens, 110);
+  });
+
+  await check('foldEvents：todo/write 计 done/running/total（画布 TODO 的唯一真值）', () => {
+    const s = graph.foldSession([
+      { type: 'todo/write', seq: 1, time: 1, data: { todos: [
+        { content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }, { content: 'c', status: 'pending' },
+      ] } },
+      // 后写覆盖前写（todo/write 是整表快照，不是增量）。
+      { type: 'todo/write', seq: 2, time: 2, data: { todos: [{ content: 'a', status: 'completed' }] } },
+    ]);
+    assert.deepEqual(s.todo, { done: 1, running: 0, total: 1 });
+  });
+
+  await check('foldEvents：tool/call 的写/读文件进 wrote/read 集（承接边的原料），坏 JSON 跳过不猜', () => {
+    const s = graph.foldSession([
+      { type: 'tool/call', seq: 1, time: 1, data: { name: 'edit', arguments: JSON.stringify({ file_path: 'D:/p/q/r/s/a.ts' }) } },
+      { type: 'tool/call', seq: 2, time: 2, data: { name: 'write', arguments: { file_path: 'p/q/r/s/b.ts' } } },
+      { type: 'tool/call', seq: 3, time: 3, data: { name: 'read', arguments: JSON.stringify({ file_path: 'p/q/r/s/a.ts' }) } },
+      { type: 'tool/call', seq: 4, time: 4, data: { name: 'read', arguments: '{坏 JSON' } },
+      { type: 'tool/call', seq: 5, time: 5, data: { name: 'pwsh', arguments: JSON.stringify({ command: 'ls' }) } },
+    ]);
+    assert.ok(s.wrote.has('q/r/s/a.ts'), '盘符去掉、留最后 4 段');
+    assert.ok(s.wrote.has('q/r/s/b.ts'));
+    assert.ok(s.read.has('q/r/s/a.ts'));
+    assert.equal(s.read.size, 1, '坏 JSON 与无 file_path 的调用都不该进读集');
+  });
+
+  await check('foldEvents：runtimeMs = Σ(turn/end − turn/start)，未闭合的 turn 不计', () => {
+    const s = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 3500, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'turn/start', seq: 3, time: 4000, data: { turn: 2 } }, // 没有对应 end
+    ]);
+    assert.equal(s.runtimeMs, 2500);
+    assert.equal(s.lastTurnEndReason, 'completed');
+  });
+
+  await check('foldEvents：Lead 派活按 targetId、队员交付按 senderName 分账（team/message 集中记在 Lead 会话）', () => {
+    const s = graph.foldSession([
+      { type: 'team/message/queued', seq: 1, time: 1, data: { message: { senderName: 'lead', targetId: 'm1', content: [] } } },
+      { type: 'team/message/queued', seq: 2, time: 2, data: { message: { senderName: 'm1', targetId: 'session-lead', content: [] } } },
+      { type: 'team/message/queued', seq: 3, time: 3, data: { message: { senderName: 'm2', targetId: 'session-lead', content: [] } } },
+    ]);
+    assert.equal(s.teamMsg.get('m1').dispatched, 1);
+    assert.equal(s.msgFrom.get('m1').get('lead').queued, 1);
+    assert.equal(s.msgFrom.get('m2').get('lead').queued, 1);
+  });
+
+  await check('buildGraph：双向承接合并成一条边（both=true、权重相加、files 有界）', () => {
+    const stats = (writes, reads) => { const s = graph.emptyStats(); s.wrote = new Set(writes); s.read = new Set(reads); return s };
+    const bySession = new Map([
+      ['lead', graph.emptyStats()],
+      ['a', stats(['x/f1', 'x/f2'], ['x/f3', 'x/f4'])],
+      ['b', stats(['x/f3', 'x/f4'], ['x/f1', 'x/f2'])],
+    ]);
+    const members = [{ id: 'a', name: 'a', role: 'teammate' }, { id: 'b', name: 'b', role: 'teammate' }];
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members, statsBySession: bySession, tasks: [] });
+    const handoff = g.edges.filter((e) => e.kind === 'handoff');
+    assert.equal(handoff.length, 1, 'a↔b 两个方向合并成一条');
+    assert.equal(handoff[0].both, true);
+    assert.equal(handoff[0].weight, 4, 'a写b读2 + b写a读2');
+    assert.ok(handoff[0].files.length <= 3, '样例文件名有界（tooltip 不撑大响应）');
+  });
+
+  await check('buildGraph：交付线由 Lead 账本里「该队员发给 lead 的消息」点亮（不是投递回执）', () => {
+    const lead = graph.emptyStats();
+    lead.msgFrom.set('a', new Map([['lead', { queued: 2, delivered: 0 }]]));
+    const bySession = new Map([['lead', lead], ['a', graph.emptyStats()], ['b', graph.emptyStats()]]);
+    const members = [{ id: 'a', name: 'a', role: 'teammate' }, { id: 'b', name: 'b', role: 'teammate' }];
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members, statsBySession: bySession, tasks: [] });
+    const dispatch = g.edges.filter((e) => e.kind === 'dispatch');
+    const edgeA = dispatch.find((e) => e.to === 'a');
+    const edgeB = dispatch.find((e) => e.to === 'b');
+    assert.equal(edgeA.delivered, true);
+    assert.equal(edgeA.reported, 2);
+    assert.equal(edgeB.delivered, false, '没交过话的队员不该被点亮');
+    assert.equal(dispatch.length, 2, '每个成员都有一条线（spawn 即派活），哪怕权重为 0');
+  });
+
+  await check('buildGraph：汇总 cacheHit = 全队 cacheRead / (cacheRead+新输入)，output 单列', () => {
+    const mk = (out, inp, cache) => { const s = graph.emptyStats(); s.usage = { uncachedInputTokens: inp, outputTokens: out, cacheReadTokens: cache, cacheWriteTokens: 0 }; return s };
+    const bySession = new Map([['lead', mk(10, 40, 60)], ['a', mk(5, 10, 90)]]);
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members: [{ id: 'a', name: 'a', role: 'teammate' }], statsBySession: bySession, tasks: [] });
+    // 总 cacheRead=150，总 prompt 侧 = (40+60)+(10+90)=200 → 150/200=0.75
+    assert.ok(Math.abs(g.totals.cacheHit - 0.75) < 1e-9, `cacheHit=${g.totals.cacheHit}`);
+    assert.equal(g.totals.outputTokens, 15);
+    assert.equal(g.totals.totalTokens, 215);
+  });
+
+  await check('extractConversation：抽 user/assistant/tool 行、按 limit 取尾部、正文有界', () => {
+    const long = 'x'.repeat(5000);
+    const rows = graph.extractConversation([
+      { type: 'user/message', data: { content: [{ type: 'text', text: '你好' }] } },
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }, { type: 'tool-call', name: 'read', arguments: '{"file_path":"a"}' }] } } },
+    ], 10);
+    assert.ok(rows.some((r) => r.kind === 'user' && r.text === '你好'));
+    const asst = rows.find((r) => r.kind === 'assistant');
+    assert.ok(asst.text.length <= 2001 && asst.text.endsWith('…'), '正文按 LINE_MAX 截断（代理对安全）');
+    assert.ok(rows.some((r) => r.kind === 'tool' && /read\(/.test(r.text)));
   });
 
   console.log('');

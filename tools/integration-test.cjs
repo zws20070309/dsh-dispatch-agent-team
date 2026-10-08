@@ -220,7 +220,9 @@ async function main() {
     name: 'fake-team-domain',
     apply(ctx) {
       ctx.provide('agentTeams', fakeDomain);
-      ctx.provide('agents', { list: () => [...agents] });
+      // get(id) 与真 dsh-agent 注册表同语义（agent.id === session.id，dsh-agent/lib/index.js:591-595）：
+      // lib/graph.js 按成员 id 取活体 agent，缺了 get 会让所有队员都走持久兜底分支。
+      ctx.provide('agents', { list: () => [...agents], get: (id) => agents.find((candidate) => candidate.id === id) });
     },
   });
   await tick();
@@ -2058,6 +2060,89 @@ async function main() {
   check('关团后：会话记录被删除（否则下次重启会自己开回来）', () => (
     resume.isEnabledSession('resume-session-1') === false ? true : '记录还在磁盘上'
   ));
+
+  // ── 8.2.1) 工作区画布的宿主接线（teamGraph / teamConversation / leadForSession） ──
+  // 这些是纯函数单测（selftest 的 lib/graph.js 那组）够不到的部分：闸门、成员→Lead 解析、
+  // 越权拒绝、以及「没有活体 agent 且无持久化」时的如实降级。全走**真 runtime 导出**。
+  {
+    // 先重新开一个团队（上面 disable 把 revived 关了），并造一个「只有域服务认识、但没有活体 agent」的队员。
+    const graphLead = { id: 'graph-session-1', session: { id: 'graph-session-1' }, ctx: agentCtx(resumeOldScope.ctx) };
+    agents.push(graphLead);
+    membershipById.set(graphLead.id, { root: graphLead, id: graphLead.id, role: 'lead', name: 'lead' });
+    // 队员：有 membership（root=graphLead）。live 队员进 agents 数组（走活体统计），
+    // 无活体队员（graph-ghost-1）故意不进，模拟「域日志记得它、但进程里没有它」的重启后情形。
+    const graphMember = { id: 'graph-member-1', session: { id: 'graph-member-1', seq: 0, eventAt: () => undefined }, ctx: agentCtx(resumeOldScope.ctx) };
+    membershipById.set(graphMember.id, { root: graphLead, id: graphMember.id, role: 'teammate', name: 'scout' });
+    membershipById.set('graph-ghost-1', { root: graphLead, id: 'graph-ghost-1', role: 'teammate', name: 'builder' });
+    agents.push(graphMember);
+    const realListMembers = fakeDomain.listMembers;
+    fakeDomain.listMembers = (agent) => {
+      const rows = realListMembers.call(fakeDomain, agent);
+      if (agent === graphLead) rows.push({ id: graphMember.id, name: 'scout', role: 'teammate', status: 'inactive' });
+      if (agent === graphLead) rows.push({ id: 'graph-ghost-1', name: 'builder', role: 'teammate', status: 'inactive' });
+      return rows;
+    };
+    await restarted.enable(root, graphLead, { source: 'integration-test' });
+
+    const graphOnLead = await restarted.teamGraph(root, 'graph-session-1');
+    check('teamGraph：开团的 Lead 会话能出图，无活体的队员走持久兜底并如实记一条 note（不是静默 0）', () => {
+      if (graphOnLead.ok !== true) return JSON.stringify(graphOnLead);
+      const names = graphOnLead.graph.nodes.map((n) => n.name);
+      if (!names.includes('lead')) return `没有 lead 节点：${names.join(',')}`;
+      if (!names.includes('scout') || !names.includes('builder')) return `两个队员没都画出来：${names.join(',')}`;
+      const notes = graphOnLead.notes ?? [];
+      // 无活体（graph-ghost-1）+ 无 sessionPersistence → 必须记降级 note；有活体的 graph-member-1 不该记。
+      if (!notes.some((line) => line.includes('graph-ghost-1') && line.includes('sessionPersistence'))) {
+        return `没记降级 note（读不到持久化必须说明，不能显示成 0）：${JSON.stringify(notes)}`;
+      }
+      if (notes.some((line) => line.includes('graph-member-1'))) return `有活体的队员不该被记成降级：${JSON.stringify(notes)}`;
+      return true;
+    });
+
+    const leadFromMember = await restarted.leadForSession(root, 'graph-member-1');
+    check('leadForSession：从有活体的队员会话回溯到 Lead（成员面板在队员会话里也显示，入口必须能打开）', () => {
+      if (leadFromMember.ok !== true) return JSON.stringify(leadFromMember);
+      if (leadFromMember.lead?.id !== 'graph-session-1') return `回溯到错的 Lead：${leadFromMember.lead?.id}`;
+      return true;
+    });
+
+    const graphFromMember = await restarted.teamGraph(root, 'graph-member-1');
+    check('teamGraph：从队员会话也能出同一张图（leadForSession→Lead→采集，不只 Lead 会话可开）', () => {
+      if (graphFromMember.ok !== true) return JSON.stringify(graphFromMember);
+      if (graphFromMember.leadSessionId !== 'graph-session-1') return `leadSessionId=${graphFromMember.leadSessionId}`;
+      return true;
+    });
+
+    const graphNotEnabled = await restarted.teamGraph(root, 'fresh-session-1');
+    check('teamGraph：没开团的会话 → notEnabled（页面据此提示先 /team，而不是画一张空图）', () => {
+      if (graphNotEnabled.ok !== false) return JSON.stringify(graphNotEnabled);
+      if (graphNotEnabled.notEnabled !== true && !String(graphNotEnabled.error).includes('没有活体') && !String(graphNotEnabled.error).includes('未开启')) {
+        return `notEnabled 标志缺失：${JSON.stringify(graphNotEnabled)}`;
+      }
+      return true;
+    });
+
+    const convoForeign = await restarted.teamConversation(root, 'graph-session-1', 'someone-elses-session');
+    check('teamConversation：越权 targetId 被拒（只能读本团队成员，不能拿这个 op 翻别的会话）', () => {
+      if (convoForeign.ok !== false) return JSON.stringify(convoForeign);
+      if (!convoForeign.error.includes('本团队')) return convoForeign.error;
+      return true;
+    });
+
+    const convoSelf = await restarted.teamConversation(root, 'graph-session-1', 'graph-session-1');
+    check('teamConversation：Lead 自己的会话允许读（无活体日志时如实返回空 rows + note，不报越权）', () => {
+      if (convoSelf.ok !== true) return JSON.stringify(convoSelf);
+      if (!Array.isArray(convoSelf.rows)) return 'rows 不是数组';
+      return true;
+    });
+
+    fakeDomain.listMembers = realListMembers;
+    restarted.disable(root, graphLead);
+    const gi = agents.indexOf(graphLead);
+    if (gi >= 0) agents.splice(gi, 1);
+    membershipById.delete(graphLead.id);
+    membershipById.delete('graph-member-1');
+  }
 
   // ── 8.3) wake_teammate：Lead 专属的「叫醒被输出上限截断的队员」 ─────────────────────
   const aliasSent = [];
