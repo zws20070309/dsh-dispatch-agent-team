@@ -1358,6 +1358,67 @@ function functionBodyOf(source, needle) {
     assert.ok(g.notes.some((n) => n.includes('重建')), '要如实说明这是历史快照');
   });
 
+  await check('collectGraph：刚派出的队员不能因本地账本未登记而被跳过（用户报的实时更新问题）', async () => {
+    // 用户原话（2026-10-08）：「我在只有两个队员的时候点进去工作区，他又派了一个队员，
+    // 但是工作区没有同时及时更新……还是只能看到两个队员，重进才能看到三个」。
+    //
+    // 根因：本插件的启用账本（state.installed）挂在 agent 生命周期事件上，而域服务的成员名单
+    // 会**更早**出现这个新队员。旧写法一律 `isTeamEnabled(agent) !== true → continue`，
+    // 于是新队员被整条跳过；重进工作区时账本已补齐，所以又能看到。
+    // 现在的判据：Lead 自己的日志里记着这个成员（team/member 事件）就认它。
+    const LEAD = 'lag-lead';
+    const OLD = 'lag-old';
+    const NEW = 'lag-new';
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 1, data: { member: { id: OLD, name: 'builder-old' } } },
+      { type: 'team/member', seq: 1, time: 2, data: { member: { id: NEW, name: 'builder-new' } } },
+      { type: 'turn/start', seq: 2, time: 3, data: { turn: 1 } },
+      { type: 'turn/end', seq: 3, time: 9000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const leadSession = { id: LEAD, seq: leadEvents.length, inheritedEventCount: 0, eventAt: (s) => leadEvents[s] };
+    const mkSession = (id) => ({ id, seq: 1, inheritedEventCount: 0, eventAt: () => ({ type: 'turn/start', time: 100, data: { turn: 1 } }) });
+    const agents = {
+      [LEAD]: { id: LEAD, session: leadSession },
+      [OLD]: { id: OLD, session: mkSession(OLD) },
+      [NEW]: { id: NEW, session: mkSession(NEW) },
+    };
+    const ctx = { agents: { list: () => Object.values(agents), get: (id) => agents[id] }, get: () => undefined };
+    const agentTeams = {
+      // 域服务**已经**把新队员列进来了（它比本地账本快）
+      listMembers: () => [
+        { id: LEAD, name: 'lead', role: 'lead', status: 'active' },
+        { id: OLD, name: 'builder-old', role: 'teammate', status: 'active' },
+        { id: NEW, name: 'builder-new', role: 'teammate', status: 'provisioning' },
+      ],
+      listTasks: () => [],
+    };
+    const r = await graph.collectGraph({
+      ctx, agentTeams, leadAgent: agents[LEAD],
+      // 只认老队员：模拟「账本还没跟上刚派出去的新队员」
+      isTeamEnabled: (agent) => agent?.id === LEAD || agent?.id === OLD,
+    });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const names = r.graph.nodes.map((n) => n.name).sort().join(',');
+    assert.equal(names, 'builder-new,builder-old,lead', `新队员被跳过了（旧实现的实际表现）：${names}`);
+    // 对照：**不在 Lead 日志里**的成员仍然要被跳过（不能为了修这个把幽灵节点放进来）
+    const agentTeamsGhost = {
+      listMembers: () => [
+        { id: LEAD, name: 'lead', role: 'lead', status: 'active' },
+        { id: OLD, name: 'builder-old', role: 'teammate', status: 'active' },
+        { id: 'ghost-1', name: 'builder-ghost', role: 'teammate', status: 'active' },
+      ],
+      listTasks: () => [],
+    };
+    const agentsGhost = { ...agents, 'ghost-1': { id: 'ghost-1', session: mkSession('ghost-1') } };
+    const ctxGhost = { agents: { list: () => Object.values(agentsGhost), get: (id) => agentsGhost[id] }, get: () => undefined };
+    const g2 = await graph.collectGraph({
+      ctx: ctxGhost, agentTeams: agentTeamsGhost, leadAgent: agentsGhost[LEAD],
+      isTeamEnabled: (agent) => agent?.id === LEAD || agent?.id === OLD,
+    });
+    const names2 = g2.graph.nodes.map((n) => n.name).sort().join(',');
+    assert.ok(!names2.includes('ghost'), `不属于本团队的幽灵成员必须被跳过，实际 ${names2}`);
+  });
+
   await check('leadForSession：带 session- 前缀的队员 id 与 Lead 自己会话都能恢复（用户 #5 缺口②③）', async () => {
     // 两个真实缺口（2026-10-08 用真日志实测发现）：
     //   ② 持久层按目录名**精确匹配**，而队员目录是裸 uuid、Lead 目录带 session- 前缀
