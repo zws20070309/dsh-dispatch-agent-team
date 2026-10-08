@@ -158,13 +158,23 @@ async function main() {
       throw new Error(`client.js 只应该 require('react')，实际 require 了 "${specifier}"`);
     });
     let component;
+    let anchorComponent;
     let localeDict;
     let injections = 0;
+    const registered = [];
     const ctx = {
       effect(fn) { fn(); return () => {}; },
       slots: Object.freeze({
         inject(name, factory) { injections += 1; return factory(); },
-        register(slot, candidate) { component = candidate; return () => {}; },
+        register(slot, candidate) {
+          registered.push(slot.name);
+          // 2026-10-08：本包现在注册**两个**组件（配置页 + 工作区入口锚点）。
+          // 锚点必须注册在 conversation.session.header.actions（官方 TeamAction 同一个槽），
+          // 配置页必须留在 plugins.bundle.config —— 各拿各的，别互相覆盖。
+          if (slot.name === 'plugins.bundle.config') component = candidate;
+          if (slot.name === 'conversation.session.header.actions') anchorComponent = candidate;
+          return () => {};
+        },
       }),
       locale: Object.freeze({ register(namespace, dicts) { localeDict = dicts; return () => {}; } }),
     };
@@ -186,6 +196,8 @@ async function main() {
     return {
       exportsObject,
       injections: () => injections,
+      registered: () => registered,
+      anchor: () => anchorComponent,
       /** 再渲染一轮（用于交互之后）。 */
       repaint() { tree = runtime.render(component, props); return tree; },
       tree: () => tree,
@@ -204,15 +216,35 @@ async function main() {
       get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: '1:1', diagnostics: [] },
       'list-models': { ok: true, groups: [], failures: [] },
     });
-    check('注册形状：id / name / inject / 槽位与字典各注册一次', () => {
+    check('注册形状：id / name / inject / 两个槽位与字典各注册一次', () => {
       if (registration.id !== '@zws/dsh-dispatch-agent-team') return `id=${registration.id}`;
       if (page.exportsObject.name !== 'dsh-dispatch-agent-team-client') return `name=${page.exportsObject.name}`;
       const inject = page.exportsObject.inject;
       if (!Array.isArray(inject) || !inject.includes('slots') || !inject.includes('locale')) {
         return `inject=${JSON.stringify(inject)}（需要 slots 与 locale）`;
       }
-      if (page.injections() !== 1) return `slots.inject 调用了 ${page.injections()} 次`;
+      if (page.injections() !== 2) return `slots.inject 调用了 ${page.injections()} 次（应为 2：配置页 + 工作区锚点）`;
+      const names = page.registered();
+      if (!names.includes('plugins.bundle.config')) return '配置页槽位没注册';
+      if (!names.includes('conversation.session.header.actions')) return '工作区锚点槽位没注册（官方 TeamAction 同一个槽）';
+      if (typeof page.anchor() !== 'function') return '工作区锚点组件没注册';
       if (page.dict() === undefined || typeof page.dict().zh !== 'object') return '字典没注册';
+      return true;
+    });
+
+    check('工作区锚点：渲染隐藏 span 并把 sessionId 写进 data-ws-session', () => {
+      // 锚点是纯函数（无 hooks），直接调用即可。
+      const tree = page.anchor()({ sessionId: 'session-abc' });
+      const props = tree === undefined || tree === null ? {} : tree.props;
+      if (tree === undefined || tree === null || tree.type !== 'span') return '锚点不是 span';
+      if (props['data-ws-session'] !== 'session-abc') return `data-ws-session=${String(props['data-ws-session'])}`;
+      if (props.style === undefined || props.style.display !== 'none') return '锚点没有隐藏（会往会话顶栏塞一个可见空位）';
+      return true;
+    });
+
+    check('工作区锚点：sessionId 缺失时不抛错、写空串', () => {
+      const tree = page.anchor()({});
+      if (tree.props['data-ws-session'] !== '') return '缺失的 sessionId 应归一成空串';
       return true;
     });
   }
