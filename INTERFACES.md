@@ -223,9 +223,18 @@ export function sessionMemory();           // -> 会话级团队记忆快照（�
 export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
                                             //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。
                                             //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
+                                            //    **口径**：每个会话只统计「它自己的事件」，必须跳过
+                                            //    fork 继承来的父会话前缀（官方 eventAt(seq) 是裸下标、
+                                            //    含前缀；ownEvents()/isOwnSeq() 才是排掉它的 API）。
+                                            //    不跳的后果（2026-10-08 实测）：3 个 fork 成员各带
+                                            //    884 条 Lead 历史 → 底栏总 token 多算 40659870（+28.8%）、
+                                            //    承接边 32（真值 14）、队员的 wrote/read/todo 全是 Lead 的。
+                                            //    判据：session.inheritedEventCount，拿不到就扫
+                                            //    subagent/descriptor 的位置（ownStartSeq/ownStartOfEvents）。
 export async function teamConversation(ctx, sessionId, targetId, limit?);
                                             //    浮动窗口的对话尾部。**只**允许读该会话所在团队
                                             //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
+                                            //    同样跳过 fork 继承前缀（否则浮窗里显示的是 Lead 的对话）。
 export async function leadForSession(ctx, sessionId); // 上面两者共用的「成员会话 → Lead agent」解析：
                                             //    先按 id（含/不含 session- 前缀两种键）找活体 agent，
                                             //    再用域服务 membership.root 回到 Lead。
