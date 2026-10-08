@@ -351,6 +351,31 @@ check('工作区入口依赖的官方面板标记与 sessionId prop 仍在（改
   return missing.length === 0 ? true : `官方这些标记变了，lib/client.js 的入口注入要跟着改：${missing.join('、')}`;
 });
 
+// 8d) 工作区画布读取的官方**团队事件字段名**（2026-10-08 落地时加的闸门）。
+// lib/graph.js 折叠会话日志时按字段名取值：读错了不会抛错，只会让某条通道**静默变成 0**
+// （实测踩过两次：team/message/delivered 是扁平形状、不带 message 包装，按 data.message 读
+// 让投递回执一直是死代码）。官方改名时这条闸门必须先红，而不是等用户发现「线不见了」。
+const officialTeamCore = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
+check('工作区读取的官方团队事件字段名仍在（改名会让画布的边/统计静默变 0）', () => {
+  if (officialTeamCore === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
+  const missing = [];
+  // team/message/queued：data.message.{id,senderName,targetId}（lib/graph.js 的 msgFrom/msgSender 依赖）
+  if (!/senderName:\s*[A-Za-z_$][\w$]*\.name/u.test(officialTeamCore) && !officialTeamCore.includes('senderName:')) {
+    missing.push('team/message 的 senderName');
+  }
+  if (!officialTeamCore.includes('targetId')) missing.push('team/message 的 targetId');
+  // team/message/delivered：**扁平**（version/teamId/messageId/targetId），不是 message 包装。
+  if (!/appendAndFlush\([^)]*"team\/message\/delivered"/u.test(officialTeamCore)) {
+    missing.push('team/message/delivered 的落盘点');
+  }
+  if (!officialTeamCore.includes('messageId')) missing.push('team/message/delivered 的 messageId');
+  // team/member：data.member.{id,name}（节点名来源）
+  if (!officialTeamCore.includes('"team/member"')) missing.push('team/member 事件名');
+  return missing.length === 0
+    ? true
+    : `官方团队事件的字段/事件名变了，lib/graph.js 的折叠要跟着改（否则画布静默缺边或统计为 0）：${missing.join('、')}`;
+});
+
 // 9) patch 层的**顺序语义**（2026-09-28 的 P0 教训）。
 // 官方 agent-team-profile 用 `- insert:` **新建** agent-team / tool-agent-team / ui-agent-team 三行；
 // patch 层按 `dsh.profile.bundles` 顺序应用，而 DSH 插件页启用 bundle 时是 **append 到末尾**。
