@@ -995,13 +995,28 @@ function functionBodyOf(source, needle) {
 
   await check('foldEvents：Lead 派活按 targetId、队员交付按 senderName 分账（team/message 集中记在 Lead 会话）', () => {
     const s = graph.foldSession([
-      { type: 'team/message/queued', seq: 1, time: 1, data: { message: { senderName: 'lead', targetId: 'm1', content: [] } } },
-      { type: 'team/message/queued', seq: 2, time: 2, data: { message: { senderName: 'm1', targetId: 'session-lead', content: [] } } },
-      { type: 'team/message/queued', seq: 3, time: 3, data: { message: { senderName: 'm2', targetId: 'session-lead', content: [] } } },
+      { type: 'team/message/queued', seq: 1, time: 1, data: { message: { id: 'q1', senderName: 'lead', targetId: 'm1', content: [] } } },
+      { type: 'team/message/queued', seq: 2, time: 2, data: { message: { id: 'q2', senderName: 'm1', targetId: 'session-lead', content: [] } } },
+      { type: 'team/message/queued', seq: 3, time: 3, data: { message: { id: 'q3', senderName: 'm2', targetId: 'session-lead', content: [] } } },
     ]);
     assert.equal(s.teamMsg.get('m1').dispatched, 1);
     assert.equal(s.msgFrom.get('m1').get('lead').queued, 1);
     assert.equal(s.msgFrom.get('m2').get('lead').queued, 1);
+  });
+
+  await check('foldEvents：team/message/delivered 是**扁平形状**（只有 messageId/targetId），靠 queued 的表回连发件人', () => {
+    // 回归：旧实现按 data.message 读 delivered，而官方 delivered 根本没有 message 包装
+    // （dsh-experimental-agent-team/lib/index.js:958-962）→ 投递回执一直是死代码，delivered 永远 0。
+    const s = graph.foldSession([
+      { type: 'team/message/queued', seq: 1, time: 1, data: { message: { id: 'q1', senderName: 'lead', targetId: 'm1', content: [] } } },
+      { type: 'team/message/queued', seq: 2, time: 2, data: { message: { id: 'q2', senderName: 'm1', targetId: 'session-lead', content: [] } } },
+      // delivered：扁平，无 message 包装。
+      { type: 'team/message/delivered', seq: 3, time: 3, data: { messageId: 'q1', targetId: 'm1' } },
+      { type: 'team/message/delivered', seq: 4, time: 4, data: { messageId: 'q2', targetId: 'session-lead' } },
+    ]);
+    assert.equal(s.teamMsg.get('m1').delivered, 1, 'Lead 派出去的投递计数');
+    assert.equal(s.msgFrom.get('m1').get('lead').delivered, 1, '队员投递回执按 messageId 回连到发件人');
+    assert.equal(s.msgFrom.get('m1').get('lead').queued, 1, '排队与投递各自独立计数');
   });
 
   await check('buildGraph：双向承接合并成一条边（both=true、权重相加、files 有界）', () => {
