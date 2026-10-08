@@ -1072,6 +1072,52 @@ function functionBodyOf(source, needle) {
     assert.ok(rows.some((r) => r.kind === 'tool' && /read\(/.test(r.text)));
   });
 
+  await check('collectGraph：持久兜底必须走 ctx.get()（属性访问未 inject 的服务会抛错 → 兜底恒失效）', async () => {
+    // 回归：原实现写 `ctx.sessionPersistence ?? ctx.get('sessionPersistence')`。
+    // cordis 里属性访问一个不在本 fiber inject 列表里的服务会抛
+    // `cannot get property "x" without inject`，于是属性访问先抛、`??` 被 try 吞掉，
+    // persistence 恒为 undefined → 宿主重启后**所有队员的统计都显示成 0**（假数据）。
+    // 这条断言用一个「只提供 get、属性访问抛错」的 ctx 替身把它钉住。
+    const TEAM = 'selftest-lead';
+    const MEMBER = 'selftest-member';
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 1, data: { member: { id: MEMBER, name: 'builder-z', phase: 'active' } } },
+      { type: 'team/message/queued', seq: 1, time: 2, data: { message: { id: 'q1', senderName: 'lead', targetId: MEMBER, content: [] } } },
+    ];
+    const memberEvents = [
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 1, time: 2000, data: { turn: 1, step: 1, usage: { inputTokens: 500, outputTokens: 50, cacheReadTokens: 4500, cacheWriteTokens: 0 } } },
+      { type: 'turn/end', seq: 2, time: 4000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const session = (id, events) => ({ id, seq: events.length, eventAt: (s) => events[s] });
+    const leadSession = session(TEAM, leadEvents);
+    const persistence = {
+      open: async (id) => (id === MEMBER
+        ? { header: {}, inheritedEventCount: 0, read: async () => ({ events: memberEvents }), close: async () => {} }
+        : (() => { throw new Error('not persisted'); })()),
+    };
+    const ctx = {
+      agents: { list: () => [{ id: TEAM, session: leadSession }], get: (id) => (id === TEAM ? { id: TEAM, session: leadSession } : undefined) },
+      get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+      // 关键：属性访问必须抛错（复刻 cordis 的 without inject 行为）。
+      get sessionPersistence() { throw new Error('cannot get property "sessionPersistence" without inject'); },
+    };
+    const agentTeams = {
+      listMembers: () => [
+        { id: TEAM, name: 'lead', role: 'lead', status: 'active' },
+        { id: MEMBER, name: 'builder-z', role: 'teammate', status: 'inactive' },
+      ],
+      listTasks: () => [],
+    };
+    const result = await graph.collectGraph({ ctx, agentTeams, leadAgent: { id: TEAM, session: leadSession }, isTeamEnabled: () => true });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const node = result.graph.nodes.find((n) => n.name === 'builder-z');
+    assert.ok(node !== undefined, '无活体的队员没被画出来');
+    assert.equal(node.totalTokens, 5050, '持久兜底没生效 → 统计成了 0（假数据）');
+    assert.ok(Math.abs(node.cacheHit - 0.9) < 1e-9, `cacheHit=${node.cacheHit}`);
+    assert.equal(node.runtimeMs, 3000);
+  });
+
   console.log('');
   console.log('lib/tools.js（report_result 的形状校验）');
 
