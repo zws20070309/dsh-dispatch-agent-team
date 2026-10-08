@@ -331,6 +331,26 @@ check('官方团队 UI 包仍存在（我们用它做成员列表/看板）', ()
     ? true
     : 'dsh-experimental-client-ui-agent-team 消失 —— cordis.patch.yml 里 dispatch-agent-team-panel 行需要删掉或换实现'));
 
+// 8c) 工作区入口依赖的官方 DOM 标记与槽位（2026-10-08 落地时加的闸门）。
+// 入口「进入工作区」是注入进**官方成员面板**的（面板整体在只读 app.asar 里，我们改不动它的 JSX），
+// 靠的是三个官方事实：面板根的 data-team-panel、触发器的 data-team-action、
+// 以及我们注册的槽 conversation.session.header.actions 会注入的 sessionId prop。
+// 官方任何一处改名都会让按钮**静默不出现**（用户看不到入口，也没有任何报错）——
+// 所以这三条必须钉成可跑断言，飘了就红，而不是等用户报「入口没了」。
+const officialTeamUi = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-client-ui-agent-team/lib/client.js') || '';
+const officialUiSession = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-session/lib/client.js') || '';
+check('工作区入口依赖的官方面板标记与 sessionId prop 仍在（改名会让按钮静默消失）', () => {
+  if (officialTeamUi === '') return '读不到 dsh-experimental-client-ui-agent-team/lib/client.js';
+  if (officialUiSession === '') return '读不到 dsh-client-ui-session/lib/client.js';
+  const missing = [];
+  if (!officialTeamUi.includes('"data-team-panel"')) missing.push('面板根 data-team-panel');
+  if (!officialTeamUi.includes('"data-team-action"')) missing.push('触发器 data-team-action');
+  if (!officialTeamUi.includes('"conversation.session.header.actions"')) missing.push('槽 conversation.session.header.actions');
+  // sessionId 是 session 作用域的标准注入 prop（BUILTIN_SOURCE.props）；锚点靠它拿权威会话 id。
+  if (!/props:\s*\[\s*"sessionId"/u.test(officialUiSession)) missing.push('session 作用域注入的 sessionId prop');
+  return missing.length === 0 ? true : `官方这些标记变了，lib/client.js 的入口注入要跟着改：${missing.join('、')}`;
+});
+
 // 9) patch 层的**顺序语义**（2026-09-28 的 P0 教训）。
 // 官方 agent-team-profile 用 `- insert:` **新建** agent-team / tool-agent-team / ui-agent-team 三行；
 // patch 层按 `dsh.profile.bundles` 顺序应用，而 DSH 插件页启用 bundle 时是 **append 到末尾**。
