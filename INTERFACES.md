@@ -250,6 +250,21 @@ export async function teamSend(ctx, sessionId, targetId, text);
                                             //      改走 `subagents.prompt({parentSessionId,childSessionId,
                                             //      mode:'continuable',delivery:'queue',content})`
                                             //      （dsh-subagent/lib/index.js:3011），且父会话必须活着。
+export async function teamAnswer(ctx, sessionId, targetId, callId, answers);
+                                             //    工作区提问卡：回答一次 ask_user_question。两条通道依次：
+                                             //    ① `userQuestions.answer(agent, callId, {answers})`
+                                             //      （dsh-user-questions/lib/index.js:552）—— 只对
+                                             //      **continued** 态有效（:554），答案写成
+                                             //      `user-question-reply` 用户消息（:561-582，官方投影
+                                             //      判「已回答」的同一条记录，projection.js:261-267）；
+                                             //      队员抛 DELEGATED_CALLER（assertLiveRoot :531-535）。
+                                             //    ② 兜底：格式化成一条消息走 teamSend（queue 投递，
+                                             //      **不打断当前轮**）。返回 {ok, via:'userQuestions'|'message'}。
+                                             //    ⚠️ 不做「插件注册 user-questions/request waterfall 抢答」：
+                                             //      官方 client 已占该席位（dsh-client-ui-user-questions/
+                                             //      lib/client.js:1927），抢单会挤掉官方提问卡造成双答案。
+                                             //    已回答判定在**数据层**：extractQuestions 配对
+                                             //      tool/result 的 answers 批次（实测已答提问都有 result）。
 export async function leadForSession(ctx, sessionId); // 上面几个共用的「成员会话 → Lead agent」解析：
                                             //    先按 id（含/不含 session- 前缀两种键）找活体 agent，
                                             //    再用域服务 membership.root 回到 Lead。

@@ -1060,7 +1060,7 @@ function functionBodyOf(source, needle) {
     assert.equal(g.totals.totalTokens, 215);
   });
 
-  await check('extractConversation：过滤框架注入、工具调用聚合成计数、正文有界、按 limit 取尾部', () => {
+  await check('extractConversation：过滤注入、工具逐条成官方风格行、正文有界、按 limit 取尾部', () => {
     const long = 'x'.repeat(5000);
     const rows = graph.extractConversation([
       // 框架注入：都不该出现在对话里（用户 2026-10-08 报的 #1）
@@ -1071,8 +1071,14 @@ function functionBodyOf(source, needle) {
       { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] } },
       // 队员派活简报（source.kind 是 user，但内容是本插件生成的使命提示词）→ 也要过滤
       { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '<system-reminder>\n你是智能体团队的队员 "x"，角色 builder' }] } },
-      // 助手正文 + 两次工具调用（应聚合成一行计数）
-      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }, { type: 'tool-call', name: 'read', arguments: '{"file_path":"a"}' }, { type: 'tool-call', name: 'write', arguments: '{"file_path":"b"}' }] } } },
+      // 助手正文 + 两次工具调用。⚠️ 2026-10-09 起工具调用**逐条成行**（用户：「弹窗要能看到
+      // 读取文件、修改文件、调用工具」）；行以 tool/call 事件为准（实测 7/7 会话里
+      // assistant 块的 callId 与事件一一对应，见 .probe/probe-blocks-vs-events.cjs）。
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{"file_path":"a"}' }, { type: 'tool-call', id: 'c2', name: 'write', arguments: '{"file_path":"b"}' }] } } },
+      { type: 'tool/call', data: { callId: 'c1', name: 'read', arguments: '{"file_path":"a"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'ok' }], isError: false } } },
+      { type: 'tool/call', data: { callId: 'c2', name: 'write', arguments: '{"file_path":"b"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c2' }, content: [{ type: 'text', text: 'boom' }], isError: true } } },
       // 团队消息（成员日志里的 user/message 形状）
       { type: 'user/message', data: { source: { kind: 'team-message', messageId: 'm1' }, content: [{ type: 'text', text: 'lead → 补充情报' }] } },
       // 同一条团队消息的 queued 版本（Lead 日志）→ 靠 messageId 去重，只显示一次
@@ -1083,13 +1089,22 @@ function functionBodyOf(source, needle) {
       `框架注入漏进了对话：${JSON.stringify(rows.map((r) => r.text.slice(0, 40)))}`);
     const asst = rows.find((r) => r.kind === 'assistant');
     assert.ok(asst.text.length <= 2001 && asst.text.endsWith('…'), '正文按 LINE_MAX 截断（代理对安全）');
-    // 工具调用聚合成一行计数（不再逐条刷屏）
-    const toolRows = rows.filter((r) => r.kind === 'tools');
-    assert.equal(toolRows.length, 1, `工具调用应聚合成 1 行，实际 ${toolRows.length} 行`);
-    assert.equal(toolRows[0].count, 2, `计数应为 2，实际 ${toolRows[0].count}`);
-    assert.ok(!rows.some((r) => /read\(\{/.test(r.text)), '工具调用参数不该逐条列出');
+    // 工具行：官方标签 + 目标摘要；assistant 内嵌的块不重复成行。
+    const toolRows = rows.filter((r) => r.kind === 'tool');
+    assert.equal(toolRows.length, 2, `两条工具调用应各成一行，实际 ${toolRows.length} 行`);
+    assert.equal(toolRows[0].text, '已读取文件', `read 应映射「已读取文件」，实际 ${toolRows[0].text}`);
+    assert.equal(toolRows[0].detail, 'a', '工具行应带目标摘要');
+    assert.equal(toolRows[1].text, '已写入文件', `write 应映射「已写入文件」，实际 ${toolRows[1].text}`);
+    assert.equal(toolRows[1].error, true, 'isError 的 result 应把行标成失败');
+    assert.ok(!rows.some((r) => /read\(\{|tool-call/.test(r.text)), '工具参数不该裸 JSON 刷屏');
     // 团队消息去重：m1 只出现一次
     assert.equal(rows.filter((r) => r.kind === 'team').length, 1, '同一条团队消息应去重');
+    // 连续 >8 条工具行折叠中段（防止把正文挤出屏幕）
+    const many = [];
+    for (let i = 0; i < 12; i += 1) many.push({ type: 'tool/call', data: { callId: 'x' + i, name: 'read', arguments: '{}' } });
+    const folded = graph.extractConversation(many, 50);
+    assert.ok(folded.some((r) => r.kind === 'toolgroup'), '12 条连续工具应折叠中段');
+    assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
   });
 
   await check('collectGraph：持久兜底必须走 ctx.get()（属性访问未 inject 的服务会抛错 → 兜底恒失效）', async () => {
@@ -1419,40 +1434,61 @@ function functionBodyOf(source, needle) {
     assert.ok(!names2.includes('ghost'), `不属于本团队的幽灵成员必须被跳过，实际 ${names2}`);
   });
 
-  await check('extractQuestions：从日志抽 ask_user_question（问题/表头/选项），供工作区聊天框显示', () => {
+  await check('extractQuestions：抽提问 + 配对 tool/result 判定已回答（用户：回答过不能再答）', () => {
     // 用户 2026-10-08：「他提问的时候我在工作区看不到也收不到任何的提问信息」。
     // 数据源必须是**会话日志**而不是官方 userQuestions 投影 —— 后者只跟踪 mode:'timed'，
     // 本机默认 legacy → 投影恒空且不报错（dsh-user-questions/.../projection.js:200-215）。
-    const rows = graph.extractQuestions([
-      { type: 'tool/call', seq: 0, time: 100, data: { name: 'read', arguments: '{"file_path":"a"}' } },
-      {
-        type: 'tool/call', seq: 1, time: 200,
-        data: {
-          name: 'ask_user_question',
-          arguments: JSON.stringify({
-            questions: [{
-              id: 'repo_visibility',
-              header: '远程仓库',
-              question: '远程仓库用哪个名字和可见性？',
-              multi_select: false,
-              options: [
-                { label: 'git + Private（推荐）', description: '私有，之后可一条命令改公开。' },
-                { label: 'git + Public', description: '公开，任何人可见。' },
-              ],
-            }],
-          }),
-        },
+    // 用户 2026-10-09：「我已经回答过了，为什么还能回答？设计问题非常的大！！」→
+    // 已回答的判据 = 该 callId 有 tool/result 且内容含 answers 批次
+    // （真实日志实测：session-898e4c64 的 3 次提问全都有 result，形如
+    //  {"answers":[{"id":"ui","selected":["纯图标…"]}]}，见 .probe/probe-result-shape.cjs）。
+    const ask = (seq, callId, id, question) => ({
+      type: 'tool/call', seq, time: 100 + seq,
+      data: {
+        callId,
+        name: 'ask_user_question',
+        arguments: JSON.stringify({
+          questions: [{
+            id,
+            header: '远程仓库',
+            question,
+            multi_select: false,
+            options: [
+              { label: 'git + Private（推荐）', description: '私有，之后可一条命令改公开。' },
+              { label: 'git + Public', description: '公开，任何人可见。' },
+            ],
+          }],
+        }),
       },
+    });
+    const result = (callId, answers) => ({
+      type: 'tool/result', time: 999,
+      data: { message: { source: { kind: 'tool', callId }, content: [{ type: 'text', text: JSON.stringify({ answers }) }] } },
+    });
+    const rows = graph.extractQuestions([
+      { type: 'tool/call', seq: 0, time: 50, data: { name: 'read', arguments: '{"file_path":"a"}' } },
+      ask(1, 'call_open', 'repo_visibility', '远程仓库用哪个名字和可见性？'),
+      ask(2, 'call_done', 'email', 'commit 作者邮箱用哪个？'),
+      result('call_done', [{ id: 'email', selected: ['用 GitHub noreply 邮箱（推荐）'] }]),
     ], 10);
-    assert.equal(rows.length, 1, `应抽出 1 条提问，实际 ${rows.length}`);
-    const q = rows[0];
-    assert.equal(q.id, 'repo_visibility');
-    assert.equal(q.header, '远程仓库');
-    assert.ok(q.question.includes('可见性'), q.question);
-    assert.equal(q.options.length, 2, `选项数应为 2，实际 ${q.options.length}`);
-    assert.ok(q.options[0].label.includes('Private'));
-    assert.ok(q.options[0].description.includes('私有'));
-    assert.equal(q.multi, false);
+    assert.equal(rows.length, 2, `应抽出 2 条提问，实际 ${rows.length}`);
+    const open = rows.find((r) => r.callId === 'call_open');
+    assert.equal(open.answered, false, '没有 result 的提问必须是未回答');
+    assert.equal(open.id, 'repo_visibility');
+    assert.equal(open.header, '远程仓库');
+    assert.equal(open.options.length, 2, `选项数应为 2，实际 ${open.options.length}`);
+    assert.ok(open.options[0].label.includes('Private'));
+    assert.equal(open.multi, false);
+    const done = rows.find((r) => r.callId === 'call_done');
+    assert.equal(done.answered, true, '有 answers result 的提问必须标成已回答');
+    assert.equal(done.answer, '用 GitHub noreply 邮箱（推荐）', `已回答卡应带答案文本，实际 ${done.answer}`);
+    // 自定义回答形状（selected 空、custom 有值）
+    const customRows = graph.extractQuestions([
+      ask(1, 'call_c', 'install', '装到哪？'),
+      result('call_c', [{ id: 'install', selected: [], custom: '链接到 C 盘插件目录' }]),
+    ], 10);
+    assert.equal(customRows[0].answered, true);
+    assert.equal(customRows[0].answer, '链接到 C 盘插件目录', 'custom 答案要能显示');
     // 非 ask 工具调用不该产出任何问题
     const none = graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'read', arguments: '{}' } }], 10);
     assert.equal(none.length, 0);
