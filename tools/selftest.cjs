@@ -1060,16 +1060,36 @@ function functionBodyOf(source, needle) {
     assert.equal(g.totals.totalTokens, 215);
   });
 
-  await check('extractConversation：抽 user/assistant/tool 行、按 limit 取尾部、正文有界', () => {
+  await check('extractConversation：过滤框架注入、工具调用聚合成计数、正文有界、按 limit 取尾部', () => {
     const long = 'x'.repeat(5000);
     const rows = graph.extractConversation([
-      { type: 'user/message', data: { content: [{ type: 'text', text: '你好' }] } },
-      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }, { type: 'tool-call', name: 'read', arguments: '{"file_path":"a"}' }] } } },
+      // 框架注入：都不该出现在对话里（用户 2026-10-08 报的 #1）
+      { type: 'user/message', data: { source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: '<system-reminder>工作区指令' }] } },
+      { type: 'user/message', data: { source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: '<system-reminder>技能目录' }] } },
+      { type: 'user/message', data: { source: { kind: 'time-context' }, content: [{ type: 'text', text: 'Time sampled while preparing turn 1' }] } },
+      // 真人输入
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] } },
+      // 队员派活简报（source.kind 是 user，但内容是本插件生成的使命提示词）→ 也要过滤
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '<system-reminder>\n你是智能体团队的队员 "x"，角色 builder' }] } },
+      // 助手正文 + 两次工具调用（应聚合成一行计数）
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }, { type: 'tool-call', name: 'read', arguments: '{"file_path":"a"}' }, { type: 'tool-call', name: 'write', arguments: '{"file_path":"b"}' }] } } },
+      // 团队消息（成员日志里的 user/message 形状）
+      { type: 'user/message', data: { source: { kind: 'team-message', messageId: 'm1' }, content: [{ type: 'text', text: 'lead → 补充情报' }] } },
+      // 同一条团队消息的 queued 版本（Lead 日志）→ 靠 messageId 去重，只显示一次
+      { type: 'team/message/queued', data: { message: { id: 'm1', senderName: 'lead', targetId: 'x', content: [{ type: 'text', text: '补充情报' }] } } },
     ], 10);
-    assert.ok(rows.some((r) => r.kind === 'user' && r.text === '你好'));
+    assert.ok(rows.some((r) => r.kind === 'user' && r.text === '你好'), '真人输入没抽出来');
+    assert.ok(!rows.some((r) => /system-reminder|Time sampled|技能目录|工作区指令|你是智能体团队的队员/.test(r.text)),
+      `框架注入漏进了对话：${JSON.stringify(rows.map((r) => r.text.slice(0, 40)))}`);
     const asst = rows.find((r) => r.kind === 'assistant');
     assert.ok(asst.text.length <= 2001 && asst.text.endsWith('…'), '正文按 LINE_MAX 截断（代理对安全）');
-    assert.ok(rows.some((r) => r.kind === 'tool' && /read\(/.test(r.text)));
+    // 工具调用聚合成一行计数（不再逐条刷屏）
+    const toolRows = rows.filter((r) => r.kind === 'tools');
+    assert.equal(toolRows.length, 1, `工具调用应聚合成 1 行，实际 ${toolRows.length} 行`);
+    assert.equal(toolRows[0].count, 2, `计数应为 2，实际 ${toolRows[0].count}`);
+    assert.ok(!rows.some((r) => /read\(\{/.test(r.text)), '工具调用参数不该逐条列出');
+    // 团队消息去重：m1 只出现一次
+    assert.equal(rows.filter((r) => r.kind === 'team').length, 1, '同一条团队消息应去重');
   });
 
   await check('collectGraph：持久兜底必须走 ctx.get()（属性访问未 inject 的服务会抛错 → 兜底恒失效）', async () => {
