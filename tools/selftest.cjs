@@ -1118,6 +1118,66 @@ function functionBodyOf(source, needle) {
     assert.equal(node.runtimeMs, 3000);
   });
 
+  await check('collectGraph：fork 队员的继承前缀不能被算成它自己的产出（活体 + 持久两条路径）', async () => {
+    // 回归：官方 eventAt(seq) 是裸数组下标、**包含** fork 继承来的父会话前缀
+    // （dsh-session/lib/index.js:1363-1365），官方专门有 ownEvents()/isOwnSeq()
+    // （同文件 :1389-1391 / :1397-1399）来排掉它。
+    // 实测（真实团队 session-4158e662）：3 个 fork 成员各带 884 条继承事件（97 条 assistant/message
+    // 就是 Lead 自己的）→ 底栏总 token 多算 40659870（+28.8%）、承接边 32→14、
+    // 队员的 wrote/read/todo 全是 Lead 的。这条断言把「必须切前缀」钉死。
+    const TEAM = 'fork-lead';
+    const MEMBER = 'fork-member';
+    // 前缀 = 父会话历史（含 1 条有 usage 的 assistant 消息 + 1 条 tool/call 写文件）
+    const prefix = [
+      { type: 'assistant/message', seq: 0, time: 1000, data: { turn: 1, step: 1, usage: { inputTokens: 900000, outputTokens: 50000, cacheReadTokens: 5000000, cacheWriteTokens: 0 } } },
+      { type: 'tool/call', seq: 1, time: 1100, data: { name: 'write', arguments: '{"file_path":"/parent/only.txt"}' } },
+      { type: 'todo/write', seq: 2, time: 1200, data: { todos: [{ content: 'p', status: 'completed' }] } },
+    ];
+    // 自己的事件（descriptor 之后）
+    const own = [
+      { type: 'subagent/descriptor', seq: 3, time: 2000, data: {} },
+      { type: 'assistant/message', seq: 4, time: 3000, data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 300, cacheWriteTokens: 0 } } },
+      { type: 'tool/call', seq: 5, time: 3100, data: { name: 'write', arguments: '{"file_path":"/own/only.txt"}' } },
+    ];
+    const log = [...prefix, ...own];
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 1, data: { member: { id: MEMBER, name: 'forked', phase: 'active' } } },
+      { type: 'team/message/queued', seq: 1, time: 2, data: { message: { id: 'q1', senderName: 'lead', targetId: MEMBER, content: [] } } },
+    ];
+    const leadSession = { id: TEAM, seq: leadEvents.length, inheritedEventCount: 0, eventAt: (s) => leadEvents[s] };
+    // 活体：官方 Session 的字段名就是 inheritedEventCount（ownEvents 靠它）
+    const memberSession = { id: MEMBER, seq: log.length, inheritedEventCount: prefix.length, eventAt: (s) => log[s] };
+    const ctx = {
+      agents: {
+        list: () => [{ id: TEAM, session: leadSession }, { id: MEMBER, session: memberSession }],
+        get: (id) => (id === TEAM ? { id: TEAM, session: leadSession } : id === MEMBER ? { id: MEMBER, session: memberSession } : undefined),
+      },
+      get: () => undefined,
+    };
+    const agentTeams = {
+      listMembers: () => [
+        { id: TEAM, name: 'lead', role: 'lead', status: 'active' },
+        { id: MEMBER, name: 'forked', role: 'teammate', status: 'active' },
+      ],
+      listTasks: () => [],
+    };
+    const result = await graph.collectGraph({ ctx, agentTeams, leadAgent: { id: TEAM, session: leadSession }, isTeamEnabled: () => true });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const node = result.graph.nodes.find((n) => n.name === 'forked');
+    assert.ok(node !== undefined, 'fork 队员没被画出来');
+    // 只该算自己的 100 input / 20 output / 300 cacheRead
+    assert.equal(node.usage.uncachedInputTokens, 100, `把父会话的 input 算进来了：${node.usage.uncachedInputTokens}`);
+    assert.equal(node.usage.outputTokens, 20);
+    assert.equal(node.usage.cacheReadTokens, 300);
+    assert.equal(node.todo.total, 0, '把父会话的 TODO 算成队员的了');
+    // 承接边：只有 /own/only.txt，不该有父会话的 /parent/only.txt
+    const handoffs = result.graph.edges.filter((e) => e.kind === 'handoff');
+    assert.equal(handoffs.length, 0, `父会话前缀伪造出了承接边：${JSON.stringify(handoffs)}`);
+    // 浮动窗口的对话也不能含父会话内容
+    const convo = await graph.readConversationTail(MEMBER, memberSession, undefined, 50);
+    assert.ok(!convo.rows.some((r) => /parent/.test(r.text)), '浮窗里出现了父会话的内容');
+  });
+
   console.log('');
   console.log('lib/tools.js（report_result 的形状校验）');
 
