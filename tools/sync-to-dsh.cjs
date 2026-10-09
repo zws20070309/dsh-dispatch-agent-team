@@ -2,23 +2,44 @@
 /**
  * sync-to-dsh.cjs —— 把本工作区的改动同步到 DSH 实际加载的那份插件目录。
  *
- * ── 为什么需要它（2026-10-04 实测得出的硬约束）────────────────────────────────
- * DSH 加载 profile 插件时走的是 dsh-app-boot 的 profile-resolution 拦截路由
- * （dsh-app-boot/lib/worker/profile-resolution-bootstrap.js）：它按**路径前缀**判断
- * 某个模块请求是否属于 profile，属于就把官方包请求路由到 app.asar 里那一份。
- * 因此插件的**真实文件位置必须在 profile 的登记路径内**：
+ * ── 2026-10-09 重要更新：现在推荐 **junction 模式**，本脚本退化为兜底 ──────────
  *
- *   * 可行：<DSH 主目录>\.dsh\plugins\<包名> 是**真实目录**
- *   * 不可行：把该目录做成 junction 指向工作区（D 盘等）——
- *     realpathSync 会解析到 profile 之外，拦截路由不生效，而
- *     <DSH 主目录>\.dsh\profiles\node_modules 下的官方包是**悬空 junction**
- *     （指向已被清空的全局 CLI 目录），于是 import '@deepseek-ai/dsh-tools' 直接
- *     ERR_MODULE_NOT_FOUND，插件整个加载失败、预设显示「加载失败」。
+ * 用户要求「不要粘贴一份源码在 .dsh\plugins，要从 D:\Desktop\插件\... 链接过去」。
+ * 我按官方代码逐条核实后确认**可行**（此前的「不可行」结论已过时）：
  *
- * 所以工作流固定为：**在工作区改代码 → 跑本脚本同步 → 重启桌面端**。
+ *   官方 dsh-app-boot 有专门的 linked-root 机制，为「链接进来的插件」服务：
+ *     * lib/index.js:629 `linkedProfileRoots(profile, profilesDir)` —— 扫描
+ *       `<profile.dir>/node_modules` 下的**链接**，解析 realPath 后登记为 linkedRoots
+ *       （排除 profiles 树内部的链接；缺失目标会被跳过）。
+ *     * lib/index.js:80 `linkedPaths = linkedRoots.flatMap(root => prefixes(root.realPath))`
+ *       —— `prefixes()` 同时返回原始路径与 realpath，两者都算合法前缀。
+ *     * worker/profile-resolution-bootstrap.js:101 `findInterceptionLayer`：
+ *       `if (!startsWithin(path, resolution.linkedPaths)) return void 0;` → 命中则
+ *       返回 `{kind:'linked'}`，由 `:306 routeLinked` 走链接专用路由。
+ *
+ *   也就是说：**realpath 解析到 profile 之外不再是问题** —— 只要那个路径被登记进
+ *   linkedRoots（由 profile/node_modules 下的链接自动产生），官方就认。
+ *
+ *   实测（.probe/verify-junction-loading.cjs 逐条复刻官方算法）：
+ *     ✅ 本插件已登记为 linkedRoot：@zws/dsh-dispatch-agent-team → D:\Desktop\插件\...
+ *     ✅ 插件入口命中 linkedPaths（官方会给它拦截层）
+ *     ✅ 包内 node_modules junction → profiles\node_modules，@deepseek-ai/dsh-tools 可达
+ *
+ *   两层链接的完整形态（改完目录结构后 repair.cjs 体检「状态完好」）：
+ *     profiles\desktop\node_modules\@zws\dsh-dispatch-agent-team   ← 官方登记层
+ *       → C:\Users\ZWS\.dsh\plugins\dsh-dispatch-agent-team
+ *           → D:\Desktop\插件\dsh-dispatch-agent-team              ← 源码（本仓库）
+ *
+ *   所以现在**改代码不需要跑同步**：DSH 直接读的就是这份源码目录。
+ *   本脚本保留给两种场景：① 万一退回「复制模式」；② `--check` 快速核对两边一致性。
+ *
+ * ── 旧结论（保留作历史，已被上面的实测推翻）─────────────────────────────────
+ * 早期版本记录：「把 .dsh\plugins\<包名> 做成 junction 指向工作区不可行 —— realpathSync
+ * 会解析到 profile 之外，拦截路由不生效」。那是**官方加 linkedRoots 之前**的事实；
+ * 现在官方专门为这种用法开了 linked 路由。
  *
  * ── 用法 ─────────────────────────────────────────────────────────────────────
- *   node tools/sync-to-dsh.cjs            # 同步（默认目标 = DSH 主目录下的同名插件目录）
+ *   node tools/sync-to-dsh.cjs            # 同步（仅复制模式需要；junction 模式下是空操作）
  *   node tools/sync-to-dsh.cjs --dry-run  # 只列出会变动的文件，不写盘
  *   node tools/sync-to-dsh.cjs --check    # 只报告两边差异，不写盘（退出码 1 = 有差异）
  *   node tools/sync-to-dsh.cjs --target <dir>   # 指定目标目录
@@ -94,10 +115,24 @@ function main() {
     console.error('[sync] 先用 node tools/install.cjs 安装一次，或用 --target 指定。');
     process.exit(2);
   }
+  // junction 模式：目标就是本仓库自己（或指向它）⇒ 无需同步，直接报告。
+  // 见文件头「2026-10-09 重要更新」：官方 linkedRoots 机制让 junction 成为**推荐**形态。
+  let targetReal = null;
+  try { targetReal = fs.realpathSync(target); } catch { /* */ }
+  let selfReal = null;
+  try { selfReal = fs.realpathSync(pluginDir); } catch { /* */ }
+  if (targetReal !== null && selfReal !== null && targetReal === selfReal) {
+    console.log('[sync] 工作区 : ' + pluginDir);
+    console.log('[sync] 目标   : ' + target);
+    console.log('[sync] 目标就是本仓库（junction 模式）——DSH 直接读这份源码，**无需同步**。');
+    if (checkOnly || dryRun) console.log('[sync] --check：两边是同一个目录，差异 0。');
+    process.exit(0);
+  }
+  // 目标是指向**别处**的链接：可能是别人手建的 junction，也可能指向另一个工作区。
+  // 不直接拒绝（旧的硬拒绝已过时），但要说清两边关系，避免误同步到意外位置。
   if (fs.lstatSync(target).isSymbolicLink()) {
-    console.error('[sync] 目标是一个链接：' + target);
-    console.error('[sync] DSH 的 profile-resolution 需要**真实目录**（见文件头「为什么需要它」）。');
-    process.exit(2);
+    console.log('[sync] 注意：目标是链接 → ' + String(fs.readlinkSync(target)));
+    console.log('[sync] 它指向的不是本仓库；下面按「复制模式」比较并写入该目标。');
   }
 
   const changed = [];
