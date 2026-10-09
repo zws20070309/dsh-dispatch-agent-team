@@ -1139,19 +1139,43 @@ function functionBodyOf(source, needle) {
     // 工具行：官方标签 + 目标摘要；assistant 内嵌的块不重复成行。
     const toolRows = rows.filter((r) => r.kind === 'tool');
     assert.equal(toolRows.length, 2, `两条工具调用应各成一行，实际 ${toolRows.length} 行`);
-    assert.equal(toolRows[0].text, '已读取文件', `read 应映射「已读取文件」，实际 ${toolRows[0].text}`);
+    assert.equal(toolRows[0].text, '读取', `read 应映射官方文案「读取」，实际 ${toolRows[0].text}`);
     assert.equal(toolRows[0].detail, 'a', '工具行应带目标摘要');
-    assert.equal(toolRows[1].text, '已写入文件', `write 应映射「已写入文件」，实际 ${toolRows[1].text}`);
+    assert.equal(toolRows[1].text, '写入', `write 应映射官方文案「写入」，实际 ${toolRows[1].text}`);
     assert.equal(toolRows[1].error, true, 'isError 的 result 应把行标成失败');
     assert.ok(!rows.some((r) => /read\(\{|tool-call/.test(r.text)), '工具参数不该裸 JSON 刷屏');
     // 团队消息去重：m1 只出现一次
     assert.equal(rows.filter((r) => r.kind === 'team').length, 1, '同一条团队消息应去重');
     // 连续 >8 条工具行折叠中段（防止把正文挤出屏幕）
-    const many = [];
-    for (let i = 0; i < 12; i += 1) many.push({ type: 'tool/call', data: { callId: 'x' + i, name: 'read', arguments: '{}' } });
+    const many = [];    for (let i = 0; i < 12; i += 1) many.push({ type: 'tool/call', data: { callId: 'x' + i, name: 'read', arguments: '{}' } });
     const folded = graph.extractConversation(many, 50);
     assert.ok(folded.some((r) => r.kind === 'toolgroup'), '12 条连续工具应折叠中段');
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
+  });
+
+  await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
+    // 用户 2026-10-09：「一定要正确，和我用官方的对话框没太大区别」。
+    // 官方真值来自 dsh-client-ui-conversation/lib/client.js 的 locale 块，
+    // 提取脚本 .probe/extract-tool-titles-zh.cjs（58 条）。
+    // 旧实现是自造文案（「已读取文件」「修改了文件」「已搜索代码」）—— 与官方不一致。
+    const expect = {
+      read: '读取', read_image: '读取图片', grep: '搜索文件内容', glob: '查找文件',
+      write: '写入', edit: '编辑', apply_patch: '编辑', bash: '运行命令', pwsh: '运行命令',
+      web_search: '网页搜索', web_fetch: '网页获取', subagent: '创建子智能体',
+      spawn_teammate: '创建队友', send_message: '发送消息', list_agents: '查看子智能体',
+      wait_agent: '等待子智能体', team_task_create: '创建团队任务', get_team_task: '读取团队任务',
+      read_terminal: '读取终端', lsp: '查询代码符号', find_references: '查找引用',
+    };
+    for (const [tool, label] of Object.entries(expect)) {
+      assert.equal(graph.toolRowLabel(tool), label, `${tool} 应为官方文案「${label}」`);
+    }
+    // 认不出来的工具回退到官方 generic（「工具调用」），**不许自造新词**。
+    assert.equal(graph.toolRowLabel('some_unknown_tool'), '工具调用', '未知工具应回退官方 generic 文案');
+    // 反面对照：自造文案一个都不许再出现。
+    for (const banned of ['已读取文件', '已写入文件', '修改了文件', '已搜索代码', '执行了命令', '已调用工具']) {
+      const hit = Object.keys(expect).some((k) => graph.toolRowLabel(k) === banned);
+      assert.ok(!hit, `官方文案里没有「${banned}」，不该出现`);
+    }
   });
 
   await check('collectGraph：持久兜底必须走 ctx.get()（属性访问未 inject 的服务会抛错 → 兜底恒失效）', async () => {
