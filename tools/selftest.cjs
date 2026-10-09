@@ -478,7 +478,7 @@ function functionBodyOf(source, needle) {
     // 顺手 import 一个 @deepseek-ai 包，体检脚本会在别的机器上直接崩，而这里是唯一会先红的地方。
     // 注意：参照项目的教训（ARCHITECTURE.md:110-112）：纯文档的边界声明会滞后失效——
     // 所以这里借的是「可跑断言」那一半，不抄一份文档。
-    const PURE_MODULES = ['roster.js', 'playbook.js', 'cache.js', 'resume.js', 'text-clip.js'];
+    const PURE_MODULES = ['roster.js', 'playbook.js', 'cache.js', 'resume.js', 'text-clip.js', 'graph.js'];
     const offenders = [];
     for (const file of PURE_MODULES) {
       const source = readFileSync(path.join(LIB, file), 'utf8');
@@ -657,9 +657,15 @@ function functionBodyOf(source, needle) {
 
   await check('提示词预算：系统提示词前缀不许膨胀（每多一个字，每次请求都多付一次钱）', () => {
     const budget = {
-      PLAYBOOK: 3800,        // 调度模式方法论（Lead 与所有请求的前缀）。2026-10-04 从 4100 收到 3900、2026-10-04 再按审查 P2-10 收到 3800：只防「超预算」不防「贴边」，留余量给以后新增的纪律
+      // 2026-10-09 上调 3800→3900 / 1150→1200：这两处增长都有明确来源，不是「往上堆」——
+      //   ① 新增用户要求的 PTC 借鉴纪律（批量取证 + 先过滤再汇报，见下面的专项断言）；
+      //   ② 修回 2026-10-09 压缩事故中误删的细节（URL、「不知道就说不知道」、
+      //      「（它对你不可用）」的原因、blocked 的判据、冻结文件的举例与「让 Lead 判断」）。
+      // 教训记在这里：那次为守住 3800/1150 而删掉的是**信息**，不是冗余；压缩该合并同义表述，
+      // 不该删事实。上调幅度只覆盖真实新增 + 一点余量，不开口子。
+      PLAYBOOK: 3900,        // 调度模式方法论（Lead 与所有请求的前缀）
       TEAM_POLICY: 800,      // 团队运行期事实（开后才有）
-      TEAMMATE_CARD: 1150,   // 队员卡（每个队员的固定前缀）
+      TEAMMATE_CARD: 1250,   // 队员卡（每个队员的固定前缀）；留 ~50 余量，避免再次为「贴边」删信息
     };
     const actual = {
       PLAYBOOK: playbook.PLAYBOOK.length,
@@ -674,8 +680,8 @@ function functionBodyOf(source, needle) {
     );
     const lead = actual.PLAYBOOK + actual.TEAM_POLICY;
     const mate = actual.TEAMMATE_CARD + playbook.teammateBrief('scout', 'scout').length;
-    assert.ok(lead <= 4900, `Lead 侧提示词 ${lead} > 4900 字符`);
-    assert.ok(mate <= 1550, `队员侧提示词 ${mate} > 1550 字符`);
+    assert.ok(lead <= 5000, `Lead 侧提示词 ${lead} > 5000 字符`);
+    assert.ok(mate <= 1650, `队员侧提示词 ${mate} > 1650 字符`);
   });
 
   await check('纪律只在 PLAYBOOK、运行期语义只在 TEAM_POLICY（重复写 = 多付钱 + 迟早自相矛盾）', () => {
@@ -689,6 +695,47 @@ function functionBodyOf(source, needle) {
       assert.ok(playbook.PLAYBOOK.includes(marker), `PLAYBOOK 缺少纪律：${marker}`);
       assert.ok(!playbook.TEAM_POLICY.includes(marker), `TEAM_POLICY 里重复了纪律「${marker}」——那属于 PLAYBOOK`);
     }
+  });
+
+  await check('队员/Lead 提示词的**关键细节**不许再被压缩删掉（2026-10-09 压缩事故的永久闸门）', () => {
+    // 事故经过：为把 TEAMMATE_CARD 压回 1150，我删掉了一批**信息**（不是冗余），
+    // 事后逐字 diff 才发现。这些点各自都有真实用途，逐条钉住：
+    //   * URL —— researcher 引外部来源、web 类结论的唯一凭据形式；
+    //   * 「不知道就说不知道」—— 诚实纪律，去掉后模型倾向于硬编一个答案；
+    //   * 「或在报告里写清楚」—— ask_lead 之外的**备选上报路径**（不可用时不至于卡死）；
+    //   * 「（它对你不可用）」—— 解释原因，否则队员会以为是自己没找到那个工具；
+    //   * blocked 的判据「需要 Lead 决策或外部条件」—— 没判据就会滥用/误用该状态；
+    //   * 冻结文件的举例「（测试、验收脚本）」+「让 Lead 判断」—— 决定谁来裁决；
+    //   * PLAYBOOK 的「（工具面强制）」「不许当事实」「真实调用链验证」。
+    const card = playbook.TEAMMATE_CARD;
+    for (const marker of ['URL', '不知道就说不知道', '或在报告里写清楚', '它对你不可用',
+      '需要 Lead 决策或外部条件', '测试、验收脚本', '让 Lead 判断', '标 blocking=false']) {
+      assert.ok(card.includes(marker), `队员卡丢了这个细节：「${marker}」——它是信息，不是冗余`);
+    }
+    const pb = playbook.PLAYBOOK;
+    for (const marker of ['（工具面强制）', '不许当事实', '真实调用链验证', '推荐：<推荐答案>',
+      '冻结的验收文件（只读）', '工具会把该角色的使命/纪律/写权限自动拼在你正文之前']) {
+      assert.ok(pb.includes(marker), `PLAYBOOK 丢了这个细节：「${marker}」——它是信息，不是冗余`);
+    }
+  });
+
+  await check('PTC 借鉴纪律：批量取证 / 先过滤后汇报，Lead 与队员两侧都在（防以后被当噪音删掉）', () => {
+    // 用户 2026-10-09 要求把 PTC（Programmatic Tool Calling）的方法论借鉴进团队。
+    // 官方 PTC 预设与 standard 的唯一实质差异是 `tool-presentation: {mode: ptc}`
+    // （dsh-web-app/presets/ptc.patch.yml）—— 它改的是「模型怎么调工具」，不是工具集。
+    // 本插件不能按队员切 preset（子会话强制继承 Lead 的 preset），所以只借鉴**方法**：
+    // ① 一次调用取一批（合并命令 / 交替模式 grep / 循环），别拆成 N 次往返；
+    // ② 原始输出先自己筛算合并，只把结论与关键行带进上下文。
+    // 两侧都必须有：队员卡管队员自己的取证方式，PLAYBOOK 管 Lead 对派活的要求
+    // （只写一边会出现「Lead 不问、队员不做」的缺口）。
+    assert.ok(playbook.TEAMMATE_CARD.includes('一次调用取一批'), '队员卡缺少「一次调用取一批」纪律');
+    assert.ok(playbook.TEAMMATE_CARD.includes('原始输出自己筛算合并'), '队员卡缺少「先过滤再进上下文」纪律');
+    assert.ok(playbook.TEAMMATE_CARD.includes('别拆成 N 次往返'), '队员卡缺少「别拆成 N 次往返」的明确反例');
+    assert.ok(playbook.PLAYBOOK.includes('批量取证'), 'PLAYBOOK 缺少对队员的「批量取证」要求');
+    assert.ok(playbook.PLAYBOOK.includes('先过滤再汇报'), 'PLAYBOOK 缺少对队员的「先过滤再汇报」要求');
+    // 反面对照：纪律不许散落到 TEAM_POLICY（那里只放运行期语义，写重复 = 多付钱 + 自相矛盾）。
+    assert.ok(!playbook.TEAM_POLICY.includes('一次调用取一批'), 'TEAM_POLICY 不该出现取证纪律');
+    assert.ok(!playbook.TEAM_POLICY.includes('批量取证'), 'TEAM_POLICY 不该出现取证纪律');
   });
 
   await check('用户可见文本：/team 用用户原文、续写指令固定措辞、**没有**会被排队的注入说明', () => {
@@ -917,6 +964,647 @@ function functionBodyOf(source, needle) {
     assert.equal(cache.resolveKeepalivePolicy({}).mode, 'auto');
     assert.equal(cache.resolveKeepalivePolicy({}).source, 'route-family:generic');
     assert.equal(cache.DEFAULT_TTL_SECONDS, 300);
+  });
+
+  console.log('');
+  console.log('lib/graph.js（工作区画布：事件折叠与建图，全部是真实数据的判据）');
+
+  const graph = await load('graph.js');
+
+  await check('normId / normalizePath：id 去前缀、路径取尾 4 段且拒空', () => {
+    assert.equal(graph.normId('session-abc'), 'abc');
+    assert.equal(graph.normId('abc'), 'abc');
+    assert.equal(graph.normId(''), '');
+    assert.equal(graph.normalizePath('D:\\x\\y\\z\\w\\lib\\client.js'), 'z/w/lib/client.js');
+    assert.equal(graph.normalizePath('C:/a/b/c/d/e.txt'), 'b/c/d/e.txt');
+    assert.equal(graph.normalizePath(''), null);
+    assert.equal(graph.normalizePath(undefined), null);
+  });
+
+  await check('foldEvents：usage 按 token-meter 同款 last-wins 去重（同 turn/step 覆盖不是累加）', () => {
+    const s = graph.foldSession([
+      { type: 'assistant/message', seq: 1, time: 10, data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 5, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+      // 同一 turn/step 的第二次结算（重试后修正）：替换，不叠加。
+      { type: 'assistant/message', seq: 2, time: 20, data: { turn: 1, step: 1, usage: { inputTokens: 120, outputTokens: 8, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+    ]);
+    assert.equal(s.usage.uncachedInputTokens, 120);
+    assert.equal(s.usage.outputTokens, 8);
+    assert.equal(s.usage.cacheReadTokens, 900);
+    // pressureFrom = input + cacheRead + cacheWrite（prompt 侧，不含 output），与官方同式。
+    assert.equal(s.pressureTokens, 120 + 900);
+  });
+
+  await check('foldEvents：llm/retry-started 关掉替换槽，让重试的那次重新计入', () => {
+    const base = { type: 'assistant/message', data: { turn: 2, step: 1, usage: { inputTokens: 50, outputTokens: 3, cacheReadTokens: 10, cacheWriteTokens: 0 } } };
+    const s = graph.foldSession([
+      { ...base, seq: 1, time: 1 },
+      { type: 'llm/retry-started', seq: 2, time: 2, data: { turn: 2, step: 1 } },
+      { ...base, seq: 3, time: 3, data: { turn: 2, step: 1, usage: { inputTokens: 60, outputTokens: 4, cacheReadTokens: 10, cacheWriteTokens: 0 } } },
+    ]);
+    // 关掉替换槽后第二条不再被当成「同 turn/step 的替换」，而是各自计入 → 50+60。
+    assert.equal(s.usage.uncachedInputTokens, 110);
+  });
+
+  await check('foldEvents：todo/write 计 done/running/total（画布 TODO 的唯一真值）', () => {
+    const s = graph.foldSession([
+      { type: 'todo/write', seq: 1, time: 1, data: { todos: [
+        { content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }, { content: 'c', status: 'pending' },
+      ] } },
+      // 后写覆盖前写（todo/write 是整表快照，不是增量）。
+      { type: 'todo/write', seq: 2, time: 2, data: { todos: [{ content: 'a', status: 'completed' }] } },
+    ]);
+    assert.deepEqual(s.todo, { done: 1, running: 0, total: 1 });
+  });
+
+  await check('foldEvents：tool/call 的写/读文件进 wrote/read 集（承接边的原料），坏 JSON 跳过不猜', () => {
+    const s = graph.foldSession([
+      { type: 'tool/call', seq: 1, time: 1, data: { name: 'edit', arguments: JSON.stringify({ file_path: 'D:/p/q/r/s/a.ts' }) } },
+      { type: 'tool/call', seq: 2, time: 2, data: { name: 'write', arguments: { file_path: 'p/q/r/s/b.ts' } } },
+      { type: 'tool/call', seq: 3, time: 3, data: { name: 'read', arguments: JSON.stringify({ file_path: 'p/q/r/s/a.ts' }) } },
+      { type: 'tool/call', seq: 4, time: 4, data: { name: 'read', arguments: '{坏 JSON' } },
+      { type: 'tool/call', seq: 5, time: 5, data: { name: 'pwsh', arguments: JSON.stringify({ command: 'ls' }) } },
+    ]);
+    assert.ok(s.wrote.has('q/r/s/a.ts'), '盘符去掉、留最后 4 段');
+    assert.ok(s.wrote.has('q/r/s/b.ts'));
+    assert.ok(s.read.has('q/r/s/a.ts'));
+    assert.equal(s.read.size, 1, '坏 JSON 与无 file_path 的调用都不该进读集');
+  });
+
+  await check('foldEvents：runtimeMs = Σ(turn/end − turn/start)，未闭合的 turn 不计', () => {
+    const s = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 3500, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'turn/start', seq: 3, time: 4000, data: { turn: 2 } }, // 没有对应 end
+    ]);
+    assert.equal(s.runtimeMs, 2500);
+    assert.equal(s.lastTurnEndReason, 'completed');
+  });
+
+  await check('foldEvents：Lead 派活按 targetId、队员交付按 senderName 分账（team/message 集中记在 Lead 会话）', () => {
+    const s = graph.foldSession([
+      { type: 'team/message/queued', seq: 1, time: 1, data: { message: { id: 'q1', senderName: 'lead', targetId: 'm1', content: [] } } },
+      { type: 'team/message/queued', seq: 2, time: 2, data: { message: { id: 'q2', senderName: 'm1', targetId: 'session-lead', content: [] } } },
+      { type: 'team/message/queued', seq: 3, time: 3, data: { message: { id: 'q3', senderName: 'm2', targetId: 'session-lead', content: [] } } },
+    ]);
+    assert.equal(s.teamMsg.get('m1').dispatched, 1);
+    assert.equal(s.msgFrom.get('m1').get('lead').queued, 1);
+    assert.equal(s.msgFrom.get('m2').get('lead').queued, 1);
+  });
+
+  await check('foldEvents：team/message/delivered 是**扁平形状**（只有 messageId/targetId），靠 queued 的表回连发件人', () => {
+    // 回归：旧实现按 data.message 读 delivered，而官方 delivered 根本没有 message 包装
+    // （dsh-experimental-agent-team/lib/index.js:958-962）→ 投递回执一直是死代码，delivered 永远 0。
+    const s = graph.foldSession([
+      { type: 'team/message/queued', seq: 1, time: 1, data: { message: { id: 'q1', senderName: 'lead', targetId: 'm1', content: [] } } },
+      { type: 'team/message/queued', seq: 2, time: 2, data: { message: { id: 'q2', senderName: 'm1', targetId: 'session-lead', content: [] } } },
+      // delivered：扁平，无 message 包装。
+      { type: 'team/message/delivered', seq: 3, time: 3, data: { messageId: 'q1', targetId: 'm1' } },
+      { type: 'team/message/delivered', seq: 4, time: 4, data: { messageId: 'q2', targetId: 'session-lead' } },
+    ]);
+    assert.equal(s.teamMsg.get('m1').delivered, 1, 'Lead 派出去的投递计数');
+    assert.equal(s.msgFrom.get('m1').get('lead').delivered, 1, '队员投递回执按 messageId 回连到发件人');
+    assert.equal(s.msgFrom.get('m1').get('lead').queued, 1, '排队与投递各自独立计数');
+  });
+
+  await check('buildGraph：双向承接合并成一条边（both=true、权重相加、files 有界）', () => {
+    const stats = (writes, reads) => { const s = graph.emptyStats(); s.wrote = new Set(writes); s.read = new Set(reads); return s };
+    const bySession = new Map([
+      ['lead', graph.emptyStats()],
+      ['a', stats(['x/f1', 'x/f2'], ['x/f3', 'x/f4'])],
+      ['b', stats(['x/f3', 'x/f4'], ['x/f1', 'x/f2'])],
+    ]);
+    const members = [{ id: 'a', name: 'a', role: 'teammate' }, { id: 'b', name: 'b', role: 'teammate' }];
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members, statsBySession: bySession, tasks: [] });
+    const handoff = g.edges.filter((e) => e.kind === 'handoff');
+    assert.equal(handoff.length, 1, 'a↔b 两个方向合并成一条');
+    assert.equal(handoff[0].both, true);
+    assert.equal(handoff[0].weight, 4, 'a写b读2 + b写a读2');
+    assert.ok(handoff[0].files.length <= 3, '样例文件名有界（tooltip 不撑大响应）');
+  });
+
+  await check('buildGraph：交付线由 Lead 账本里「该队员发给 lead 的消息」点亮（不是投递回执）', () => {
+    const lead = graph.emptyStats();
+    lead.msgFrom.set('a', new Map([['lead', { queued: 2, delivered: 0 }]]));
+    const bySession = new Map([['lead', lead], ['a', graph.emptyStats()], ['b', graph.emptyStats()]]);
+    const members = [{ id: 'a', name: 'a', role: 'teammate' }, { id: 'b', name: 'b', role: 'teammate' }];
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members, statsBySession: bySession, tasks: [] });
+    const dispatch = g.edges.filter((e) => e.kind === 'dispatch');
+    const edgeA = dispatch.find((e) => e.to === 'a');
+    const edgeB = dispatch.find((e) => e.to === 'b');
+    assert.equal(edgeA.delivered, true);
+    assert.equal(edgeA.reported, 2);
+    assert.equal(edgeB.delivered, false, '没交过话的队员不该被点亮');
+    assert.equal(dispatch.length, 2, '每个成员都有一条线（spawn 即派活），哪怕权重为 0');
+  });
+
+  await check('buildGraph：汇总 cacheHit = 全队 cacheRead / (cacheRead+新输入)，output 单列', () => {
+    const mk = (out, inp, cache) => { const s = graph.emptyStats(); s.usage = { uncachedInputTokens: inp, outputTokens: out, cacheReadTokens: cache, cacheWriteTokens: 0 }; return s };
+    const bySession = new Map([['lead', mk(10, 40, 60)], ['a', mk(5, 10, 90)]]);
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members: [{ id: 'a', name: 'a', role: 'teammate' }], statsBySession: bySession, tasks: [] });
+    // 总 cacheRead=150，总 prompt 侧 = (40+60)+(10+90)=200 → 150/200=0.75
+    assert.ok(Math.abs(g.totals.cacheHit - 0.75) < 1e-9, `cacheHit=${g.totals.cacheHit}`);
+    assert.equal(g.totals.outputTokens, 15);
+    assert.equal(g.totals.totalTokens, 215);
+  });
+
+  await check('extractConversation：过滤注入、工具逐条成官方风格行、正文有界、按 limit 取尾部', () => {
+    const long = 'x'.repeat(5000);
+    const rows = graph.extractConversation([
+      // 框架注入：都不该出现在对话里（用户 2026-10-08 报的 #1）
+      { type: 'user/message', data: { source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: '<system-reminder>工作区指令' }] } },
+      { type: 'user/message', data: { source: { kind: 'skill-catalog' }, content: [{ type: 'text', text: '<system-reminder>技能目录' }] } },
+      { type: 'user/message', data: { source: { kind: 'time-context' }, content: [{ type: 'text', text: 'Time sampled while preparing turn 1' }] } },
+      // 真人输入
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] } },
+      // 队员派活简报（source.kind 是 user，但内容是本插件生成的使命提示词）→ 也要过滤
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '<system-reminder>\n你是智能体团队的队员 "x"，角色 builder' }] } },
+      // 助手正文 + 两次工具调用。⚠️ 2026-10-09 起工具调用**逐条成行**（用户：「弹窗要能看到
+      // 读取文件、修改文件、调用工具」）；行以 tool/call 事件为准（实测 7/7 会话里
+      // assistant 块的 callId 与事件一一对应，见 .probe/probe-blocks-vs-events.cjs）。
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: long }, { type: 'tool-call', id: 'c1', name: 'read', arguments: '{"file_path":"a"}' }, { type: 'tool-call', id: 'c2', name: 'write', arguments: '{"file_path":"b"}' }] } } },
+      { type: 'tool/call', data: { callId: 'c1', name: 'read', arguments: '{"file_path":"a"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'ok' }], isError: false } } },
+      { type: 'tool/call', data: { callId: 'c2', name: 'write', arguments: '{"file_path":"b"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c2' }, content: [{ type: 'text', text: 'boom' }], isError: true } } },
+      // 团队消息（成员日志里的 user/message 形状）
+      { type: 'user/message', data: { source: { kind: 'team-message', messageId: 'm1' }, content: [{ type: 'text', text: 'lead → 补充情报' }] } },
+      // 同一条团队消息的 queued 版本（Lead 日志）→ 靠 messageId 去重，只显示一次
+      { type: 'team/message/queued', data: { message: { id: 'm1', senderName: 'lead', targetId: 'x', content: [{ type: 'text', text: '补充情报' }] } } },
+    ], 10);
+    assert.ok(rows.some((r) => r.kind === 'user' && r.text === '你好'), '真人输入没抽出来');
+    assert.ok(!rows.some((r) => /system-reminder|Time sampled|技能目录|工作区指令|你是智能体团队的队员/.test(r.text)),
+      `框架注入漏进了对话：${JSON.stringify(rows.map((r) => r.text.slice(0, 40)))}`);
+    const asst = rows.find((r) => r.kind === 'assistant');
+    assert.ok(asst.text.length <= 2001 && asst.text.endsWith('…'), '正文按 LINE_MAX 截断（代理对安全）');
+    // 工具行：官方标签 + 目标摘要；assistant 内嵌的块不重复成行。
+    const toolRows = rows.filter((r) => r.kind === 'tool');
+    assert.equal(toolRows.length, 2, `两条工具调用应各成一行，实际 ${toolRows.length} 行`);
+    assert.equal(toolRows[0].text, '已读取文件', `read 应映射「已读取文件」，实际 ${toolRows[0].text}`);
+    assert.equal(toolRows[0].detail, 'a', '工具行应带目标摘要');
+    assert.equal(toolRows[1].text, '已写入文件', `write 应映射「已写入文件」，实际 ${toolRows[1].text}`);
+    assert.equal(toolRows[1].error, true, 'isError 的 result 应把行标成失败');
+    assert.ok(!rows.some((r) => /read\(\{|tool-call/.test(r.text)), '工具参数不该裸 JSON 刷屏');
+    // 团队消息去重：m1 只出现一次
+    assert.equal(rows.filter((r) => r.kind === 'team').length, 1, '同一条团队消息应去重');
+    // 连续 >8 条工具行折叠中段（防止把正文挤出屏幕）
+    const many = [];
+    for (let i = 0; i < 12; i += 1) many.push({ type: 'tool/call', data: { callId: 'x' + i, name: 'read', arguments: '{}' } });
+    const folded = graph.extractConversation(many, 50);
+    assert.ok(folded.some((r) => r.kind === 'toolgroup'), '12 条连续工具应折叠中段');
+    assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
+  });
+
+  await check('collectGraph：持久兜底必须走 ctx.get()（属性访问未 inject 的服务会抛错 → 兜底恒失效）', async () => {
+    // 回归：原实现写 `ctx.sessionPersistence ?? ctx.get('sessionPersistence')`。
+    // cordis 里属性访问一个不在本 fiber inject 列表里的服务会抛
+    // `cannot get property "x" without inject`，于是属性访问先抛、`??` 被 try 吞掉，
+    // persistence 恒为 undefined → 宿主重启后**所有队员的统计都显示成 0**（假数据）。
+    // 这条断言用一个「只提供 get、属性访问抛错」的 ctx 替身把它钉住。
+    const TEAM = 'selftest-lead';
+    const MEMBER = 'selftest-member';
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 1, data: { member: { id: MEMBER, name: 'builder-z', phase: 'active' } } },
+      { type: 'team/message/queued', seq: 1, time: 2, data: { message: { id: 'q1', senderName: 'lead', targetId: MEMBER, content: [] } } },
+    ];
+    const memberEvents = [
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 1, time: 2000, data: { turn: 1, step: 1, usage: { inputTokens: 500, outputTokens: 50, cacheReadTokens: 4500, cacheWriteTokens: 0 } } },
+      { type: 'turn/end', seq: 2, time: 4000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const session = (id, events) => ({ id, seq: events.length, eventAt: (s) => events[s] });
+    const leadSession = session(TEAM, leadEvents);
+    const persistence = {
+      open: async (id) => (id === MEMBER
+        ? { header: {}, inheritedEventCount: 0, read: async () => ({ events: memberEvents }), close: async () => {} }
+        : (() => { throw new Error('not persisted'); })()),
+    };
+    const ctx = {
+      agents: { list: () => [{ id: TEAM, session: leadSession }], get: (id) => (id === TEAM ? { id: TEAM, session: leadSession } : undefined) },
+      get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+      // 关键：属性访问必须抛错（复刻 cordis 的 without inject 行为）。
+      get sessionPersistence() { throw new Error('cannot get property "sessionPersistence" without inject'); },
+    };
+    const agentTeams = {
+      listMembers: () => [
+        { id: TEAM, name: 'lead', role: 'lead', status: 'active' },
+        { id: MEMBER, name: 'builder-z', role: 'teammate', status: 'inactive' },
+      ],
+      listTasks: () => [],
+    };
+    const result = await graph.collectGraph({ ctx, agentTeams, leadAgent: { id: TEAM, session: leadSession }, isTeamEnabled: () => true });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const node = result.graph.nodes.find((n) => n.name === 'builder-z');
+    assert.ok(node !== undefined, '无活体的队员没被画出来');
+    assert.equal(node.totalTokens, 5050, '持久兜底没生效 → 统计成了 0（假数据）');
+    assert.ok(Math.abs(node.cacheHit - 0.9) < 1e-9, `cacheHit=${node.cacheHit}`);
+    assert.equal(node.runtimeMs, 3000);
+  });
+
+  await check('collectGraph：fork 队员的继承前缀不能被算成它自己的产出（活体 + 持久两条路径）', async () => {
+    // 回归：官方 eventAt(seq) 是裸数组下标、**包含** fork 继承来的父会话前缀
+    // （dsh-session/lib/index.js:1363-1365），官方专门有 ownEvents()/isOwnSeq()
+    // （同文件 :1389-1391 / :1397-1399）来排掉它。
+    // 实测（真实团队 session-4158e662）：3 个 fork 成员各带 884 条继承事件（97 条 assistant/message
+    // 就是 Lead 自己的）→ 底栏总 token 多算 40659870（+28.8%）、承接边 32→14、
+    // 队员的 wrote/read/todo 全是 Lead 的。这条断言把「必须切前缀」钉死。
+    const TEAM = 'fork-lead';
+    const MEMBER = 'fork-member';
+    // 前缀 = 父会话历史（含 1 条有 usage 的 assistant 消息 + 1 条 tool/call 写文件）
+    const prefix = [
+      { type: 'assistant/message', seq: 0, time: 1000, data: { turn: 1, step: 1, usage: { inputTokens: 900000, outputTokens: 50000, cacheReadTokens: 5000000, cacheWriteTokens: 0 } } },
+      { type: 'tool/call', seq: 1, time: 1100, data: { name: 'write', arguments: '{"file_path":"/parent/only.txt"}' } },
+      { type: 'todo/write', seq: 2, time: 1200, data: { todos: [{ content: 'p', status: 'completed' }] } },
+    ];
+    // 自己的事件（descriptor 之后）
+    const own = [
+      { type: 'subagent/descriptor', seq: 3, time: 2000, data: {} },
+      { type: 'assistant/message', seq: 4, time: 3000, data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 300, cacheWriteTokens: 0 } } },
+      { type: 'tool/call', seq: 5, time: 3100, data: { name: 'write', arguments: '{"file_path":"/own/only.txt"}' } },
+    ];
+    const log = [...prefix, ...own];
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 1, data: { member: { id: MEMBER, name: 'forked', phase: 'active' } } },
+      { type: 'team/message/queued', seq: 1, time: 2, data: { message: { id: 'q1', senderName: 'lead', targetId: MEMBER, content: [] } } },
+    ];
+    const leadSession = { id: TEAM, seq: leadEvents.length, inheritedEventCount: 0, eventAt: (s) => leadEvents[s] };
+    // 活体：官方 Session 的字段名就是 inheritedEventCount（ownEvents 靠它）
+    const memberSession = { id: MEMBER, seq: log.length, inheritedEventCount: prefix.length, eventAt: (s) => log[s] };
+    const ctx = {
+      agents: {
+        list: () => [{ id: TEAM, session: leadSession }, { id: MEMBER, session: memberSession }],
+        get: (id) => (id === TEAM ? { id: TEAM, session: leadSession } : id === MEMBER ? { id: MEMBER, session: memberSession } : undefined),
+      },
+      get: () => undefined,
+    };
+    const agentTeams = {
+      listMembers: () => [
+        { id: TEAM, name: 'lead', role: 'lead', status: 'active' },
+        { id: MEMBER, name: 'forked', role: 'teammate', status: 'active' },
+      ],
+      listTasks: () => [],
+    };
+    const result = await graph.collectGraph({ ctx, agentTeams, leadAgent: { id: TEAM, session: leadSession }, isTeamEnabled: () => true });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const node = result.graph.nodes.find((n) => n.name === 'forked');
+    assert.ok(node !== undefined, 'fork 队员没被画出来');
+    // 只该算自己的 100 input / 20 output / 300 cacheRead
+    assert.equal(node.usage.uncachedInputTokens, 100, `把父会话的 input 算进来了：${node.usage.uncachedInputTokens}`);
+    assert.equal(node.usage.outputTokens, 20);
+    assert.equal(node.usage.cacheReadTokens, 300);
+    assert.equal(node.todo.total, 0, '把父会话的 TODO 算成队员的了');
+    // 承接边：只有 /own/only.txt，不该有父会话的 /parent/only.txt
+    const handoffs = result.graph.edges.filter((e) => e.kind === 'handoff');
+    assert.equal(handoffs.length, 0, `父会话前缀伪造出了承接边：${JSON.stringify(handoffs)}`);
+    // 浮动窗口的对话也不能含父会话内容
+    const convo = await graph.readConversationTail(MEMBER, memberSession, undefined, 50);
+    assert.ok(!convo.rows.some((r) => /parent/.test(r.text)), '浮窗里出现了父会话的内容');
+  });
+
+  await check('buildGraph：Lead 派活条数 = spawn 次数 + 后续 team/message 条数（用户 #3）', () => {
+    // 回归：实测（session-898e4c64）Lead 用 spawn_teammate 派了 3 个队员，
+    // 而 team/message 只有 2 条补充消息。只数 team/message 时另外两个队员显示「Lead 派活 0 条」。
+    const LEAD = 'lead-1';
+    const A = 'a-1';
+    const B = 'b-1';
+    const leadEvents = [
+      { type: 'tool/call', seq: 0, time: 1, data: { name: 'spawn_teammate', arguments: '{"name":"alpha","role":"builder"}' } },
+      { type: 'tool/call', seq: 1, time: 2, data: { name: 'spawn_teammate', arguments: '{"name":"beta","role":"verify"}' } },
+      { type: 'team/member', seq: 2, time: 3, data: { member: { id: A, name: 'alpha' } } },
+      { type: 'team/member', seq: 3, time: 4, data: { member: { id: B, name: 'beta' } } },
+      // 只给 alpha 发两条后续消息
+      { type: 'team/message/queued', seq: 4, time: 5, data: { message: { id: 'q1', senderName: 'lead', targetId: A, content: [] } } },
+      { type: 'team/message/queued', seq: 5, time: 6, data: { message: { id: 'q2', senderName: 'lead', targetId: A, content: [] } } },
+    ];
+    const leadStats = graph.foldSession(leadEvents);
+    const g = graph.buildGraph({
+      leadId: LEAD, leadName: 'lead',
+      members: [{ id: A, name: 'alpha', role: 'teammate' }, { id: B, name: 'beta', role: 'teammate' }],
+      statsBySession: new Map([[LEAD, leadStats]]),
+      tasks: [],
+    });
+    const ea = g.edges.find((e) => e.kind === 'dispatch' && e.to === 'alpha');
+    const eb = g.edges.find((e) => e.kind === 'dispatch' && e.to === 'beta');
+    assert.equal(ea.weight, 3, `alpha 应为 1 spawn + 2 消息 = 3，实际 ${ea.weight}`);
+    assert.equal(ea.spawned, 1);
+    assert.equal(ea.messaged, 2);
+    assert.equal(eb.weight, 1, `beta 应为 1 spawn + 0 消息 = 1（旧实现显示 0），实际 ${eb.weight}`);
+    assert.equal(eb.spawned, 1);
+    assert.equal(eb.messaged, 0);
+  });
+
+  await check('foldSession：TODO 只反映当前轮（新一轮开始清空上一轮）（用户 #6）', () => {
+    // 回归：实测 builder-copyid 的 turn 1 在 seq=520 结束、turn 2 在 seq=523 开始，
+    // 最后一次 todo/write 在 seq=514（4/0/4）。不清空的话第二轮仍显示 4/0/4。
+    const twoTurns = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      { type: 'todo/write', seq: 1, time: 1100, data: { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'completed' }] } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'turn/start', seq: 3, time: 3000, data: { turn: 2 } },
+      // turn 2 没有 todo/write
+    ]);
+    assert.equal(twoTurns.todo.total, 0, `第二轮没写 TODO 就该是 0/0/0，实际 ${JSON.stringify(twoTurns.todo)}`);
+    // 单轮会话不受影响：turn/start 在 todo/write 之前，写完立刻填回来
+    const oneTurn = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 1000, data: { turn: 1 } },
+      { type: 'todo/write', seq: 1, time: 1100, data: { todos: [{ content: 'a', status: 'completed' }, { content: 'b', status: 'in_progress' }, { content: 'c', status: 'pending' }] } },
+    ]);
+    assert.equal(oneTurn.todo.done, 1);
+    assert.equal(oneTurn.todo.running, 1);
+    assert.equal(oneTurn.todo.total, 3);
+  });
+
+  await check('effectiveRuntimeMs：未闭合 turn 也要算运行时长（额度中断后不再显示「—」）（用户 #4）', () => {
+    // 回归：runtimeMs 原本只在 turn/end 结算；额度耗尽/被杀的会话永远没有 turn/end，
+    // 于是 runtime=0 → 卡片与浮窗都显示「—」，可它明明跑了几十分钟。
+    const cut = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 10000, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 1, time: 40000, data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 60, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+      // 没有 turn/end（额度耗尽）
+    ]);
+    assert.equal(cut.runtimeMs, 0, '前提：闭合部分确实是 0');
+    assert.equal(cut.openTurns.size, 1, '前提：确实有一个未闭合 turn');
+    // 最后一条事件时间 40000 − turn 起点 10000 = 30000ms
+    assert.equal(graph.effectiveRuntimeMs(cut), 30000, `有效运行时长应为 30000ms，实际 ${graph.effectiveRuntimeMs(cut)}`);
+    // buildGraph 必须用有效值 → 节点有 runtime 与 tps
+    const g = graph.buildGraph({
+      leadId: 'L', leadName: 'lead', members: [],
+      statsBySession: new Map([['L', cut]]), tasks: [],
+    });
+    assert.equal(g.nodes[0].runtimeMs, 30000);
+    assert.ok(g.nodes[0].tps > 0, `tps 应 > 0，实际 ${g.nodes[0].tps}`);
+    assert.equal(g.nodes[0].openTurns, 1, '未闭合 turn 数要如实暴露给客户端');
+  });
+
+  await check('buildGraph：承接边方向按主导信息流，不随名单顺序漂移（用户 #7）', () => {
+    // 回归：旧实现把 pair 内**先遇到的**那条当 from（由名单顺序决定）→ 双向边里约一半流光反着播。
+    const mk = (wrote, read) => {
+      const s = graph.emptyStats();
+      for (const f of wrote) s.wrote.add(f);
+      for (const f of read) s.read.add(f);
+      return s;
+    };
+    // zeta 写了 3 个文件被 alpha 读；alpha 只写 1 个被 zeta 读 → 主导方向 zeta → alpha
+    const zeta = mk(['f1', 'f2', 'f3'], ['g1']);
+    const alpha = mk(['g1'], ['f1', 'f2', 'f3']);
+    const build = (order) => graph.buildGraph({
+      leadId: 'L', leadName: 'lead',
+      members: order === 1
+        ? [{ id: 'a', name: 'alpha', role: 'teammate' }, { id: 'z', name: 'zeta', role: 'teammate' }]
+        : [{ id: 'z', name: 'zeta', role: 'teammate' }, { id: 'a', name: 'alpha', role: 'teammate' }],
+      statsBySession: new Map([['L', graph.emptyStats()], ['a', alpha], ['z', zeta]]),
+      tasks: [],
+    });
+    const e1 = build(1).edges.find((e) => e.kind === 'handoff');
+    const e2 = build(2).edges.find((e) => e.kind === 'handoff');
+    assert.equal(e1.from, 'zeta', `主导方向应为 zeta → alpha，实际 ${e1.from} → ${e1.to}`);
+    assert.equal(e2.from, 'zeta', `名单顺序变了方向不该变，实际 ${e2.from} → ${e2.to}`);
+    assert.equal(e1.weight, 4, `两个方向合计 4 个文件，实际 ${e1.weight}`);
+    assert.equal(e1.both, true, '双向边必须标记 both（客户端据此播反向流光）');
+  });
+
+  await check('leadForSession：团队结束后从日志 header.parentSession 恢复 Lead（用户 #5）', async () => {
+    // 回归：额度耗尽 → 队员 agent 全部销毁 → 用户点队员会话打开工作区时
+    // 报「找不到会话 … 对应的活动 agent」，整页打不开。
+    //
+    // ⚠️ 这条断言的关键是**替身必须复刻官方 jsonl 后端的形状**：
+    // session 头是日志第 1 行，被 scanLog 当 meta 消费（dsh-session-persistence-jsonl:2801），
+    // `read()` 只返回 events（同文件 :2825 / :62）→ **events 里没有 type==='session'**。
+    // 第一版替身把 session 头留在 events 里，于是掩盖了「读 events 找不到 parentSession」的死代码。
+    const runtimeMod = await load('runtime.js');
+    const LEAD = 'session-recover-lead';
+    const MEMBER = 'recover-member';
+    const memberEvents = [
+      { type: 'subagent/descriptor', seq: 0, time: 1, data: {} },
+      { type: 'assistant/message', seq: 1, time: 2, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 } } },
+    ];
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 3, data: { member: { id: MEMBER, name: 'builder-r' } } },
+      { type: 'turn/start', seq: 1, time: 4, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 5000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const persistence = {
+      open: async (id) => {
+        const key = String(id).replace(/^session-/, '');
+        const isMember = key === MEMBER;
+        const events = isMember ? memberEvents : leadEvents;
+        return {
+          // 官方形状：header 单独一份（第 1 行），events 不含 session 头。
+          header: isMember ? { type: 'session', id: MEMBER, parentSession: LEAD } : { type: 'session', id: LEAD },
+          inheritedEventCount: 0,
+          read: async () => ({ events }),
+          close: async () => {},
+        };
+      },
+    };
+    // 场景：**没有任何活体 agent**（额度耗尽后全部销毁）。
+    const ctx = {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+    };
+    const found = await runtimeMod.leadForSession(ctx, MEMBER);
+    assert.equal(found.ok, true, `恢复失败：${JSON.stringify(found)}`);
+    assert.equal(found.historyOnly, true, '要标记成历史快照');
+    assert.equal(found.lead.id, LEAD, `Lead id 应为 ${LEAD}，实际 ${found.lead?.id}`);
+    // 合成的 lead **不能**带假 session：带了会让 statsForSession 走活体增量路径 → 统计全 0。
+    assert.equal(found.lead.session, undefined, '合成 lead 不许带 session（否则持久路径被短路，统计变 0）');
+    // 沿 parentSession 恢复出的 lead 必须能画出成员（走 collectGraph 的持久路径）
+    const g = await graph.collectGraph({
+      ctx,
+      agentTeams: { listMembers: () => { throw new Error('TEAM_NOT_MEMBER'); }, listTasks: () => [] },
+      leadAgent: found.lead,
+      isTeamEnabled: () => true,
+    });
+    assert.equal(g.ok, true, JSON.stringify(g));
+    const names = g.graph.nodes.map((n) => n.name).sort().join(',');
+    assert.equal(names, 'builder-r,lead', `应从 Lead 日志重建成员，实际 ${names}`);
+    assert.ok(g.notes.some((n) => n.includes('重建')), '要如实说明这是历史快照');
+  });
+
+  await check('collectGraph：刚派出的队员不能因本地账本未登记而被跳过（用户报的实时更新问题）', async () => {
+    // 用户原话（2026-10-08）：「我在只有两个队员的时候点进去工作区，他又派了一个队员，
+    // 但是工作区没有同时及时更新……还是只能看到两个队员，重进才能看到三个」。
+    //
+    // 根因：本插件的启用账本（state.installed）挂在 agent 生命周期事件上，而域服务的成员名单
+    // 会**更早**出现这个新队员。旧写法一律 `isTeamEnabled(agent) !== true → continue`，
+    // 于是新队员被整条跳过；重进工作区时账本已补齐，所以又能看到。
+    // 现在的判据：Lead 自己的日志里记着这个成员（team/member 事件）就认它。
+    const LEAD = 'lag-lead';
+    const OLD = 'lag-old';
+    const NEW = 'lag-new';
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 1, data: { member: { id: OLD, name: 'builder-old' } } },
+      { type: 'team/member', seq: 1, time: 2, data: { member: { id: NEW, name: 'builder-new' } } },
+      { type: 'turn/start', seq: 2, time: 3, data: { turn: 1 } },
+      { type: 'turn/end', seq: 3, time: 9000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    const leadSession = { id: LEAD, seq: leadEvents.length, inheritedEventCount: 0, eventAt: (s) => leadEvents[s] };
+    const mkSession = (id) => ({ id, seq: 1, inheritedEventCount: 0, eventAt: () => ({ type: 'turn/start', time: 100, data: { turn: 1 } }) });
+    const agents = {
+      [LEAD]: { id: LEAD, session: leadSession },
+      [OLD]: { id: OLD, session: mkSession(OLD) },
+      [NEW]: { id: NEW, session: mkSession(NEW) },
+    };
+    const ctx = { agents: { list: () => Object.values(agents), get: (id) => agents[id] }, get: () => undefined };
+    const agentTeams = {
+      // 域服务**已经**把新队员列进来了（它比本地账本快）
+      listMembers: () => [
+        { id: LEAD, name: 'lead', role: 'lead', status: 'active' },
+        { id: OLD, name: 'builder-old', role: 'teammate', status: 'active' },
+        { id: NEW, name: 'builder-new', role: 'teammate', status: 'provisioning' },
+      ],
+      listTasks: () => [],
+    };
+    const r = await graph.collectGraph({
+      ctx, agentTeams, leadAgent: agents[LEAD],
+      // 只认老队员：模拟「账本还没跟上刚派出去的新队员」
+      isTeamEnabled: (agent) => agent?.id === LEAD || agent?.id === OLD,
+    });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const names = r.graph.nodes.map((n) => n.name).sort().join(',');
+    assert.equal(names, 'builder-new,builder-old,lead', `新队员被跳过了（旧实现的实际表现）：${names}`);
+    // 对照：**不在 Lead 日志里**的成员仍然要被跳过（不能为了修这个把幽灵节点放进来）
+    const agentTeamsGhost = {
+      listMembers: () => [
+        { id: LEAD, name: 'lead', role: 'lead', status: 'active' },
+        { id: OLD, name: 'builder-old', role: 'teammate', status: 'active' },
+        { id: 'ghost-1', name: 'builder-ghost', role: 'teammate', status: 'active' },
+      ],
+      listTasks: () => [],
+    };
+    const agentsGhost = { ...agents, 'ghost-1': { id: 'ghost-1', session: mkSession('ghost-1') } };
+    const ctxGhost = { agents: { list: () => Object.values(agentsGhost), get: (id) => agentsGhost[id] }, get: () => undefined };
+    const g2 = await graph.collectGraph({
+      ctx: ctxGhost, agentTeams: agentTeamsGhost, leadAgent: agentsGhost[LEAD],
+      isTeamEnabled: (agent) => agent?.id === LEAD || agent?.id === OLD,
+    });
+    const names2 = g2.graph.nodes.map((n) => n.name).sort().join(',');
+    assert.ok(!names2.includes('ghost'), `不属于本团队的幽灵成员必须被跳过，实际 ${names2}`);
+  });
+
+  await check('extractQuestions：抽提问 + 配对 tool/result 判定已回答（用户：回答过不能再答）', () => {
+    // 用户 2026-10-08：「他提问的时候我在工作区看不到也收不到任何的提问信息」。
+    // 数据源必须是**会话日志**而不是官方 userQuestions 投影 —— 后者只跟踪 mode:'timed'，
+    // 本机默认 legacy → 投影恒空且不报错（dsh-user-questions/.../projection.js:200-215）。
+    // 用户 2026-10-09：「我已经回答过了，为什么还能回答？设计问题非常的大！！」→
+    // 已回答的判据 = 该 callId 有 tool/result 且内容含 answers 批次
+    // （真实日志实测：session-898e4c64 的 3 次提问全都有 result，形如
+    //  {"answers":[{"id":"ui","selected":["纯图标…"]}]}，见 .probe/probe-result-shape.cjs）。
+    const ask = (seq, callId, id, question) => ({
+      type: 'tool/call', seq, time: 100 + seq,
+      data: {
+        callId,
+        name: 'ask_user_question',
+        arguments: JSON.stringify({
+          questions: [{
+            id,
+            header: '远程仓库',
+            question,
+            multi_select: false,
+            options: [
+              { label: 'git + Private（推荐）', description: '私有，之后可一条命令改公开。' },
+              { label: 'git + Public', description: '公开，任何人可见。' },
+            ],
+          }],
+        }),
+      },
+    });
+    const result = (callId, answers) => ({
+      type: 'tool/result', time: 999,
+      data: { message: { source: { kind: 'tool', callId }, content: [{ type: 'text', text: JSON.stringify({ answers }) }] } },
+    });
+    const rows = graph.extractQuestions([
+      { type: 'tool/call', seq: 0, time: 50, data: { name: 'read', arguments: '{"file_path":"a"}' } },
+      ask(1, 'call_open', 'repo_visibility', '远程仓库用哪个名字和可见性？'),
+      ask(2, 'call_done', 'email', 'commit 作者邮箱用哪个？'),
+      result('call_done', [{ id: 'email', selected: ['用 GitHub noreply 邮箱（推荐）'] }]),
+    ], 10);
+    assert.equal(rows.length, 2, `应抽出 2 条提问，实际 ${rows.length}`);
+    const open = rows.find((r) => r.callId === 'call_open');
+    assert.equal(open.answered, false, '没有 result 的提问必须是未回答');
+    assert.equal(open.id, 'repo_visibility');
+    assert.equal(open.header, '远程仓库');
+    assert.equal(open.options.length, 2, `选项数应为 2，实际 ${open.options.length}`);
+    assert.ok(open.options[0].label.includes('Private'));
+    assert.equal(open.multi, false);
+    const done = rows.find((r) => r.callId === 'call_done');
+    assert.equal(done.answered, true, '有 answers result 的提问必须标成已回答');
+    assert.equal(done.answer, '用 GitHub noreply 邮箱（推荐）', `已回答卡应带答案文本，实际 ${done.answer}`);
+    // 自定义回答形状（selected 空、custom 有值）
+    const customRows = graph.extractQuestions([
+      ask(1, 'call_c', 'install', '装到哪？'),
+      result('call_c', [{ id: 'install', selected: [], custom: '链接到 C 盘插件目录' }]),
+    ], 10);
+    assert.equal(customRows[0].answered, true);
+    assert.equal(customRows[0].answer, '链接到 C 盘插件目录', 'custom 答案要能显示');
+    // 非 ask 工具调用不该产出任何问题
+    const none = graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'read', arguments: '{}' } }], 10);
+    assert.equal(none.length, 0);
+    // 坏 JSON / 缺 questions 字段也不能抛
+    assert.equal(graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'ask_user_question', arguments: '{bad' } }], 10).length, 0);
+    assert.equal(graph.extractQuestions([{ type: 'tool/call', seq: 0, time: 1, data: { name: 'ask_user_question', arguments: '{}' } }], 10).length, 0);
+  });
+
+  await check('leadForSession：带 session- 前缀的队员 id 与 Lead 自己会话都能恢复（用户 #5 缺口②③）', async () => {
+    // 两个真实缺口（2026-10-08 用真日志实测发现）：
+    //   ② 持久层按目录名**精确匹配**，而队员目录是裸 uuid、Lead 目录带 session- 前缀
+    //      （实测 `open('session-ca6e6ecd-…')` 抛、`open('ca6e6ecd-…')` 成功）
+    //      → open 必须前缀双试，否则带前缀的队员 id 打不开。
+    //   ③ **Lead 自己的会话没有 parentSession**，而官方成员面板在 Lead 会话里也显示入口
+    //      → 「在 Lead 会话里点进入工作区」在团队结束后必须也能恢复（靠投影缓存判 members>1）。
+    const runtimeMod = await load('runtime.js');
+    const LEAD = 'session-recover-lead2';
+    const MEMBER = 'recover-member2';
+    const memberEvents = [{ type: 'assistant/message', seq: 0, time: 2, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 } } }];
+    const leadEvents = [
+      { type: 'team/member', seq: 0, time: 3, data: { member: { id: MEMBER, name: 'builder-r2' } } },
+      { type: 'turn/start', seq: 1, time: 4, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 5000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ];
+    // 严格复刻官方形状：header 单独一份；**只认精确目录名**（所以前缀双试才有意义）。
+    const persistence = {
+      open: async (id) => {
+        const isLead = id === LEAD;
+        const isMember = id === MEMBER;
+        if (!isLead && !isMember) throw new Error(`no log for ${id}`);
+        return {
+          header: isMember ? { type: 'session', id: MEMBER, parentSession: LEAD } : { type: 'session', id: LEAD },
+          inheritedEventCount: 0,
+          read: async () => ({ events: isMember ? memberEvents : leadEvents }),
+          close: async () => {},
+        };
+      },
+    };
+    // 投影缓存：**只有 Lead 的会话**有 members（>1）。这是缺口③ 的唯一判据。
+    const projectionCache = {
+      cachedSnapshot: (header) => (header?.id === LEAD
+        ? { values: { agentTeam: { members: [{ id: LEAD, role: 'lead', name: 'lead' }, { id: MEMBER, role: 'teammate', name: 'builder-r2' }], tasks: [{ id: 'task-1', status: 'pending' }] } }, asOfSeq: 9 }
+        : undefined),
+    };
+    const ctx = {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : name === 'sessionProjectionCache' ? projectionCache : undefined),
+    };
+    // ② 带前缀的队员 id
+    const prefixed = await runtimeMod.leadForSession(ctx, `session-${MEMBER}`);
+    assert.equal(prefixed.ok, true, `带前缀的队员 id 应能恢复：${JSON.stringify(prefixed)}`);
+    assert.equal(prefixed.lead.id, LEAD);
+    // ③ Lead 自己的会话
+    const asLead = await runtimeMod.leadForSession(ctx, LEAD);
+    assert.equal(asLead.ok, true, `Lead 自己的会话应能恢复：${JSON.stringify(asLead)}`);
+    assert.equal(asLead.historyOnly, true);
+    assert.equal(asLead.lead.id, LEAD);
+    assert.equal(asLead.lead.session, undefined, '合成 lead 不许带 session');
+    // 负对照：不存在的 id 必须失败（不能因为兜底把什么都当团队）
+    const missing = await runtimeMod.leadForSession(ctx, 'nope-9999');
+    assert.equal(missing.ok, false, '不存在的 id 必须失败');
+    // 负对照：投影缓存里 members 只有 lead 一个 → 不算团队
+    const loneCache = { cachedSnapshot: () => ({ values: { agentTeam: { members: [{ id: LEAD, role: 'lead' }] } } }) };
+    const ctxLone = {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : name === 'sessionProjectionCache' ? loneCache : undefined),
+    };
+    const lone = await runtimeMod.leadForSession(ctxLone, LEAD);
+    assert.equal(lone.ok, false, 'members 只有 lead 一个时不该判成团队（实测 213 份缓存里只有 9 份 members 非空）');
   });
 
   console.log('');
