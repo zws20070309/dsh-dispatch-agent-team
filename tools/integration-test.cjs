@@ -516,8 +516,10 @@ async function main() {
     });
 
     check('系统提示词前缀规模在预算内（这段前缀每次请求都要付钱）', () => {
-      if (ownLead > 4900) return `Lead 侧自有段落 ${ownLead} 字符 > 4900`;
-      if (ownMate > 1550) return `队员侧自有段落 ${ownMate} 字符 > 1550`;
+      // 上限与 selftest 的预算表同步（2026-10-09 上调：新增 PTC 借鉴纪律 + 修回误删细节）。
+      // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
+      if (ownLead > 5000) return `Lead 侧自有段落 ${ownLead} 字符 > 5000`;
+      if (ownMate > 1650) return `队员侧自有段落 ${ownMate} 字符 > 1650`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
       if (scoutPrompt.length < playbook.TEAMMATE_CARD.length) return '渲染结果比队员卡还短（卡没注册上？）';

@@ -657,9 +657,15 @@ function functionBodyOf(source, needle) {
 
   await check('提示词预算：系统提示词前缀不许膨胀（每多一个字，每次请求都多付一次钱）', () => {
     const budget = {
-      PLAYBOOK: 3800,        // 调度模式方法论（Lead 与所有请求的前缀）。2026-10-04 从 4100 收到 3900、2026-10-04 再按审查 P2-10 收到 3800：只防「超预算」不防「贴边」，留余量给以后新增的纪律
+      // 2026-10-09 上调 3800→3900 / 1150→1200：这两处增长都有明确来源，不是「往上堆」——
+      //   ① 新增用户要求的 PTC 借鉴纪律（批量取证 + 先过滤再汇报，见下面的专项断言）；
+      //   ② 修回 2026-10-09 压缩事故中误删的细节（URL、「不知道就说不知道」、
+      //      「（它对你不可用）」的原因、blocked 的判据、冻结文件的举例与「让 Lead 判断」）。
+      // 教训记在这里：那次为守住 3800/1150 而删掉的是**信息**，不是冗余；压缩该合并同义表述，
+      // 不该删事实。上调幅度只覆盖真实新增 + 一点余量，不开口子。
+      PLAYBOOK: 3900,        // 调度模式方法论（Lead 与所有请求的前缀）
       TEAM_POLICY: 800,      // 团队运行期事实（开后才有）
-      TEAMMATE_CARD: 1150,   // 队员卡（每个队员的固定前缀）
+      TEAMMATE_CARD: 1250,   // 队员卡（每个队员的固定前缀）；留 ~50 余量，避免再次为「贴边」删信息
     };
     const actual = {
       PLAYBOOK: playbook.PLAYBOOK.length,
@@ -674,8 +680,8 @@ function functionBodyOf(source, needle) {
     );
     const lead = actual.PLAYBOOK + actual.TEAM_POLICY;
     const mate = actual.TEAMMATE_CARD + playbook.teammateBrief('scout', 'scout').length;
-    assert.ok(lead <= 4900, `Lead 侧提示词 ${lead} > 4900 字符`);
-    assert.ok(mate <= 1550, `队员侧提示词 ${mate} > 1550 字符`);
+    assert.ok(lead <= 5000, `Lead 侧提示词 ${lead} > 5000 字符`);
+    assert.ok(mate <= 1650, `队员侧提示词 ${mate} > 1650 字符`);
   });
 
   await check('纪律只在 PLAYBOOK、运行期语义只在 TEAM_POLICY（重复写 = 多付钱 + 迟早自相矛盾）', () => {
@@ -691,6 +697,28 @@ function functionBodyOf(source, needle) {
     }
   });
 
+  await check('队员/Lead 提示词的**关键细节**不许再被压缩删掉（2026-10-09 压缩事故的永久闸门）', () => {
+    // 事故经过：为把 TEAMMATE_CARD 压回 1150，我删掉了一批**信息**（不是冗余），
+    // 事后逐字 diff 才发现。这些点各自都有真实用途，逐条钉住：
+    //   * URL —— researcher 引外部来源、web 类结论的唯一凭据形式；
+    //   * 「不知道就说不知道」—— 诚实纪律，去掉后模型倾向于硬编一个答案；
+    //   * 「或在报告里写清楚」—— ask_lead 之外的**备选上报路径**（不可用时不至于卡死）；
+    //   * 「（它对你不可用）」—— 解释原因，否则队员会以为是自己没找到那个工具；
+    //   * blocked 的判据「需要 Lead 决策或外部条件」—— 没判据就会滥用/误用该状态；
+    //   * 冻结文件的举例「（测试、验收脚本）」+「让 Lead 判断」—— 决定谁来裁决；
+    //   * PLAYBOOK 的「（工具面强制）」「不许当事实」「真实调用链验证」。
+    const card = playbook.TEAMMATE_CARD;
+    for (const marker of ['URL', '不知道就说不知道', '或在报告里写清楚', '它对你不可用',
+      '需要 Lead 决策或外部条件', '测试、验收脚本', '让 Lead 判断', '标 blocking=false']) {
+      assert.ok(card.includes(marker), `队员卡丢了这个细节：「${marker}」——它是信息，不是冗余`);
+    }
+    const pb = playbook.PLAYBOOK;
+    for (const marker of ['（工具面强制）', '不许当事实', '真实调用链验证', '推荐：<推荐答案>',
+      '冻结的验收文件（只读）', '工具会把该角色的使命/纪律/写权限自动拼在你正文之前']) {
+      assert.ok(pb.includes(marker), `PLAYBOOK 丢了这个细节：「${marker}」——它是信息，不是冗余`);
+    }
+  });
+
   await check('PTC 借鉴纪律：批量取证 / 先过滤后汇报，Lead 与队员两侧都在（防以后被当噪音删掉）', () => {
     // 用户 2026-10-09 要求把 PTC（Programmatic Tool Calling）的方法论借鉴进团队。
     // 官方 PTC 预设与 standard 的唯一实质差异是 `tool-presentation: {mode: ptc}`
@@ -701,11 +729,13 @@ function functionBodyOf(source, needle) {
     // 两侧都必须有：队员卡管队员自己的取证方式，PLAYBOOK 管 Lead 对派活的要求
     // （只写一边会出现「Lead 不问、队员不做」的缺口）。
     assert.ok(playbook.TEAMMATE_CARD.includes('一次调用取一批'), '队员卡缺少「一次调用取一批」纪律');
-    assert.ok(playbook.TEAMMATE_CARD.includes('先过滤再进上下文'), '队员卡缺少「先过滤再进上下文」纪律');
+    assert.ok(playbook.TEAMMATE_CARD.includes('原始输出自己筛算合并'), '队员卡缺少「先过滤再进上下文」纪律');
+    assert.ok(playbook.TEAMMATE_CARD.includes('别拆成 N 次往返'), '队员卡缺少「别拆成 N 次往返」的明确反例');
     assert.ok(playbook.PLAYBOOK.includes('批量取证'), 'PLAYBOOK 缺少对队员的「批量取证」要求');
     assert.ok(playbook.PLAYBOOK.includes('先过滤再汇报'), 'PLAYBOOK 缺少对队员的「先过滤再汇报」要求');
     // 反面对照：纪律不许散落到 TEAM_POLICY（那里只放运行期语义，写重复 = 多付钱 + 自相矛盾）。
     assert.ok(!playbook.TEAM_POLICY.includes('一次调用取一批'), 'TEAM_POLICY 不该出现取证纪律');
+    assert.ok(!playbook.TEAM_POLICY.includes('批量取证'), 'TEAM_POLICY 不该出现取证纪律');
   });
 
   await check('用户可见文本：/team 用用户原文、续写指令固定措辞、**没有**会被排队的注入说明', () => {
