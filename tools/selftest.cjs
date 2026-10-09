@@ -1153,6 +1153,17 @@ function functionBodyOf(source, needle) {
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
   });
 
+  await check('markdown 表格渲染：解析器存在且成表（用户 2026-10-09 截图报「表格渲染有问题」）', () => {
+    // 用户截图里 `| 检查项 | 结果 |` / `|---|---|` 原样显示成乱码 —— 渲染器缺表格支持。
+    // 完整的**行为**断言在 .probe/test-table.cjs 与 .probe/ws-e2e.mjs（需要浏览器 DOM）；
+    // 这里做静态闸门：解析器必须在，且被 wsMarkdown 调用（防有人删掉后无人察觉）。
+    const src = readFileSync(require('node:path').join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(src.includes('function wsTableAt('), 'client.js 缺少 wsTableAt 表格解析器');
+    assert.ok(src.includes('const table = wsTableAt(lines, i)'), 'wsMarkdown 必须调用 wsTableAt');
+    assert.ok(src.includes('.dat-ws .md table{'), '缺少表格样式（.dat-ws .md table）');
+    assert.ok(src.includes('md-table'), '缺少表格容器样式（.md-table，用于横向滚动）');
+  });
+
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
     // 用户 2026-10-09：「一定要正确，和我用官方的对话框没太大区别」。
     // 官方真值来自 dsh-client-ui-conversation/lib/client.js 的 locale 块，
