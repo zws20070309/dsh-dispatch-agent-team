@@ -156,11 +156,17 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 
 | 文本 | 预算 | 当前 | 谁在读 |
 |---|---|---|---|
-| `PLAYBOOK` | ≤ 3800 | **3783** | 调度模式的**每一次**请求（Lead） |
+| `PLAYBOOK` | ≤ 3900 | **3848** | 调度模式的**每一次**请求（Lead） |
 | `TEAM_POLICY` | ≤ 800 | **758** | 团队开启后的 Lead |
-| `TEAMMATE_CARD` | ≤ 1150 | **1134** | 每个队员的固定前缀 |
-| Lead 侧合计 | ≤ 4900 | **4541** | |
-| 队员侧合计（卡 + 角色简报） | ≤ 1550 | **1509** | 简报是第一条 user 消息，同样进前缀 |
+| `TEAMMATE_CARD` | ≤ 1250 | **1199** | 每个队员的固定前缀 |
+| Lead 侧合计 | ≤ 5000 | **4606** | |
+| 队员侧合计（卡 + 角色简报） | ≤ 1650 | **1574** | 简报是第一条 user 消息，同样进前缀 |
+
+> 2026-10-09 上调上限（3800→3900、1150→1200、合计 4900→5000 / 1550→1600）：新增用户要求的
+> PTC 借鉴纪律（批量取证 / 先过滤后汇报），并修回同一次压缩中**误删的细节**（URL、「不知道就说
+> 不知道」、`ask_lead` 之外的备选路径、blocked 的判据、冻结文件的举例与「让 Lead 判断」）。
+> **教训**：压缩要合并同义表述，不许删事实——为守住上限而删信息是本末倒置。selftest 里同时
+> 有专项断言钉住那些细节不许再消失。
 
 改这四段文本后必须重跑 `node tools/selftest.cjs`：那条闸门会拿上面的数字与模块实测长度对账
 （`README` 里的旧副本已随文档精简移除，现在这份表是唯一真值）。
@@ -220,6 +226,54 @@ export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点
 export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
+export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
+                                            //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。
+                                            //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
+                                            //    **口径**：每个会话只统计「它自己的事件」，必须跳过
+                                            //    fork 继承来的父会话前缀（官方 eventAt(seq) 是裸下标、
+                                            //    含前缀；ownEvents()/isOwnSeq() 才是排掉它的 API）。
+                                            //    不跳的后果（2026-10-08 实测）：3 个 fork 成员各带
+                                            //    884 条 Lead 历史 → 底栏总 token 多算 40659870（+28.8%）、
+                                            //    承接边 32（真值 14）、队员的 wrote/read/todo 全是 Lead 的。
+                                            //    判据：session.inheritedEventCount，拿不到就扫
+                                            //    subagent/descriptor 的位置（ownStartSeq/ownStartOfEvents）。
+export async function teamConversation(ctx, sessionId, targetId, limit?);
+                                            //    浮动窗口的对话尾部。**只**允许读该会话所在团队
+                                            //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
+                                            //    同样跳过 fork 继承前缀（否则浮窗里显示的是 Lead 的对话）。
+export async function teamQuestions(ctx, sessionId, targetId);
+                                            //    工作区聊天框：读某个成员「向用户提过的问」
+                                            //    （`ask_user_question` 工具调用）。数据源是**会话日志**
+                                            //    而不是官方 `userQuestions` 投影 —— 后者只跟踪
+                                            //    `mode: "timed"`，本机默认 legacy → 投影恒空且不报错
+                                            //    （dsh-user-questions/lib/types/projection.js:200-215）。
+export async function teamSend(ctx, sessionId, targetId, text);
+                                            //    工作区聊天框：发一条用户消息。**必须按会话类型分流**：
+                                            //    Lead → `sessionController.prompt({sessionId,content,mode:'queue',requestId})`
+                                            //      （dsh-api-session-controller/lib/index.js:850）；
+                                            //    队员（origin==='subagent'）→ prompt 恒被拒
+                                            //      （同文件 :126-132 对 origin 恒 true → `session/agent-busy`），
+                                            //      改走 `subagents.prompt({parentSessionId,childSessionId,
+                                            //      mode:'continuable',delivery:'queue',content})`
+                                            //      （dsh-subagent/lib/index.js:3011），且父会话必须活着。
+export async function teamAnswer(ctx, sessionId, targetId, callId, answers);
+                                             //    工作区提问卡：回答一次 ask_user_question。两条通道依次：
+                                             //    ① `userQuestions.answer(agent, callId, {answers})`
+                                             //      （dsh-user-questions/lib/index.js:552）—— 只对
+                                             //      **continued** 态有效（:554），答案写成
+                                             //      `user-question-reply` 用户消息（:561-582，官方投影
+                                             //      判「已回答」的同一条记录，projection.js:261-267）；
+                                             //      队员抛 DELEGATED_CALLER（assertLiveRoot :531-535）。
+                                             //    ② 兜底：格式化成一条消息走 teamSend（queue 投递，
+                                             //      **不打断当前轮**）。返回 {ok, via:'userQuestions'|'message'}。
+                                             //    ⚠️ 不做「插件注册 user-questions/request waterfall 抢答」：
+                                             //      官方 client 已占该席位（dsh-client-ui-user-questions/
+                                             //      lib/client.js:1927），抢单会挤掉官方提问卡造成双答案。
+                                             //    已回答判定在**数据层**：extractQuestions 配对
+                                             //      tool/result 的 answers 批次（实测已答提问都有 result）。
+export async function leadForSession(ctx, sessionId); // 上面几个共用的「成员会话 → Lead agent」解析：
+                                            //    先按 id（含/不含 session- 前缀两种键）找活体 agent，
+                                            //    再用域服务 membership.root 回到 Lead。
 ```
 
 ### 3.1 `enable()` 必须做的事（顺序固定）
@@ -509,7 +563,11 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     `{op:'get'}` → `{ok:true, config, roles:[...], path, revision, diagnostics}`；
     `{op:'list-models'}` → `{ok:true, groups, failures}`；
     `{op:'set', args:{roles, revision}}` → `{ok:true, config, revision}`，revision 不一致时
-    `{ok:false, conflict:true, revision, error}`；`{op:'reset'}` → `{ok:true, config, revision}`。
+    `{ok:false, conflict:true, revision, error}`；`{op:'reset'}` → `{ok:true, config, revision}`；
+    `{op:'team-graph', args:{sessionId}}` → `{ok:true, graph:{nodes,edges,tasks,totals}, leadSessionId, notes}`
+    （工作区画布的唯一数据源，见 §3 的 teamGraph；未开团队时 `{ok:false, notEnabled:true}`）；
+    `{op:'team-conversation', args:{sessionId, targetId, limit}}` → `{ok:true, rows:[{kind,text,time}]}`
+    （浮动窗口的对话尾部；targetId 不属于该团队 → `{ok:false}`）。
 - UI 要求（「原版 UI 味道」：灰阶、细边框、12–13px、克制，**不要花哨、不要浓 AI 味**）：
   - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（mcp-manager 的 CSS 可抄）。
   - 每个角色一行：角色名（中文）+ 角色 id（等宽小字）+ 使命一句话；「模型」下拉；「思考强度」下拉。
