@@ -691,6 +691,23 @@ function functionBodyOf(source, needle) {
     }
   });
 
+  await check('PTC 借鉴纪律：批量取证 / 先过滤后汇报，Lead 与队员两侧都在（防以后被当噪音删掉）', () => {
+    // 用户 2026-10-09 要求把 PTC（Programmatic Tool Calling）的方法论借鉴进团队。
+    // 官方 PTC 预设与 standard 的唯一实质差异是 `tool-presentation: {mode: ptc}`
+    // （dsh-web-app/presets/ptc.patch.yml）—— 它改的是「模型怎么调工具」，不是工具集。
+    // 本插件不能按队员切 preset（子会话强制继承 Lead 的 preset），所以只借鉴**方法**：
+    // ① 一次调用取一批（合并命令 / 交替模式 grep / 循环），别拆成 N 次往返；
+    // ② 原始输出先自己筛算合并，只把结论与关键行带进上下文。
+    // 两侧都必须有：队员卡管队员自己的取证方式，PLAYBOOK 管 Lead 对派活的要求
+    // （只写一边会出现「Lead 不问、队员不做」的缺口）。
+    assert.ok(playbook.TEAMMATE_CARD.includes('一次调用取一批'), '队员卡缺少「一次调用取一批」纪律');
+    assert.ok(playbook.TEAMMATE_CARD.includes('先过滤再进上下文'), '队员卡缺少「先过滤再进上下文」纪律');
+    assert.ok(playbook.PLAYBOOK.includes('批量取证'), 'PLAYBOOK 缺少对队员的「批量取证」要求');
+    assert.ok(playbook.PLAYBOOK.includes('先过滤再汇报'), 'PLAYBOOK 缺少对队员的「先过滤再汇报」要求');
+    // 反面对照：纪律不许散落到 TEAM_POLICY（那里只放运行期语义，写重复 = 多付钱 + 自相矛盾）。
+    assert.ok(!playbook.TEAM_POLICY.includes('一次调用取一批'), 'TEAM_POLICY 不该出现取证纪律');
+  });
+
   await check('用户可见文本：/team 用用户原文、续写指令固定措辞、**没有**会被排队的注入说明', () => {
     // `/team <args>` 注入给 Lead 的就是**用户自己那一行**（2026-10-01 用户反馈：会话里必须看到 /team，
     // 不能变成一段用户没打过的系统口吻气泡）。rawInput 的形状依据 dsh-commands 的 parseCommand。
