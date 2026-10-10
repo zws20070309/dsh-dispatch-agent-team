@@ -89,6 +89,7 @@ const PACKAGE_FILES = [
   'lib/text-clip.js',
   'lib/graph.js',
   'lib/client.js',
+  'lib/self-heal.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
   'tools/integration-test.cjs',
@@ -530,6 +531,27 @@ if (installed && fs.existsSync(installedDir)) {
 }
 if (manifestMissing === 0) console.log('- 源码文件清单：齐备');
 console.log('');
+
+// ── DSH 运行态检测（用户 2026-10-10 的困惑：「修了怎么还是不生效」）─────────────
+// profile 的 cordis.patch.yml 是**启动时读入**的：如果 DSH 正在运行，
+// 本脚本刚写进去的「关官方 tool-agent-team 行 + 容量 48」**不会影响当前进程** ——
+// 用户会看到「体检说好了、界面仍显示 Team 暂不可用」，以为修复失败。
+// 所以这里主动探测进程，并把「先退出 DSH」说成明确的第一步。
+let dshRunning = 0;
+try {
+  const { execSync } = require('node:child_process');
+  // 只数进程名，不碰窗口标题（避免把别的程序算进来）。
+  const out = execSync('tasklist /FI "IMAGENAME eq DeepSeek Harness.exe" /NH', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  dshRunning = (out.match(/DeepSeek Harness\.exe/gi) ?? []).length;
+} catch { /* 非 Windows 或 tasklist 不可用：跳过这项检测，不影响其它检查 */ }
+if (dshRunning > 0) {
+  console.log(`检测到 DSH 正在运行（${dshRunning} 个进程）。`);
+  console.log('  ⚠️ profile 的 cordis.patch.yml 在**启动时**读入 —— 本脚本对它的修改');
+  console.log('     对**当前进程无效**。要让「关官方工具行 + 容量 48」生效，必须：');
+  console.log('     ① 完全退出 DSH；② 再跑一次本脚本（或直接启动，插件会自愈）；③ 启动。');
+  console.log('     判据：下次启动后「运行时 agent-team 有效 maxMembers」应显示 48。');
+  console.log('');
+}
 
 // ── 结论 ─────────────────────────────────────────────────────────────────────
 if (notes.length > 0) {

@@ -1153,6 +1153,38 @@ function functionBodyOf(source, needle) {
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
   });
 
+  await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
+    // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
+    // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方
+    // tool-agent-team 行 + agent-team 容量 48）整段消失 ⇒ 官方九个团队工具与本插件
+    // 同名冲突（tool "spawn_teammate" is already registered in this scope）、
+    // 界面显示「Team 暂不可用」。
+    // 修法：插件启动时自愈（lib/self-heal.js 的 healManagedBlock）。
+    //
+    // 这条闸门守**两份定义的一致性**：自愈写进去的块必须与 repair.cjs 期望的完全相同，
+    // 否则会出现「自愈说修好了、repair --check 仍报缺」这种自相矛盾的状态。
+    const healSrc = readFileSync(path.join(__dirname, '..', 'lib', 'self-heal.js'), 'utf8');
+    const repairSrc = readFileSync(path.join(__dirname, 'repair.cjs'), 'utf8');
+    const markerRe = /const MANAGED_(START|END) = '([^']+)'/g;
+    const fromHeal = {};
+    const fromRepair = {};
+    for (const m of healSrc.matchAll(markerRe)) fromHeal[m[1]] = m[2];
+    for (const m of repairSrc.matchAll(markerRe)) fromRepair[m[1]] = m[2];
+    assert.equal(fromHeal.START, fromRepair.START, 'MANAGED_START 两份定义不一致');
+    assert.equal(fromHeal.END, fromRepair.END, 'MANAGED_END 两份定义不一致');
+    for (const key of ['maxMembers', 'maxTasks', 'maxPendingMessagesPerMember', 'maxMessageBytes', 'disposalTimeoutMs']) {
+      const inRepair = new RegExp(key + ':\\s*(\\d+)').exec(repairSrc);
+      const inHeal = new RegExp(key + ':\\s*(\\d+)').exec(healSrc);
+      assert.ok(inRepair !== null, `repair.cjs 里找不到 ${key}`);
+      assert.ok(inHeal !== null, `self-heal.js 里找不到 ${key}`);
+      assert.equal(inHeal[1], inRepair[1], `${key} 两份定义不一致（repair=${inRepair[1]} self-heal=${inHeal[1]}）`);
+    }
+    assert.ok(healSrc.includes('- id: tool-agent-team') && healSrc.includes('disabled: true'),
+      'self-heal.js 的托管块必须包含「关掉官方 tool-agent-team 行」');
+    const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+    assert.ok(indexSrc.includes('healManagedBlock'), 'lib/index.js 必须调用 healManagedBlock（否则自愈形同虚设）');
+  });
+
   await check('markdown 表格渲染：解析器存在且成表（用户 2026-10-09 截图报「表格渲染有问题」）', () => {
     // 用户截图里 `| 检查项 | 结果 |` / `|---|---|` 原样显示成乱码 —— 渲染器缺表格支持。
     // 完整的**行为**断言在 .probe/test-table.cjs 与 .probe/ws-e2e.mjs（需要浏览器 DOM）；
