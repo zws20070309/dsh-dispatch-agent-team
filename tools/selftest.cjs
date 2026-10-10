@@ -1153,6 +1153,41 @@ function functionBodyOf(source, needle) {
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
   });
 
+  await check('dispatch-mode preset 必须把 tool-ask-user 设为 mode: timed（否则弹窗回答关不掉官方提问卡）', () => {
+    // 用户 2026-10-10 报障：「我在弹窗里回答了问题，点发送后显示已回答，
+    // 但退出工作区后官方页面仍显示等待我回答」。
+    //
+    // 根因（官方源码 + 真实会话复算）：
+    //   官方 ask_user_question 有两条互不相通的路径，由工具 schema 是否声明
+    //   `timeout` 决定（dsh-user-questions/lib/index.js:190 的 timed 判定）：
+    //     * legacy（无 config 的默认）：:200 `if (!fold.timed || ...) return fold`
+    //       —— 投影整条跳过，提问走 :681 `ctx.waterfall("user-questions/request")`，
+    //       答案只能由持有该 waterfall 的一方给出（只存在于官方前端内存：
+    //       dsh-client-ui-user-questions/lib/client.js:1927 + :1795）。
+    //       宿主侧 `userQuestions.answer()` 于是 :554 找不到 → :555 return false
+    //       ⇒ **插件根本无法关闭官方提问卡**。
+    //     * timed（本 preset 的 config）：提问进投影记 continued，
+    //       官方卡片自己的提交路径也变成 RPC（同文件 :396-405
+    //       `#state === "continued" && rpc !== void 0 → rpc.answer(...)`），
+    //       与插件走**同一条** userQuestions.answer ⇒ 弹窗回答能真正 settle。
+    //
+    // 实测判据（.probe/verify-timed-legacy-real.cjs）：本机 session-3cc0092d 的
+    // request/header 里 ask_user_question 参数只有 ["questions"] ⇒ legacy。
+    //
+    // 这条闸门防止有人删掉 mode: timed 而无人察觉（症状是「弹窗说已回答、官方还在等」，
+    // 从代码表面完全看不出来）。
+    const yml = readFileSync(path.join(__dirname, '..', 'presets', 'dispatch-mode.patch.yml'), 'utf8');
+    const at = yml.indexOf('- id: tool-ask-user');
+    assert.ok(at >= 0, 'dispatch-mode preset 里找不到 tool-ask-user 行');
+    // 取该行往后 8 行作为这个条目的块
+    const block = yml.slice(at).split('\n').slice(0, 8).join('\n');
+    assert.ok(/^\s*mode:\s*timed\s*$/m.test(block),
+      'tool-ask-user 必须设 mode: timed —— 否则提问走 legacy waterfall，'
+      + '插件（以及工作区弹窗）永远无法关闭官方提问卡，用户会看到「已回答但官方仍等待」');
+    assert.ok(/^\s*timeout:\s*\d+\s*$/m.test(block),
+      'mode: timed 必须同时给一个默认 timeout（秒），否则官方按未配置处理');
+  });
+
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
     // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
     // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方
