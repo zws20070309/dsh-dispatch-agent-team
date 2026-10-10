@@ -90,6 +90,7 @@ const FILES = [
   'lib/text-clip.js',
   'lib/graph.js',
   'lib/client.js',
+  'lib/self-heal.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
   'tools/integration-test.cjs',
