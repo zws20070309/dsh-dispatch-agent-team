@@ -64,6 +64,109 @@ const MANAGED_START = '# ── dispatch-agent-team:managed:start（由 tools/re
 const MANAGED_END = '# ── dispatch-agent-team:managed:end ──';
 
 /**
+ * 哨兵区内**允许**出现的行 id：只有本插件自己写的这两条。
+ *
+ * ── 为什么必须校验（2026-10-10 P0，已用真实 profile 复现）────────────────────
+ * profile 的 cordis.patch.yml 是**顶层 YAML 序列**。宿主 dsh-plugin-manager 在
+ * 插件页切换任一组件时走 writePluginEnabled（其 patch.js 的 `document.add()`），
+ * 而 YAML AST 的 add() 把新条目追加在**最后一个序列项之后、尾部注释之前**。
+ * 托管块原本写在**文件末尾**（MANAGED_END 是最后一行），于是：
+ *   1. 新插件行被插进哨兵区**内部**（实测：permission 第 325-338 行、llm-pi-ai 第 339-351 行
+ *      都落在 managed:start(306) 与 managed:end(353) 之间）；
+ *   2. 随后 --apply / --revert 的「整段切片重写」把它们**静默删掉**
+ *      （实测 16623 → 15096 字节，dsh-permission-presets / llm-pi-ai / JIYUAN_API_KEY 全没了）；
+ *   3. 而体检抓不到：repair 的两条正则都通过、self-heal 只查 includes(MANAGED_START)。
+ *
+ * 两条修法（本文件同时做）：
+ *   * **结构**：托管块改写到文件**开头**（见 managedBlockPrefix）——AST 追加永远发生在
+ *     最后一个序列项之后，块在开头时新行只会落在块**之后**，不再进哨兵区；
+ *   * **防御**：切片前先把哨兵区里的**外来行**救出来并重新放回正文
+ *     （见 removeManagedBlock），外来内容永远不是我们有权删除的。
+ */
+const MANAGED_ROW_IDS = ['tool-agent-team', 'agent-team'];
+
+/** 托管块在文本里的区间；没有成对哨兵时返回 null。 */
+function managedRegion(text) {
+  const start = text.indexOf(MANAGED_START);
+  const end = text.indexOf(MANAGED_END);
+  if (start < 0 || end <= start) return null;
+  return { start, end, bodyStart: start + MANAGED_START.length, bodyEnd: end };
+}
+
+/**
+ * 把一段文本按「顶层条目」切开：一条顶层 `- id:` / `- insert:` 行开启一个新块，
+ * 其后的缩进行与注释行都归属该块；首个条目之前的行算 head（文件头注释）。
+ * @param {string} text
+ * @returns {{head: string[], rows: {id: string, lines: string[]}[]}}
+ */
+function splitRows(text) {
+  const head = [];
+  const rows = [];
+  let current = null;
+  for (const line of text.split('\n')) {
+    const m = /^-\s*(?:id:\s*(\S+)|(insert):)/.exec(line);
+    if (m !== null) {
+      current = { id: m[1] === undefined ? 'insert' : m[1], lines: [line] };
+      rows.push(current);
+    } else if (current !== null) {
+      current.lines.push(line);
+    } else {
+      head.push(line);
+    }
+  }
+  return { head, rows };
+}
+
+/**
+ * 摘掉托管块，并把哨兵区里**不属于本插件**的行救回正文末尾。
+ *
+ * 语义：哨兵区只标记「本插件写的那两条行」的范围；落在区内的外来行是宿主 AST 追加的
+ * 副作用，删除它们等于替用户删配置。所以这里先摘出来、再放回正文。
+ *
+ * @param {string} text - profile patch 全文。
+ * @returns {{text: string, rescued: string[], present: boolean}} 处理后的文本、救回的行 id、是否原本有块。
+ */
+function removeManagedBlock(text) {
+  const region = managedRegion(text);
+  if (region === null) return { text, rescued: [], present: false };
+  const body = text.slice(region.bodyStart, region.bodyEnd);
+  const { rows } = splitRows(body);
+  const rescuedRows = rows.filter((row) => !MANAGED_ROW_IDS.includes(row.id));
+  const outside = text.slice(0, region.start) + text.slice(region.end + MANAGED_END.length);
+  let next = outside.replace(/(?:\n[ \t]*)+$/u, '\n');
+  const rescuedText = rescuedRows
+    .map((row) => row.lines.join('\n').replace(/\s+$/u, ''))
+    .filter((chunk) => chunk.trim() !== '');
+  if (rescuedText.length > 0) {
+    next = `${next.replace(/\s*$/u, '')}\n\n${rescuedText.join('\n\n')}\n`;
+  }
+  return { text: next, rescued: rescuedRows.map((row) => row.id), present: true };
+}
+
+/** 托管块必须写在文件**开头**，理由见 MANAGED_ROW_IDS 上方。 */
+function managedBlockPrefix(block, body) {
+  return `${block}\n\n${body.replace(/^\s*\n/u, '')}`;
+}
+
+/**
+ * 第一个顶层条目（`- id:` / `- insert:`）的**字符偏移**；没有则 -1。
+ *
+ * 必须是字符偏移而不是行号：判定「块是否在开头」要比较字符位置。
+ * 2026-10-10 初版把行号传给了 `String.slice`，块明明在第 1 行却被判成「不在开头」，
+ * 于是 --apply 每次都重写一遍（幂等性丢失）。
+ * @param {string} text - 待检查的文本。
+ * @returns {number} 字符偏移，或 -1。
+ */
+function firstTopLevelRowOffset(text) {
+  let offset = 0;
+  for (const line of text.split('\n')) {
+    if (/^-\s*(?:id:|insert:)/u.test(line)) return offset;
+    offset += line.length + 1;
+  }
+  return -1;
+}
+
+/**
  * 本包**会被加载/执行**的文件清单（源码目录与已安装副本都要查，见第 7 节）。
  *
  * 2026-10-04 审查 P1-3/子代理复审补：旧清单漏了 lib/cache.js 与 lib/resume.js ——
@@ -126,17 +229,22 @@ if (revert) {
     process.exit(0);
   }
   const patchText = fs.readFileSync(PROFILE_PATCH, 'utf8');
-  const start = patchText.indexOf(MANAGED_START);
-  const end = patchText.indexOf(MANAGED_END);
-  if (start < 0 || end <= start) {
+  const region = managedRegion(patchText);
+  if (region === null) {
     console.log('- 未发现 dispatch-agent-team 托管块：无需回收（官方工具行未被本插件关过，或已回收/手工处理）');
     process.exit(0);
   }
   // 删哨兵包住的整段；块前/块后各自折叠多余空行，不碰别的行。
   // （哨兵外若还留着 2026-09-28 之前旧版写入的裸注释头，那是 YAML 注释、无害，不越权删。）
-  const head = patchText.slice(0, start).replace(/(?:\n[ \t]*)+$/u, '\n');
-  const tail = patchText.slice(end + MANAGED_END.length).replace(/^(?:\n[ \t]*)+/u, '\n');
-  const next = `${head}${tail}`;
+  //
+  // ⚠️ 2026-10-10 P0：**不能**再裸切片。哨兵区里可能混着宿主 AST 追加进来的外来插件行
+  // （实测 permission / llm-pi-ai），裸切片会把它们一起删掉。removeManagedBlock 先把外来行
+  // 救出来放回正文，只删本插件自己写的那两条。见 MANAGED_ROW_IDS 上方。
+  const { text: next, rescued } = removeManagedBlock(patchText);
+  if (rescued.length > 0) {
+    console.log(`- ⚠️ 哨兵区内发现 ${rescued.length} 条**外来**插件行（${rescued.join(', ')}）——`
+      + '已原样保留在正文里，未随托管块删除。');
+  }
   const backup = `${PROFILE_PATCH}.bak-${Date.now()}-pre-dispatch-team-revert`;
   try {
     fs.copyFileSync(PROFILE_PATCH, backup);
@@ -303,33 +411,76 @@ if (!fs.existsSync(PROFILE_PATCH)) {
   const missing = Object.entries(AGENT_TEAM_CONFIG).filter(([key, value]) => effective[key] !== value);
   console.log(`- profile 层 agent-team 容量覆盖：${missing.length === 0 ? '齐备' : `缺/不一致 ${missing.map(([key]) => key).join(', ')}`}`);
 
-  if (!toolRowDisabled || missing.length > 0) {
+  // (3) 2026-10-10 P0：哨兵区**结构**是否还健康。两条判据：
+  //     * 块必须写在文件开头（否则宿主 AST 追加会再次把外来行塞进哨兵区）；
+  //     * 哨兵区内只应有本插件那两条行。
+  //     这两条原先没有任何闸门，所以 permission / llm-pi-ai 被包进哨兵区时体检仍报「状态完好」。
+  const region = managedRegion(patchText);
+  const firstRowOffset = firstTopLevelRowOffset(patchText);
+  const blockAtTop = region !== null
+    && (firstRowOffset < 0 || patchText.indexOf(MANAGED_START) < firstRowOffset);
+  const foreignInside = region === null
+    ? []
+    : splitRows(patchText.slice(region.bodyStart, region.bodyEnd)).rows
+      .map((row) => row.id)
+      .filter((id) => !MANAGED_ROW_IDS.includes(id));
+  if (region === null) {
+    console.log('- 托管块：不存在');
+  } else {
+    console.log(`- 托管块位置：${blockAtTop ? '文件开头（正确）' : '**不在开头** —— 宿主 AST 追加会把外来插件行塞进哨兵区'}`);
+    console.log(`- 哨兵区内外来行：${foreignInside.length === 0 ? '无（正确）' : `**${foreignInside.join(', ')}** —— 切片重写会误删它们`}`);
+  }
+
+  if (!toolRowDisabled || missing.length > 0 || !blockAtTop || foreignInside.length > 0) {
     const why = [
       toolRowDisabled ? '' : '官方 tool-agent-team 行还开着：它会把九个同名工具装进每个会话的 agent 作用域，本插件的工具装不上（角色/模型参数不可用）',
       missing.length === 0 ? '' : `agent-team 容量缺/不一致（${missing.map(([key, value]) => `${key} 应为 ${value}，实际 ${effective[key] ?? '缺'}`).join('；')}）：顺序不利时 maxMembers 会退回官方默认 8，团队 8 次 spawn 后派不出人`,
+      blockAtTop ? '' : '托管块不在文件开头：宿主切换插件组件时会用 YAML AST 把新行追加到文件尾部注释之前，即**哨兵区内部**，下次 --apply/--revert 会把它们静默删掉',
+      foreignInside.length === 0 ? '' : `哨兵区内混入了外来插件行（${foreignInside.join(', ')}）：它们随时会被切片重写误删`,
     ].filter((line) => line !== '').join('；');
     if (apply) {
       const backup = `${PROFILE_PATCH}.bak-${Date.now()}-pre-dispatch-team-managed`;
       fs.copyFileSync(PROFILE_PATCH, backup);
-      // 有哨兵 → 整段替换；有旧的裸 agent-team 块 → 替换它并补上工具行；都没有 → 追加。
-      let next;
-      const start = patchText.indexOf(MANAGED_START);
-      const end = patchText.indexOf(MANAGED_END);
-      if (start >= 0 && end > start) {
-        next = patchText.slice(0, start) + MANAGED_BLOCK + patchText.slice(end + MANAGED_END.length);
+      // ── 2026-10-10 P0 修法 ─────────────────────────────────────────────────────
+      // 托管块一律写到文件**开头**（managedBlockPrefix）。原因：宿主 dsh-plugin-manager
+      // 切换组件时用 YAML AST 的 document.add() 追加新行，而 add() 落在**最后一个序列项
+      // 之后、尾部注释之前**。块写在末尾时，新行必然插进哨兵区内部，随后被整段切片删掉
+      // （已用真实 profile 复现：permission / llm-pi-ai 就是这么进去的）。块在开头时，
+      // 追加永远发生在块之后 —— 结构上不可能再进哨兵区。
+      // 同时：切片前先把哨兵区里的外来行救出来（removeManagedBlock），
+      // 有哨兵 / 只有裸 agent-team 块 / 什么都没有，三条路都归一到「正文 + 头部块」。
+      let body;
+      const region = managedRegion(patchText);
+      if (region !== null) {
+        const removed = removeManagedBlock(patchText);
+        body = removed.text;
+        if (removed.rescued.length > 0) {
+          console.log(`- ⚠️ 哨兵区内发现 ${removed.rescued.length} 条**外来**插件行（${removed.rescued.join(', ')}）`
+            + '——已原样保留在正文里，未随托管块重写删除。');
+        }
       } else if (match !== null) {
-        // 注意：必须补一个换行：`match[0]` 已经把那一行的结尾换行吃掉了，不补的话下一行会被
-        // 我们块尾的注释吞掉（2026-09-28 实际发生过：`ui-skin-claude-style` 那一行被注释掉）。
-        next = patchText.replace(match[0], `${MANAGED_BLOCK}\n`);
+        // 旧的裸 agent-team 块（2026-09-28 之前写的）：摘掉它，正文保留其余全部内容。
+        // 注意：`match[0]` 已经把那一行的结尾换行吃掉了，摘除后必须补一个换行，
+        // 否则下一行会被我们块尾的注释吞掉（2026-09-28 实际发生过）。
+        body = patchText.replace(match[0], '\n');
       } else {
-        next = `${patchText.replace(/\s*$/u, '')}\n\n${MANAGED_BLOCK}\n`;
+        body = patchText;
       }
+      const next = managedBlockPrefix(MANAGED_BLOCK, body);
       writeAtomic(PROFILE_PATCH, next);
-      // 写完立刻自检：解析一遍，确认块尾没有把下一行粘进注释里。
+      // 写完立刻自检：① 块尾没有把下一行粘进注释里；② 哨兵区内没有外来行。
       const reparsed = next.split('\n').some((line) => line.includes(MANAGED_END) && line.trim() !== MANAGED_END);
       console.log(reparsed
         ? '  注意：自检：managed 块尾与下一行粘在一起了，请把这段贴给 lead'
         : '  → 自检：managed 块尾换行正常');
+      const after = managedRegion(next);
+      if (after !== null) {
+        const inside = splitRows(next.slice(after.bodyStart, after.bodyEnd)).rows;
+        const foreign = inside.filter((row) => !MANAGED_ROW_IDS.includes(row.id));
+        console.log(foreign.length === 0
+          ? '  → 自检：哨兵区内只有本插件的两条行（结构上不会再被 AST 追加污染）'
+          : `  注意：自检：哨兵区内仍有外来行 ${foreign.map((row) => row.id).join(', ')}，请把这段贴给 lead`);
+      }
       console.log(`  → 已写入并备份到 ${path.basename(backup)}`);
     } else {
       problems.push(`${why}。加 --apply 可自动补齐（会先备份）。`);

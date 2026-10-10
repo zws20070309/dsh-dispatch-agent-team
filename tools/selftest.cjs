@@ -1220,6 +1220,77 @@ function functionBodyOf(source, needle) {
     assert.ok(indexSrc.includes('healManagedBlock'), 'lib/index.js 必须调用 healManagedBlock（否则自愈形同虚设）');
   });
 
+  await check('托管块结构（2026-10-10 P0）：块必须在文件开头，且切片重写不得吞掉哨兵区内的外来行', async () => {
+    // 用户 2026-10-10 报障的根因（已用真实 profile 复现）：托管块原本 append 在**文件末尾**，
+    // 而宿主 dsh-plugin-manager 切换插件组件时用 YAML AST 的 document.add() 追加新行 ——
+    // add() 落在**最后一个序列项之后、尾部注释之前**，也就是**哨兵区内部**。
+    // 随后 --apply/--revert 的整段切片把 permission(325-338) / llm-pi-ai(339-351) 一起删掉
+    // （实测 16623 → 15096 字节，dsh-permission-presets / JIYUAN_API_KEY 全没了），
+    // 而体检两条正则都通过、self-heal 只查 includes(MANAGED_START) ⇒ 谁都没发现。
+    //
+    // 本闸门用**真代码**（self-heal.js 的导出）跑四个行为断言，任一条退化即红：
+    //   ① 块在末尾的文本判为不健康；② 归一化把块搬到开头；
+    //   ③ 哨兵区内的外来行在归一化后**必须还在**；④ 归一化幂等（第二次完全不变）。
+    const heal = await import(pathToFileURL(path.join(LIB, 'self-heal.js')).href);
+    const { MANAGED_START, MANAGED_END } = heal;
+    assert.equal(typeof heal.managedBlockHealthy, 'function', 'self-heal.js 必须导出 managedBlockHealthy');
+    assert.equal(typeof heal.normalizeManagedBlock, 'function', 'self-heal.js 必须导出 normalizeManagedBlock');
+
+    // 造一份「块在末尾 + 区内混入外来行」的文本（复刻用户现场的最小形状）。
+    const foreign = ['- id: permission', '  name: "@deepseek-ai/dsh-permission-presets"', '',
+      '- id: llm-pi-ai', '  name: "@deepseek-ai/dsh-llm-pi-ai"', '  config:', '    apiKeyEnv: JIYUAN_API_KEY'];
+    const blockAtEnd = [
+      '# profile head comment',
+      '- id: ui-settings',
+      '  config:',
+      '    enabled: true',
+      '',
+      MANAGED_START,
+      '- id: tool-agent-team',
+      '  disabled: true',
+      '',
+      '- id: agent-team',
+      '  config:',
+      '    maxMembers: 48',
+      ...foreign,
+      MANAGED_END,
+    ].join('\n');
+
+    assert.equal(heal.managedBlockHealthy(blockAtEnd), false,
+      '块写在文件末尾必须判为不健康（否则宿主 AST 追加会再次把外来行塞进哨兵区）');
+
+    const fixed = heal.normalizeManagedBlock(blockAtEnd);
+    assert.equal(heal.managedBlockHealthy(fixed), true, '归一化后必须健康');
+    // ① 块在文件开头：MANAGED_START 必须出现在第一个顶层条目之前。
+    const firstRow = fixed.split('\n').findIndex((line) => /^-\s*(?:id:|insert:)/u.test(line));
+    const startLine = fixed.split('\n').findIndex((line) => line === MANAGED_START);
+    assert.ok(startLine >= 0 && startLine < firstRow,
+      `托管块必须排在第一个顶层条目之前（块在第 ${startLine + 1} 行、首个条目在第 ${firstRow + 1} 行）`);
+    // ② 哨兵区内只允许本插件那两条。
+    const bodyStart = fixed.indexOf(MANAGED_START) + MANAGED_START.length;
+    const bodyEnd = fixed.indexOf(MANAGED_END);
+    const inside = [...fixed.slice(bodyStart, bodyEnd).matchAll(/^-\s*id:\s*(\S+)/gmu)].map((m) => m[1]);
+    assert.deepEqual(inside, ['tool-agent-team', 'agent-team'],
+      `哨兵区内只应有本插件两条行，实际：${inside.join(', ')}`);
+    // ③ 外来行一条都不能丢（这是本次 P0 的核心）。
+    for (const key of ['dsh-permission-presets', 'llm-pi-ai', 'JIYUAN_API_KEY']) {
+      assert.ok(fixed.includes(key), `归一化把外来内容删掉了：${key} 不见了`);
+    }
+    // ④ 幂等：对已健康的文本再归一化必须逐字不变（否则 repair --apply 每次都重写）。
+    assert.equal(heal.normalizeManagedBlock(fixed), fixed, '归一化必须幂等（第二次调用逐字不变）');
+
+    // ⑤ 两份实现必须一致：repair.cjs 也必须导出/实现同样的两个概念（防只修一边）。
+    const repairSrc = readFileSync(path.join(__dirname, 'repair.cjs'), 'utf8');
+    assert.ok(repairSrc.includes('function removeManagedBlock'), 'repair.cjs 必须有 removeManagedBlock（救出外来行）');
+    assert.ok(repairSrc.includes('managedBlockPrefix'), 'repair.cjs 必须把块写进文件开头（managedBlockPrefix）');
+    assert.ok(repairSrc.includes('function managedRegion'), 'repair.cjs 必须有 managedRegion');
+    assert.ok(/MANAGED_ROW_IDS\s*=\s*\[[^\]]*'tool-agent-team'[^\]]*'agent-team'/u.test(repairSrc),
+      'repair.cjs 的 MANAGED_ROW_IDS 必须同时含 tool-agent-team 与 agent-team');
+    assert.ok(/MANAGED_ROW_IDS\s*=\s*Object\.freeze\(\[[^\]]*'tool-agent-team'[^\]]*'agent-team'/u.test(
+      readFileSync(path.join(LIB, 'self-heal.js'), 'utf8')),
+      'self-heal.js 的 MANAGED_ROW_IDS 必须同时含 tool-agent-team 与 agent-team');
+  });
+
   await check('markdown 表格渲染：解析器存在且成表（用户 2026-10-09 截图报「表格渲染有问题」）', () => {
     // 用户截图里 `| 检查项 | 结果 |` / `|---|---|` 原样显示成乱码 —— 渲染器缺表格支持。
     // 完整的**行为**断言在 .probe/test-table.cjs 与 .probe/ws-e2e.mjs（需要浏览器 DOM）；
