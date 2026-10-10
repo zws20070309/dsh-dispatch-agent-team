@@ -108,6 +108,7 @@ const FILES = [
   // 少了它们，已安装副本里会留着一份**过期的 README**，看起来像源码没同步成功。
   'README.md',
   'INTERFACES.md',
+  'INCIDENT-2026-10-09-managed-block.md',
 ];
 
 function main() {

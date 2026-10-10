@@ -22,7 +22,8 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "INTERFACES.md"
+    "INTERFACES.md",
+    "INCIDENT-2026-10-09-managed-block.md"
   ],
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.3.0",
