@@ -2158,37 +2158,73 @@ async function main() {
     //
     // 分流是硬要求：Lead 走 sessionController.prompt；队员（origin==='subagent'）走
     // subagents.prompt —— 因为官方 prompt 通道对 subagent 恒拒（session/agent-busy）。
+    //
+    // ⚠️⚠️ 2026-10-10 修这个测试桩的**致命缺陷**（用户报「所有发送都失败」）：
+    //   旧桩写的是 `prompt: async (req) => …` —— **只有一个参数**。
+    //   而官方两个通道的真实签名都是 `prompt(request, signal)`，且**体内直接
+    //   `signal.throwIfAborted()`（不判空）**：
+    //     * dsh-api-session-controller/lib/index.js:2847 `super(ctx,"sessionController")`
+    //       → :3096 `prompt(request, signal)` → :3097 `signal.throwIfAborted()`
+    //     * dsh-subagent/lib/index.js:3010 `async prompt(request, signal)`
+    //       → :967 `inputs.signal.throwIfAborted()`
+    //   桩只收一个参数 ⇒ **漏传 signal 也"通过"**，于是这个 P0 级 bug
+    //   在 132 条集成测试里一路绿灯（用户第三次报同一现象才发现）。
+    //   现在桩**复刻官方的 signal 契约**：缺 signal 就抛官方那句原文，
+    //   让「漏传」变成测试失败而不是用户可见的崩溃。
+    const assertSignal = (signal) => {
+      if (signal === undefined || signal === null) {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+      }
+      if (typeof signal.throwIfAborted === 'function') signal.throwIfAborted();
+    };
     const sentPrompts = [];
     const sentSubagents = [];
+    const sentSignals = [];
     // chatCtx 必须把 agents 转发给真实 root（leadForSession 靠它找活体 Lead），
     // 只额外补上 sessionController / subagents 两个「发送通道」服务。
     const chatCtx = {
       get: (name) => {
         if (name === 'sessionController') {
-          return { prompt: async (req) => { sentPrompts.push(req); return { accepted: true }; } };
+          return {
+            prompt: async (req, signal) => {
+              assertSignal(signal);           // ← 复刻官方 :3097 的硬要求
+              sentPrompts.push(req);
+              sentSignals.push(signal);
+              return { accepted: true };
+            },
+          };
         }
         if (name === 'subagents') {
-          return { prompt: async (req) => { sentSubagents.push(req); return { messageId: 'msg-1' }; } };
+          return {
+            prompt: async (req, signal) => {
+              assertSignal(signal);           // ← 复刻官方 :967 的硬要求
+              sentSubagents.push(req);
+              sentSignals.push(signal);
+              return { messageId: 'msg-1' };
+            },
+          };
         }
         try { return root.get(name); } catch { return undefined; }
       },
     };
     // Lead 会话 → sessionController.prompt
     const sendLead = await restarted.teamSend(chatCtx, 'graph-session-1', 'graph-session-1', '下一步做什么？');
-    check('teamSend：给 Lead 发消息走 sessionController.prompt（mode=queue + requestId）', () => {
+    check('teamSend：给 Lead 发消息走 sessionController.prompt（mode=queue + requestId + **signal**）', () => {
       if (sendLead.ok !== true) return JSON.stringify(sendLead);
       if (sentPrompts.length !== 1) return `prompt 调用 ${sentPrompts.length} 次`;
       const req = sentPrompts[0];
       if (req.mode !== 'queue') return `mode=${req.mode}`;
       if (typeof req.requestId !== 'string' || req.requestId === '') return '缺 requestId';
       if (!Array.isArray(req.content) || req.content[0]?.text !== '下一步做什么？') return JSON.stringify(req.content);
+      // 官方 :3097 直接 signal.throwIfAborted() ⇒ 必须是带该方法的对象。
+      if (typeof sentSignals[0]?.throwIfAborted !== 'function') return '缺 signal（官方 prompt(request, signal) 必填）';
       return true;
     });
     // 队员会话 → subagents.prompt（不能走 prompt 通道）
     const memberId = [...membershipById.keys()].find((k) => k !== graphLead.id);
     if (memberId !== undefined) {
       const sendMember = await restarted.teamSend(chatCtx, 'graph-session-1', memberId, '补充：用 Private');
-      check('teamSend：给队员发消息走 subagents.prompt（parentSessionId/childSessionId/mode=continuable）', () => {
+      check('teamSend：给队员发消息走 subagents.prompt（parentSessionId/childSessionId/mode=continuable + **signal**）', () => {
         if (sendMember.ok !== true) return JSON.stringify(sendMember);
         if (sentSubagents.length !== 1) return `subagents.prompt 调用 ${sentSubagents.length} 次`;
         const req = sentSubagents[0];
@@ -2196,6 +2232,7 @@ async function main() {
         if (req.delivery !== 'queue') return `delivery=${req.delivery}`;
         if (req.childSessionId !== memberId) return `child=${req.childSessionId}`;
         if (typeof req.parentSessionId !== 'string' || req.parentSessionId === '') return '缺 parentSessionId';
+        if (typeof sentSignals[1]?.throwIfAborted !== 'function') return '缺 signal（官方 prompt(request, signal) 必填）';
         return true;
       });
     }

@@ -241,6 +241,37 @@ export async function teamConversation(ctx, sessionId, targetId, limit?);
                                             //    浮动窗口的对话尾部。**只**允许读该会话所在团队
                                             //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
                                             //    同样跳过 fork 继承前缀（否则浮窗里显示的是 Lead 的对话）。
+                                            //    白名单与 teamImage 共用 teamAllowedSessions（防两处漂移）。
+export async function teamSendImages(ctx, sessionId, targetId, text, images);
+                                            //    工作区抽屉：**带图片**发消息（与官方对话页一致的
+                                            //    上传能力）。用户 2026-10-10：「要支持直接在弹窗上传
+                                            //    图片，和官方的对话页面应当一致」。
+                                            //    图片块形状 `{type:'image', data:<canonical base64>,
+                                            //    mediaType, name?}`，由官方
+                                            //    `attachments.admitPromptContent` 落盘：
+                                            //      * dsh-attachment/lib/types/index.js 的
+                                            //        `admitPromptContent` → 对 image 块调
+                                            //        `admitEncodedImages`；
+                                            //      * dsh-attachment/lib/types/admission.js 的
+                                            //        `admitEncodedImages` 做 **canonical base64 校验**
+                                            //        （decode 后再 encode 必须与原文逐字相同，否则
+                                            //        INVALID_IMAGE_BASE64）+ 张数/总字节/mediaType 白名单。
+                                            //    「只有图片、没有文字」是合法 prompt：
+                                            //      dsh-api-session-controller/lib/index.js:649
+                                            //      `hasPromptContent = content.some(part =>
+                                            //       part.type !== 'text' || part.text.trim() !== '')`。
+                                            //    分流与 signal 要求同 teamSend（两处都是必填第二参数）。
+export async function teamImage(ctx, sessionId, targetId, attachmentId);
+                                            //    浮动窗口：读一张**会话日志引用过的图片**，返回
+                                            //    `{ok, data:<base64>, mediaType}`，供浮窗真正渲染。
+                                            //    用户 2026-10-10：「图片无法正常渲染！」（此前
+                                            //    extractConversation 把 image 块降级成文本 `[图片]`）。
+                                            //    走官方 `sessionController.attachment({sessionId,
+                                            //    attachmentId})`（dsh-api-session-controller/lib/index.js:3105）
+                                            //    —— 该 API **带授权校验**：只允许读被该会话日志
+                                            //    引用过的图片（同文件 :919 referencedImage），
+                                            //    否则抛 attachment authorization unavailable。
+                                            //    ⚠️ 签名只有**一个参数**（没有 signal，与 prompt 不同）。
 export async function teamQuestions(ctx, sessionId, targetId);
                                             //    工作区聊天框：读某个成员「向用户提过的问」
                                             //    （`ask_user_question` 工具调用）。数据源是**会话日志**
@@ -249,13 +280,22 @@ export async function teamQuestions(ctx, sessionId, targetId);
                                             //    （dsh-user-questions/lib/types/projection.js:200-215）。
 export async function teamSend(ctx, sessionId, targetId, text);
                                             //    工作区聊天框：发一条用户消息。**必须按会话类型分流**：
-                                            //    Lead → `sessionController.prompt({sessionId,content,mode:'queue',requestId})`
-                                            //      （dsh-api-session-controller/lib/index.js:850）；
+                                            //    Lead → `sessionController.prompt({sessionId,content,mode:'queue',requestId}, signal)`
+                                            //      （dsh-api-session-controller/lib/index.js:850 是内层实现；
+                                            //       **:3096 才是服务暴露的那层**：`prompt(request, signal)`，
+                                            //       且 :3097 `signal.throwIfAborted()` **不判空**）；
                                             //    队员（origin==='subagent'）→ prompt 恒被拒
                                             //      （同文件 :126-132 对 origin 恒 true → `session/agent-busy`），
                                             //      改走 `subagents.prompt({parentSessionId,childSessionId,
-                                            //      mode:'continuable',delivery:'queue',content})`
-                                            //      （dsh-subagent/lib/index.js:3011），且父会话必须活着。
+                                            //      mode:'continuable',delivery:'queue',content}, signal)`
+                                            //      （dsh-subagent/lib/index.js:3010；signal 在 :967 被
+                                            //      `inputs.signal.throwIfAborted()` 直接调用）。
+                                            //    ⚠️⚠️ **两个通道的 signal 都是必填的第二位置参数**。
+                                            //      漏传会抛 `Cannot read properties of undefined
+                                            //      (reading 'throwIfAborted')` —— 用户 2026-10-10 报的
+                                            //      「所有和发送有关的操作都失败」就是这个（Lead 分支漏了；
+                                            //      integration-test 的旧桩只收一个参数所以一路绿灯，
+                                            //      现已让桩复刻官方的 signal 契约）。
 export async function teamAnswer(ctx, sessionId, targetId, callId, answers);
                                              //    工作区提问卡：回答一次 ask_user_question。两条通道依次：
                                              //    ① `userQuestions.answer(agent, callId, {answers})`
