@@ -12,6 +12,11 @@ dispatch-agent-team-status.json
 # 临时探针目录与取证输出（tools/session-probe.cjs / asar-probe.cjs 的 --extract 目标）
 /.probe/
 /probe/
+# 探针跑出来的临时工作目录（.probe/test-chat.mjs 等生成的中间文件）
+/.probe-tmp/
+# 浏览器探针的 user-data-dir（headless Chrome 的 profile，跑一次就生成）
+/.probe/_cdp_live/
+/.probe/_cdp_img/
 
 # 崩溃恢复备份（profile 的 cordis.patch.yml.bak-*，若被拷进本目录也不提交）
 *.bak
