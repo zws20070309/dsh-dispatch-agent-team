@@ -23,7 +23,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
+const { readFileSync, existsSync } = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -1416,6 +1416,67 @@ function functionBodyOf(source, needle) {
       'self-heal.js 的托管块必须包含「关掉官方 tool-agent-team 行」');
     const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
     assert.ok(indexSrc.includes('healManagedBlock'), 'lib/index.js 必须调用 healManagedBlock（否则自愈形同虚设）');
+  });
+
+  await check('dsh-ops 组件合并（vendor 化）：ops-file 行、vendor 闭包、共存自愈三件套齐备', () => {
+    // 用户 2026-10-11 第二轮要求：「ops 插件直接放进我的智能体团队源码里面，把我本机上
+    // 安装的 ops 卸载了也可以用；别人装了 ops 可以兼容不报错，没装 ops 也能装我的插件」。
+    //
+    // 落地形态（四处协同，缺一即坏）：
+    //   ① vendor/ops/lib/ —— dsh-ops 0.2.6 lib/ 的完整运行时拷贝（14 模块依赖闭包，
+    //      除 Node 内置外零外部包）；vendor/ops/vendor/fastctx/target/release/fastctx.exe
+    //      是工具的 Rust 执行体（dsh-ops binary.js 搜索链第 2 环 repoBuildFile 命中，
+    //      PACKAGE_ROOT 在 vendor 副本里指向 vendor/ops，实测 resolveBinary+probeBinary 通过）。
+    //   ② cordis.patch.yml 第 4 行 `- id: ops-file / name: @zws/dsh-dispatch-agent-team/ops-file`
+    //      —— name 指向**本包自己的 exports 子路径**（./ops-file），卸载独立 dsh-ops 后
+    //      本行照常解析挂载。id 不能沿用 dsh-ops-file（会被它的 bundle 行覆盖，
+    //      asar 文档 overridden 语义）。
+    //   ③ package.json exports['./ops-file'] + files 含 vendor（发布时带上二进制）。
+    //   ④ lib/ops-coexist.js 启动自愈 —— 别人装了独立 dsh-ops 时，把它 bundle 的
+    //      dsh-ops-file 行在 profile 层钉 disabled（机制同 self-heal），防 ops_* 重复注册；
+    //      没装则该自愈零动作。lib/index.js 必须调用它 + detectOpsIntegration 体检。
+    const patch = readFileSync(path.join(__dirname, '..', 'cordis.patch.yml'), 'utf8');
+    assert.ok(/^\s*-\s*id:\s*ops-file\s*$/m.test(patch), 'cordis.patch.yml 必须有 `- id: ops-file` 行（第四组件）');
+    assert.match(patch, /name:\s*['"]@zws\/dsh-dispatch-agent-team\/ops-file['"]/,
+      'ops-file 行的 name 必须指向本包 vendor 入口（卸载独立 dsh-ops 后仍可解析）');
+    assert.ok(!/^\s*-\s*id:\s*dsh-ops-file\s*$/m.test(patch),
+      '本包不得声明 id=dsh-ops-file（会被 dsh-ops 自己的 bundle 行覆盖，overridden 语义）');
+    // config 逐项核对（与 dsh-ops 官方 dsh-ops-file 行同值，防止两个实现配置分叉）
+    const blockMatch = /- id: ops-file\n([\s\S]*?)(?=\n    - id:|\n$|$)/.exec(patch);
+    assert.ok(blockMatch !== null, 'ops-file 行块提取失败');
+    const block = blockMatch[1];
+    assert.match(block, /promptPolicy:\s*true/);
+    assert.match(block, /enableShellTools:\s*false/);
+    assert.match(block, /required:\s*false/);
+    assert.match(block, /toolCallTimeoutMs:\s*300000/);
+
+    // vendor 闭包完整性（13 模块 + file 组件 manifest + fastctx.exe）
+    const vendorLib = path.join(__dirname, '..', 'vendor', 'ops', 'lib');
+    for (const mod of ['index.js', 'binary.js', 'policy.js', 'tools.js', 'config.js', 'config-updates.js',
+      'shells.js', 'session-shells.js', 'session-pwsh.js', 'handshake.js', 'jobs.js',
+      'presentation.js', 'runtime-pool.js']) {
+      assert.ok(existsSync(path.join(vendorLib, mod)), `vendor/ops/lib/${mod} 缺失（vendor 闭包不完整）`);
+    }
+    assert.ok(existsSync(path.join(vendorLib, 'components', 'file', 'index.js')), 'vendor file 入口缺失');
+    assert.ok(existsSync(path.join(vendorLib, 'components', 'file', 'package.json')),
+      'vendor file manifest 缺失（插件页组件卡片会没有图标/描述）');
+    assert.ok(existsSync(path.join(__dirname, '..', 'vendor', 'ops', 'vendor', 'fastctx', 'target', 'release', 'fastctx.exe')),
+      'vendor fastctx.exe 缺失（工具的 Rust 执行体；resolveBinary 的 repoBuild 环就是找它）');
+
+    const pkg = JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert.equal(pkg.exports?.['./ops-file'], './vendor/ops/lib/components/file/index.js',
+      'package.json exports 必须有 ./ops-file 子路径（patch 行 name 解析的锚点）');
+    assert.ok(pkg.files?.includes('vendor'), 'package.json files 必须含 vendor（发布不带二进制 = 别人装了组件挂掉）');
+
+    const coexistSrc = readFileSync(path.join(__dirname, '..', 'lib', 'ops-coexist.js'), 'utf8');
+    assert.ok(coexistSrc.includes('export function healOpsCoexist(ctx)'), 'lib/ops-coexist.js 必须导出 healOpsCoexist');
+    assert.ok(coexistSrc.includes('- id: dsh-ops-file'), '共存自愈必须钉 dsh-ops-file 行（只此一行，不碰 shell/background）');
+    const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+    assert.ok(indexSrc.includes('healOpsCoexist'), 'lib/index.js 必须调用 healOpsCoexist（别人装了 dsh-ops 时的防重复注册）');
+    assert.ok(indexSrc.includes('async function detectOpsIntegration(ctx)'), 'lib/index.js 必须有 detectOpsIntegration 体检');
+    assert.ok(indexSrc.includes('status.opsIntegration = await detectOpsIntegration(ctx)'), 'writeStatusFile 必须落盘 opsIntegration');
+    assert.ok(indexSrc.includes("entryId === 'ops-file' || entryId === 'dsh-ops-file'"),
+      'rows 采集必须同时覆盖 ops-file 与 dsh-ops-file 两行（排查「谁被顶掉」看这里）');
   });
 
   await check('托管块结构（2026-10-10 P0）：块必须在文件开头，且切片重写不得吞掉哨兵区内的外来行', async () => {
