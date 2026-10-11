@@ -54,3 +54,30 @@
       config:
         configFile: dispatch-agent-team.json
         maxMembers: 8
+
+    # ── 第四组件：ops 文件检索（Rust FastCtx，2026-10-11 合并并 vendor 化）──────────
+    # 为什么由本包声明（用户 2026-10-11 要求「把 dsh-ops 的一个组件合并进智能体团队」）：
+    #   * 插件页的组件按 bundle 分组，本包 patch 里的行就显示为本包的组件 → 团队包 4 个组件。
+    #
+    # ⚠️ vendor 化（2026-10-11 第二轮，用户要求「卸载本机 dsh-ops 也要可用」）：
+    #   name 指向**本包自己的 vendor 入口**（exports['./ops-file'] → vendor/ops/lib/...），
+    #   不再指向 dsh-ops 实装包 —— 卸载 dsh-ops 后本行照常解析、照常挂载。
+    #   * vendor/ops/lib/ 是 dsh-ops 0.2.6 lib/ 的完整运行时拷贝（14 模块依赖闭包实测，
+    #     除 Node 内置外零外部包；插件页 manifest 用 vendor/ops/lib/components/file/package.json）；
+    #   * fastctx.exe（Rust 二进制）在 vendor/fastctx/target/release/ —— dsh-ops 的
+    #     resolveBinary 搜索链第 2 环「vendored source build」用 PACKAGE_ROOT（= vendor
+    #     拷贝自身的包根）计算 repoBuildFile，恰好命中该路径（实验验证：三场景全对）。
+    #   * 没装 dsh-ops 的用户：本行照常工作（自带全部实现）；
+    #     装了 dsh-ops 的用户：dsh-ops 自己 bundle 的 dsh-ops-file 行会重复注册 ops_* →
+    #     由 lib/ops-coexist.js 在启动期自愈（profile 层钉 disabled，机制同 self-heal.js）。
+    #
+    # ⚠️ ops_* 工具全模式可用：本行挂 host 平面组件（不进任何 preset 子树），所有 agent
+    #    预设（极简灰度/标准/调度模式/ptc/cordis/minimal）的会话都继承全局工具注册表；
+    #    调度模式的工具收窄是枚举名单（TEAMMATE_TOOL_DENY，不含 ops_*），不会摘除。
+    - id: ops-file
+      name: '@zws/dsh-dispatch-agent-team/ops-file'
+      config:
+        promptPolicy: true
+        enableShellTools: false
+        required: false
+        toolCallTimeoutMs: 300000

@@ -91,6 +91,7 @@ const FILES = [
   'lib/graph.js',
   'lib/client.js',
   'lib/self-heal.js',
+  'lib/ops-coexist.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
   'tools/integration-test.cjs',

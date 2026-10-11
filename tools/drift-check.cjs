@@ -515,6 +515,39 @@ check('硬前置：官方 agent-team-profile 仍被 profile 选中', () => {
   return true;
 });
 
+// 10f) dsh-ops 组件合并（2026-10-11）：本包的 ops-file 行与 dsh-ops 自带的 dsh-ops-file 行
+// 挂同一个实现包；两行同时活会把同一套 ops_* 工具注册两次 → "already registered"，
+// file 组件挂掉。bundle 层顺序不可靠（dsh-ops 在本包之后时它的行还会覆盖同 id 行），
+// 唯一顺序无关的落点是 profile 层 —— 这里验证三件事：
+//   ① profile patch 把 dsh-ops-file 钉成 disabled（关掉重复行，不是关掉功能）；
+//   ② 本包 cordis.patch.yml 的 ops-file 行仍然存在（功能来源）；
+//   ③ dsh-ops 已安装时（profile node_modules 可解析），双行状态由状态文件的
+//      opsIntegration 记录（那半是运行时事实，这里只做静态可判的两条）。
+check('dsh-ops 合并：profile 层钉住 dsh-ops-file disabled + 本包 ops-file 行在位', () => {
+  const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
+  if (!fs.existsSync(profilePatchPath)) {
+    return `读不到 ${profilePatchPath}：dsh-ops-file 的重复注册防护没有落点`;
+  }
+  const profileText = fs.readFileSync(profilePatchPath, 'utf8');
+  // `- id: dsh-ops-file` 后到下一行级条目之前的块里必须有 disabled: true。
+  const at = profileText.search(/^-\s*id:\s*dsh-ops-file\s*$/m);
+  if (at < 0) {
+    return 'profile 的 cordis.patch.yml 没有 `- id: dsh-ops-file / disabled: true`：'
+      + '本包 ops-file 行与 dsh-ops 自带行会重复注册 ops_* 工具（already registered）。'
+      + '修法：在 profile patch 的 dsh-ops 块加两行（见本仓库 cordis.patch.yml 2026-10-11 段的说明）。';
+  }
+  const tail = profileText.slice(at).split(/\n-\s*(?:id|insert):/)[0];
+  if (!/^\s*disabled:\s*true\s*$/m.test(tail)) {
+    return 'profile 层的 dsh-ops-file 行没有 disabled: true —— 重复注册风险未解除';
+  }
+  const oursPatch = fs.readFileSync(path.join(PLUGIN_DIR, 'cordis.patch.yml'), 'utf8');
+  // ops-file 行在 `- insert:` 块内（4 空格缩进），正则必须允许行首空白。
+  if (!/^\s*-\s*id:\s*ops-file\s*$/m.test(oursPatch)) {
+    return '本包 cordis.patch.yml 的 ops-file 行消失了：第四组件（Rust 文件检索）失效';
+  }
+  return true;
+});
+
 // 10e) 依赖解析接线：本包以 link: 安装时 Node 解析到真实路径，需要一个指向
 // <dshHome>/profiles/node_modules 的 junction，否则 @deepseek-ai/dsh-tools 在
 // **模块加载期**解析失败，host 行无法激活（首次安装实测就是这么失败的）。
