@@ -12,7 +12,9 @@
     "./roster": "./lib/roster.js",
     "./playbook": "./lib/playbook.js",
     "./locale/*.json": "./locale/*.json",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./ops-file": "./vendor/ops/lib/components/file/index.js",
+    "./ops-file/package.json": "./vendor/ops/lib/components/file/package.json"
   },
   "files": [
     "lib",
@@ -22,7 +24,9 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "INTERFACES.md"
+    "INTERFACES.md",
+    "INCIDENT-2026-10-09-managed-block.md",
+    "vendor"
   ],
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <0.3.0",

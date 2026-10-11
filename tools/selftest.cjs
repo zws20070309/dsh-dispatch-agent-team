@@ -23,7 +23,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
+const { readFileSync, existsSync } = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -1139,19 +1139,451 @@ function functionBodyOf(source, needle) {
     // 工具行：官方标签 + 目标摘要；assistant 内嵌的块不重复成行。
     const toolRows = rows.filter((r) => r.kind === 'tool');
     assert.equal(toolRows.length, 2, `两条工具调用应各成一行，实际 ${toolRows.length} 行`);
-    assert.equal(toolRows[0].text, '已读取文件', `read 应映射「已读取文件」，实际 ${toolRows[0].text}`);
+    assert.equal(toolRows[0].text, '读取', `read 应映射官方文案「读取」，实际 ${toolRows[0].text}`);
     assert.equal(toolRows[0].detail, 'a', '工具行应带目标摘要');
-    assert.equal(toolRows[1].text, '已写入文件', `write 应映射「已写入文件」，实际 ${toolRows[1].text}`);
+    assert.equal(toolRows[1].text, '写入', `write 应映射官方文案「写入」，实际 ${toolRows[1].text}`);
     assert.equal(toolRows[1].error, true, 'isError 的 result 应把行标成失败');
     assert.ok(!rows.some((r) => /read\(\{|tool-call/.test(r.text)), '工具参数不该裸 JSON 刷屏');
     // 团队消息去重：m1 只出现一次
     assert.equal(rows.filter((r) => r.kind === 'team').length, 1, '同一条团队消息应去重');
     // 连续 >8 条工具行折叠中段（防止把正文挤出屏幕）
-    const many = [];
-    for (let i = 0; i < 12; i += 1) many.push({ type: 'tool/call', data: { callId: 'x' + i, name: 'read', arguments: '{}' } });
+    const many = [];    for (let i = 0; i < 12; i += 1) many.push({ type: 'tool/call', data: { callId: 'x' + i, name: 'read', arguments: '{}' } });
     const folded = graph.extractConversation(many, 50);
     assert.ok(folded.some((r) => r.kind === 'toolgroup'), '12 条连续工具应折叠中段');
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
+  });
+
+  await check('team 行：sender 走结构化字段，正文保持纯净 markdown（弹窗乱码修复）', () => {
+    // 用户 2026-10-11 报障：弹窗里 `##`、`**`、反引号全部裸显（「乱码」）。
+    // 根因（真实会话 session-0000100b seq=66 实测）：队员的 report_result 报告正文**就是
+    // markdown**（`## 3) 抽查复核`、`**P2**`、`` `dev/...` ``），但有两处叠加问题：
+    //   ① 渲染层（client.js）只给 assistant 行走 wsMarkdown，team 行 textContent 直出；
+    //   ② 数据层（graph.js）把 `sender → ` 拼在正文最前面 —— 即使 ① 修了，
+    //      「plan-critic → ## 3) 抽查复核」的第一行也会因行首混入非 markdown 前缀
+    //      而把标题语法破坏掉。
+    //
+    // 本闸门钉住 ②（数据层契约）：team 行必须有结构化 senderName，正文**不得**再带
+    // `sender → ` 前缀。①由 client-smoke-test 与渲染分支覆盖（"assistant|team|notice" 分支）。
+    const rows = graph.extractConversation([
+      { type: 'team/message/queued', data: { message: { id: 'r1', senderName: 'plan-critic', targetId: 'lead', content: [{ type: 'text', text: '## 3) 抽查复核\n- **P2** `a.m:1` 存在\n\nVERDICT: ACCEPT' }] } } },
+    ], 10);
+    assert.equal(rows.length, 1, `应成 1 行，实际 ${rows.length}`);
+    const row = rows[0];
+    assert.equal(row.kind, 'team');
+    assert.equal(row.senderName, 'plan-critic', 'senderName 必须是结构化字段（渲染层据此显示 who 标签）');
+    assert.ok(!row.text.startsWith('plan-critic → '), '正文不得再拼 sender 前缀（会破坏首行 markdown）');
+    assert.ok(row.text.startsWith('## 3)'), `正文第一行必须保持 markdown 原样，实际 ${JSON.stringify(row.text.slice(0, 20))}`);
+    assert.ok(row.text.includes('**P2**') && row.text.includes('VERDICT'), '正文内容不能丢');
+
+    // 反例：sender 缺失时用 '?'，依然不拼进正文。
+    const rows2 = graph.extractConversation([
+      { type: 'team/message/queued', data: { message: { id: 'r2', targetId: 'lead', content: [{ type: 'text', text: '## 标题' }] } } },
+    ], 10);
+    assert.equal(rows2[0].senderName, '?', 'senderName 缺失时回退 "?"');
+    assert.ok(rows2[0].text.startsWith('## 标题'), '正文依然纯净');
+  });
+
+  await check('extractConversation：被中止的回合只有 reasoning 块时，对话不能整片空白', () => {
+    // 用户 2026-10-10 报障：「工作区里面空的，看不到回复」。
+    // 根因（真实会话 session-00001008 seq=19 实测）：用户 `/team` 后中止那一轮，
+    // DSH 落盘的 assistant/message 里 content **只有一个 reasoning 块**
+    // （`[{type:'reasoning', text:<37428 字符>}]`，data.stream 只有 2 条记录：
+    //  `chunk/block-start(blockType:reasoning)` 与 `reasoning-chunks`，没有任何 usage）。
+    // 而 textOfBlocks 只认 `type === 'text'` ⇒ 返回空串 ⇒ 对话详情**整片空白**，
+    // 用户看不到任何内容，尽管模型确实产出了 3.7 万字。
+    //
+    // 这条闸门钉住修复：reasoning-only 的 assistant 消息必须成行，且**必须带
+    // reasoning:true 标记**（渲染层据此如实标注「仅思考内容」，避免被当成正式回复）。
+    const onlyReasoning = [
+      { type: 'assistant/message', data: { turn: 1, step: 1, interrupted: true, message: { role: 'assistant', content: [{ type: 'reasoning', text: 'Let me think about this task carefully.' }] } } },
+    ];
+    const rows = graph.extractConversation(onlyReasoning, 10);
+    assert.equal(rows.length, 1, `reasoning-only 的回合必须成 1 行，实际 ${rows.length} 行（回归：对话会整片空白）`);
+    assert.equal(rows[0].kind, 'assistant');
+    assert.equal(rows[0].reasoning, true, 'reasoning 兜底行必须带 reasoning:true，渲染层据此标注');
+    assert.ok(rows[0].text.includes('Let me think'), 'reasoning 文本要真的进去');
+
+    // 反例：**有正文**的回合绝不能用 reasoning 顶替正文（避免思考淹没对话）。
+    const withText = [
+      { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '内部推理不该显示' }, { type: 'text', text: '正式回复' }] } } },
+    ];
+    const rows2 = graph.extractConversation(withText, 10);
+    assert.equal(rows2.length, 1, '有正文时应只成 1 行');
+    assert.equal(rows2[0].text, '正式回复', '有 text 块时必须用 text，不能被 reasoning 顶替');
+    assert.ok(rows2[0].reasoning !== true, '有正文的行不该被标成 reasoning');
+
+    // 空 content 不能凭空造行。
+    const empty = [{ type: 'assistant/message', data: { message: { content: [] } } }];
+    assert.equal(graph.extractConversation(empty, 10).length, 0, '空 content 不该成行');
+  });
+
+  await check('hasUsage：没有 provider usage 时必须为 false（「没测量」不能画成「测到 0」）', () => {
+    // 用户 2026-10-10 报障：「卡片看不到基本信息」（0/0/0 TODO、0 out、0 cache、0% hit）。
+    // 根因（真实会话 session-00001008 seq=19 实测）：被中止的回合没有产生 usage chunk
+    // ⇒ data.usage === undefined、data.stream 只有 block-start 与 reasoning-chunks
+    // ⇒ 四桶全停在 0。旧渲染把「**没有测量**」画成「**测到 0**」，
+    // 而同一屏的「输出速度」却显示 `—`（client.js 用 tps>0 判定），两处口径自相矛盾。
+    //
+    // 这条闸门钉住 hasUsage 的语义：只有**真的**收到过 usage 才为 true。
+    const noUsage = [
+      { type: 'model/selection', data: { provider: 'raccoon', model: 'sn-glm-5-3' } },
+      { type: 'request/context', data: { provider: 'raccoon', model: 'sn-glm-5-3', contextWindow: 1000000 } },
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'assistant/message', data: { turn: 1, step: 1, interrupted: true, message: { content: [{ type: 'reasoning', text: 'x' }] }, stream: [{ type: 'chunk', chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } }, { type: 'reasoning-chunks', index: 0, dt: [1, 2] }] } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+    ];
+    const stats = graph.foldSession(noUsage);
+    const g = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', stats]]), tasks: [] });
+    assert.equal(g.nodes[0].hasUsage, false, '没有任何 usage 时必须 hasUsage=false（否则卡片会显示骗人的 0）');
+    assert.equal(g.totals.hasUsage, false, 'totals.hasUsage 必须同为 false（底栏同一口径）');
+
+    // 有 usage 时必须为 true，且数值进四桶。
+    const withUsage = [
+      { type: 'assistant/message', data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+    ];
+    const s2 = graph.foldSession(withUsage);
+    const g2 = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s2]]), tasks: [] });
+    assert.equal(g2.nodes[0].hasUsage, true, '收到过 usage 时必须 hasUsage=true');
+    assert.equal(g2.nodes[0].usage.outputTokens, 50, 'outputTokens 要进桶');
+    assert.equal(g2.nodes[0].usage.cacheReadTokens, 900, 'cacheReadTokens 要进桶');
+    assert.equal(g2.totals.hasUsage, true, 'totals.hasUsage 必须同为 true');
+
+    // 官方两层形状（{type:'chunk', chunk:{type:'usage', usage}}）也必须认。
+    const twoLayer = [
+      { type: 'assistant/message', data: { turn: 1, step: 1, stream: [{ type: 'chunk', chunk: { type: 'usage', usage: { inputTokens: 7, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0 } } }] } },
+    ];
+    const s3 = graph.foldSession(twoLayer);
+    const g3 = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s3]]), tasks: [] });
+    assert.equal(g3.nodes[0].hasUsage, true, '两层形状的 usage 也要认（否则回退成 undefined）');
+    assert.equal(g3.nodes[0].usage.outputTokens, 3, '两层形状的 outputTokens 要进桶');
+  });
+
+  await check('dispatch-mode preset 必须把 tool-ask-user 设为 mode: timed（否则弹窗回答关不掉官方提问卡）', () => {
+    // 用户 2026-10-10 报障：「我在弹窗里回答了问题，点发送后显示已回答，
+    // 但退出工作区后官方页面仍显示等待我回答」。
+    //
+    // 根因（官方源码 + 真实会话复算）：
+    //   官方 ask_user_question 有两条互不相通的路径，由工具 schema 是否声明
+    //   `timeout` 决定（dsh-user-questions/lib/index.js:190 的 timed 判定）：
+    //     * legacy（无 config 的默认）：:200 `if (!fold.timed || ...) return fold`
+    //       —— 投影整条跳过，提问走 :681 `ctx.waterfall("user-questions/request")`，
+    //       答案只能由持有该 waterfall 的一方给出（只存在于官方前端内存：
+    //       dsh-client-ui-user-questions/lib/client.js:1927 + :1795）。
+    //       宿主侧 `userQuestions.answer()` 于是 :554 找不到 → :555 return false
+    //       ⇒ **插件根本无法关闭官方提问卡**。
+    //     * timed（本 preset 的 config）：提问进投影记 continued，
+    //       官方卡片自己的提交路径也变成 RPC（同文件 :396-405
+    //       `#state === "continued" && rpc !== void 0 → rpc.answer(...)`），
+    //       与插件走**同一条** userQuestions.answer ⇒ 弹窗回答能真正 settle。
+    //
+    // 实测判据（.probe/verify-timed-legacy-real.cjs）：本机 session-0000100f 的
+    // request/header 里 ask_user_question 参数只有 ["questions"] ⇒ legacy。
+    //
+    // 这条闸门防止有人删掉 mode: timed 而无人察觉（症状是「弹窗说已回答、官方还在等」，
+    // 从代码表面完全看不出来）。
+    const yml = readFileSync(path.join(__dirname, '..', 'presets', 'dispatch-mode.patch.yml'), 'utf8');
+    const at = yml.indexOf('- id: tool-ask-user');
+    assert.ok(at >= 0, 'dispatch-mode preset 里找不到 tool-ask-user 行');
+    // 取该行往后 8 行作为这个条目的块
+    const block = yml.slice(at).split('\n').slice(0, 8).join('\n');
+    assert.ok(/^\s*mode:\s*timed\s*$/m.test(block),
+      'tool-ask-user 必须设 mode: timed —— 否则提问走 legacy waterfall，'
+      + '插件（以及工作区弹窗）永远无法关闭官方提问卡，用户会看到「已回答但官方仍等待」');
+    assert.ok(/^\s*timeout:\s*\d+\s*$/m.test(block),
+      'mode: timed 必须同时给一个默认 timeout（秒），否则官方按未配置处理');
+  });
+
+  await check('增量折叠游标：必须推进到「连续可读」的位置，不能按条数、也不能按 session.seq', () => {
+    // ── 用户 2026-10-10 报障「工作区没有实时更新」的根因之一（P1）────────────────
+    // 活体增量折叠用 `consumedSeq` 当游标，而 `session.seq`（已分配序号）与
+    // `eventAt(seq)`（已落盘日志）在写入过程中会短暂不一致 —— 空洞（undefined）。
+    // 三种推进口径的后果实测（模拟 seq 0..9、3/4 缺失、第 2 轮后补齐）：
+    //   * `consumedSeq += events.length`（**旧实现**）：游标与 seq 空间累积偏差 ⇒
+    //     空洞在**中间**时游标落后 ⇒ 同一批事件被反复折叠（token/时长/TODO 重复累加）。
+    //     实测：seq 3/4 缺失时第一轮得 8 条 → 游标 0→8 而真实已扫到 9 ⇒ 下一轮重折 seq 8。
+    //   * `consumedSeq = session.seq`：空洞被**永久跳过** ⇒ 后补落盘的事件再也读不到。
+    //     实测：漏掉 2 条 ⇒ outputTokens 少算 200（800 而非 1000）。
+    //   * `consumedSeq = safeUntil`（**现实现**）：只推进到连续读到处 ⇒ 两种场景都正确。
+    //
+    // 这条闸门用「中间有空洞 + 后补落盘」的真实场景钉住现实现的行为。
+    const mk = (seq) => ({
+      type: 'assistant/message', seq, time: 1000 + seq,
+      data: { turn: seq, step: 1, usage: { inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    });
+    const END = 10;
+    const store = new Map();
+    for (let i = 0; i < END; i += 1) { if (i === 3 || i === 4) continue; store.set(i, mk(i)) }
+
+    // 复刻现实现的口径（safeUntil）
+    const readSafe = (from) => {
+      const out = [];
+      let safeUntil = from;
+      for (let seq = from; seq < END; seq += 1) {
+        const e = store.get(seq);
+        if (e === undefined) break;
+        out.push(e);
+        safeUntil = seq + 1;
+      }
+      return { events: out, safeUntil };
+    };
+    const stats = graph.emptyStats();
+    let cursor = 0;
+    for (let round = 1; round <= 4; round += 1) {
+      const { events, safeUntil } = readSafe(cursor);
+      graph.foldEvents(stats, events);
+      if (safeUntil > cursor) cursor = safeUntil;
+      if (round === 2) for (let i = 0; i < END; i += 1) if (!store.has(i)) store.set(i, mk(i));
+    }
+    assert.equal(cursor, END, `游标最终应推进到 ${END}，实际 ${cursor}`);
+    assert.equal(stats.usage.outputTokens, END * 100,
+      `中间有空洞时不能漏读也不能重复折叠：期望 ${END * 100}，实际 ${stats.usage.outputTokens}`);
+
+    // 反例 1：按条数推进（旧实现）在有空洞且空洞在**中间**时游标落后 ⇒ 同一事件被折叠两次。
+    // ⚠️ 判据必须用「同一 seq 的事件被折了几次」，不能看 outputTokens 是否变大 ——
+    //    foldEvents 对同 turn/step 是 **last-wins 替换**语义，重复折叠不会累加（反而会抵消）。
+    //    所以这里直接数「同一 seq 被喂进 foldEvents 的次数」。
+    {
+      const s2 = new Map();
+      for (let i = 0; i < END; i += 1) { if (i === 5) continue; s2.set(i, mk(i)) } // 空洞在中间（seq 5）
+      const readByLength = (from) => {
+        const out = []
+        for (let seq = from; seq < END; seq += 1) { const e = s2.get(seq); if (e !== undefined) out.push(e) }
+        return out
+      }
+      const seenByLength = new Map()
+      let cur = 0
+      for (let round = 1; round <= 3; round += 1) {
+        const evs = readByLength(cur)
+        for (const e of evs) seenByLength.set(e.seq, (seenByLength.get(e.seq) ?? 0) + 1)
+        cur += evs.length   // 旧口径
+      }
+      const dup = [...seenByLength.entries()].filter(([, n]) => n > 1).map(([seq, n]) => `seq${seq}×${n}`)
+      assert.ok(dup.length > 0,
+        `旧口径（+= events.length）在空洞位于中间时应当把后续事件**重复读入**（这正是要修掉的 bug）；`
+        + `实际没有任何重复：${JSON.stringify([...seenByLength.entries()])}`)
+    }
+
+    // 反例 2：按 session.seq 推进会永久跳过空洞 —— 用「同一 seq 被读到的次数」判据：
+    // 空洞（seq 3/4）永远读不到 ⇒ 它们从未进入折叠。
+    {
+      const s3 = new Map();
+      for (let i = 0; i < END; i += 1) { if (i === 3 || i === 4) continue; s3.set(i, mk(i)) }
+      const readToEnd = (from) => {
+        const out = []
+        for (let seq = from; seq < END; seq += 1) { const e = s3.get(seq); if (e !== undefined) out.push(e) }
+        return out
+      }
+      const seen = new Set()
+      let cur = 0
+      for (let round = 1; round <= 3; round += 1) {
+        for (const e of readToEnd(cur)) seen.add(e.seq)
+        cur = END   // 旧口径 2
+        if (round === 1) for (let i = 0; i < END; i += 1) if (!s3.has(i)) s3.set(i, mk(i))
+      }
+      assert.ok(!seen.has(3) || !seen.has(4),
+        `按 session.seq 推进应当**永久跳过**空洞（这正是不能采用它的原因）；`
+        + `实际读到的 seq：${JSON.stringify([...seen].sort((a, b) => a - b))}`)
+    }
+  });
+
+  await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
+    // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
+    // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方
+    // tool-agent-team 行 + agent-team 容量 48）整段消失 ⇒ 官方九个团队工具与本插件
+    // 同名冲突（tool "spawn_teammate" is already registered in this scope）、
+    // 界面显示「Team 暂不可用」。
+    // 修法：插件启动时自愈（lib/self-heal.js 的 healManagedBlock）。
+    //
+    // 这条闸门守**两份定义的一致性**：自愈写进去的块必须与 repair.cjs 期望的完全相同，
+    // 否则会出现「自愈说修好了、repair --check 仍报缺」这种自相矛盾的状态。
+    const healSrc = readFileSync(path.join(__dirname, '..', 'lib', 'self-heal.js'), 'utf8');
+    const repairSrc = readFileSync(path.join(__dirname, 'repair.cjs'), 'utf8');
+    const markerRe = /const MANAGED_(START|END) = '([^']+)'/g;
+    const fromHeal = {};
+    const fromRepair = {};
+    for (const m of healSrc.matchAll(markerRe)) fromHeal[m[1]] = m[2];
+    for (const m of repairSrc.matchAll(markerRe)) fromRepair[m[1]] = m[2];
+    assert.equal(fromHeal.START, fromRepair.START, 'MANAGED_START 两份定义不一致');
+    assert.equal(fromHeal.END, fromRepair.END, 'MANAGED_END 两份定义不一致');
+    for (const key of ['maxMembers', 'maxTasks', 'maxPendingMessagesPerMember', 'maxMessageBytes', 'disposalTimeoutMs']) {
+      const inRepair = new RegExp(key + ':\\s*(\\d+)').exec(repairSrc);
+      const inHeal = new RegExp(key + ':\\s*(\\d+)').exec(healSrc);
+      assert.ok(inRepair !== null, `repair.cjs 里找不到 ${key}`);
+      assert.ok(inHeal !== null, `self-heal.js 里找不到 ${key}`);
+      assert.equal(inHeal[1], inRepair[1], `${key} 两份定义不一致（repair=${inRepair[1]} self-heal=${inHeal[1]}）`);
+    }
+    assert.ok(healSrc.includes('- id: tool-agent-team') && healSrc.includes('disabled: true'),
+      'self-heal.js 的托管块必须包含「关掉官方 tool-agent-team 行」');
+    const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+    assert.ok(indexSrc.includes('healManagedBlock'), 'lib/index.js 必须调用 healManagedBlock（否则自愈形同虚设）');
+  });
+
+  await check('dsh-ops 组件合并（vendor 化）：ops-file 行、vendor 闭包、共存自愈三件套齐备', () => {
+    // 用户 2026-10-11 第二轮要求：「ops 插件直接放进我的智能体团队源码里面，把我本机上
+    // 安装的 ops 卸载了也可以用；别人装了 ops 可以兼容不报错，没装 ops 也能装我的插件」。
+    //
+    // 落地形态（四处协同，缺一即坏）：
+    //   ① vendor/ops/lib/ —— dsh-ops 0.2.6 lib/ 的完整运行时拷贝（14 模块依赖闭包，
+    //      除 Node 内置外零外部包）；vendor/ops/vendor/fastctx/target/release/fastctx.exe
+    //      是工具的 Rust 执行体（dsh-ops binary.js 搜索链第 2 环 repoBuildFile 命中，
+    //      PACKAGE_ROOT 在 vendor 副本里指向 vendor/ops，实测 resolveBinary+probeBinary 通过）。
+    //   ② cordis.patch.yml 第 4 行 `- id: ops-file / name: @zws/dsh-dispatch-agent-team/ops-file`
+    //      —— name 指向**本包自己的 exports 子路径**（./ops-file），卸载独立 dsh-ops 后
+    //      本行照常解析挂载。id 不能沿用 dsh-ops-file（会被它的 bundle 行覆盖，
+    //      asar 文档 overridden 语义）。
+    //   ③ package.json exports['./ops-file'] + files 含 vendor（发布时带上二进制）。
+    //   ④ lib/ops-coexist.js 启动自愈 —— 别人装了独立 dsh-ops 时，把它 bundle 的
+    //      dsh-ops-file 行在 profile 层钉 disabled（机制同 self-heal），防 ops_* 重复注册；
+    //      没装则该自愈零动作。lib/index.js 必须调用它 + detectOpsIntegration 体检。
+    const patch = readFileSync(path.join(__dirname, '..', 'cordis.patch.yml'), 'utf8');
+    assert.ok(/^\s*-\s*id:\s*ops-file\s*$/m.test(patch), 'cordis.patch.yml 必须有 `- id: ops-file` 行（第四组件）');
+    assert.match(patch, /name:\s*['"]@zws\/dsh-dispatch-agent-team\/ops-file['"]/,
+      'ops-file 行的 name 必须指向本包 vendor 入口（卸载独立 dsh-ops 后仍可解析）');
+    assert.ok(!/^\s*-\s*id:\s*dsh-ops-file\s*$/m.test(patch),
+      '本包不得声明 id=dsh-ops-file（会被 dsh-ops 自己的 bundle 行覆盖，overridden 语义）');
+    // config 逐项核对（与 dsh-ops 官方 dsh-ops-file 行同值，防止两个实现配置分叉）
+    const blockMatch = /- id: ops-file\n([\s\S]*?)(?=\n    - id:|\n$|$)/.exec(patch);
+    assert.ok(blockMatch !== null, 'ops-file 行块提取失败');
+    const block = blockMatch[1];
+    assert.match(block, /promptPolicy:\s*true/);
+    assert.match(block, /enableShellTools:\s*false/);
+    assert.match(block, /required:\s*false/);
+    assert.match(block, /toolCallTimeoutMs:\s*300000/);
+
+    // vendor 闭包完整性（13 模块 + file 组件 manifest + fastctx.exe）
+    const vendorLib = path.join(__dirname, '..', 'vendor', 'ops', 'lib');
+    for (const mod of ['index.js', 'binary.js', 'policy.js', 'tools.js', 'config.js', 'config-updates.js',
+      'shells.js', 'session-shells.js', 'session-pwsh.js', 'handshake.js', 'jobs.js',
+      'presentation.js', 'runtime-pool.js']) {
+      assert.ok(existsSync(path.join(vendorLib, mod)), `vendor/ops/lib/${mod} 缺失（vendor 闭包不完整）`);
+    }
+    assert.ok(existsSync(path.join(vendorLib, 'components', 'file', 'index.js')), 'vendor file 入口缺失');
+    assert.ok(existsSync(path.join(vendorLib, 'components', 'file', 'package.json')),
+      'vendor file manifest 缺失（插件页组件卡片会没有图标/描述）');
+    assert.ok(existsSync(path.join(__dirname, '..', 'vendor', 'ops', 'vendor', 'fastctx', 'target', 'release', 'fastctx.exe')),
+      'vendor fastctx.exe 缺失（工具的 Rust 执行体；resolveBinary 的 repoBuild 环就是找它）');
+
+    const pkg = JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert.equal(pkg.exports?.['./ops-file'], './vendor/ops/lib/components/file/index.js',
+      'package.json exports 必须有 ./ops-file 子路径（patch 行 name 解析的锚点）');
+    assert.ok(pkg.files?.includes('vendor'), 'package.json files 必须含 vendor（发布不带二进制 = 别人装了组件挂掉）');
+
+    const coexistSrc = readFileSync(path.join(__dirname, '..', 'lib', 'ops-coexist.js'), 'utf8');
+    assert.ok(coexistSrc.includes('export function healOpsCoexist(ctx)'), 'lib/ops-coexist.js 必须导出 healOpsCoexist');
+    assert.ok(coexistSrc.includes('- id: dsh-ops-file'), '共存自愈必须钉 dsh-ops-file 行（只此一行，不碰 shell/background）');
+    const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+    assert.ok(indexSrc.includes('healOpsCoexist'), 'lib/index.js 必须调用 healOpsCoexist（别人装了 dsh-ops 时的防重复注册）');
+    assert.ok(indexSrc.includes('async function detectOpsIntegration(ctx)'), 'lib/index.js 必须有 detectOpsIntegration 体检');
+    assert.ok(indexSrc.includes('status.opsIntegration = await detectOpsIntegration(ctx)'), 'writeStatusFile 必须落盘 opsIntegration');
+    assert.ok(indexSrc.includes("entryId === 'ops-file' || entryId === 'dsh-ops-file'"),
+      'rows 采集必须同时覆盖 ops-file 与 dsh-ops-file 两行（排查「谁被顶掉」看这里）');
+  });
+
+  await check('托管块结构（2026-10-10 P0）：块必须在文件开头，且切片重写不得吞掉哨兵区内的外来行', async () => {
+    // 用户 2026-10-10 报障的根因（已用真实 profile 复现）：托管块原本 append 在**文件末尾**，
+    // 而宿主 dsh-plugin-manager 切换插件组件时用 YAML AST 的 document.add() 追加新行 ——
+    // add() 落在**最后一个序列项之后、尾部注释之前**，也就是**哨兵区内部**。
+    // 随后 --apply/--revert 的整段切片把 permission(325-338) / llm-pi-ai(339-351) 一起删掉
+    // （实测 16623 → 15096 字节，dsh-permission-presets / JIYUAN_API_KEY 全没了），
+    // 而体检两条正则都通过、self-heal 只查 includes(MANAGED_START) ⇒ 谁都没发现。
+    //
+    // 本闸门用**真代码**（self-heal.js 的导出）跑四个行为断言，任一条退化即红：
+    //   ① 块在末尾的文本判为不健康；② 归一化把块搬到开头；
+    //   ③ 哨兵区内的外来行在归一化后**必须还在**；④ 归一化幂等（第二次完全不变）。
+    const heal = await import(pathToFileURL(path.join(LIB, 'self-heal.js')).href);
+    const { MANAGED_START, MANAGED_END } = heal;
+    assert.equal(typeof heal.managedBlockHealthy, 'function', 'self-heal.js 必须导出 managedBlockHealthy');
+    assert.equal(typeof heal.normalizeManagedBlock, 'function', 'self-heal.js 必须导出 normalizeManagedBlock');
+
+    // 造一份「块在末尾 + 区内混入外来行」的文本（复刻用户现场的最小形状）。
+    const foreign = ['- id: permission', '  name: "@deepseek-ai/dsh-permission-presets"', '',
+      '- id: llm-pi-ai', '  name: "@deepseek-ai/dsh-llm-pi-ai"', '  config:', '    apiKeyEnv: JIYUAN_API_KEY'];
+    const blockAtEnd = [
+      '# profile head comment',
+      '- id: ui-settings',
+      '  config:',
+      '    enabled: true',
+      '',
+      MANAGED_START,
+      '- id: tool-agent-team',
+      '  disabled: true',
+      '',
+      '- id: agent-team',
+      '  config:',
+      '    maxMembers: 48',
+      ...foreign,
+      MANAGED_END,
+    ].join('\n');
+
+    assert.equal(heal.managedBlockHealthy(blockAtEnd), false,
+      '块写在文件末尾必须判为不健康（否则宿主 AST 追加会再次把外来行塞进哨兵区）');
+
+    const fixed = heal.normalizeManagedBlock(blockAtEnd);
+    assert.equal(heal.managedBlockHealthy(fixed), true, '归一化后必须健康');
+    // ① 块在文件开头：MANAGED_START 必须出现在第一个顶层条目之前。
+    const firstRow = fixed.split('\n').findIndex((line) => /^-\s*(?:id:|insert:)/u.test(line));
+    const startLine = fixed.split('\n').findIndex((line) => line === MANAGED_START);
+    assert.ok(startLine >= 0 && startLine < firstRow,
+      `托管块必须排在第一个顶层条目之前（块在第 ${startLine + 1} 行、首个条目在第 ${firstRow + 1} 行）`);
+    // ② 哨兵区内只允许本插件那两条。
+    const bodyStart = fixed.indexOf(MANAGED_START) + MANAGED_START.length;
+    const bodyEnd = fixed.indexOf(MANAGED_END);
+    const inside = [...fixed.slice(bodyStart, bodyEnd).matchAll(/^-\s*id:\s*(\S+)/gmu)].map((m) => m[1]);
+    assert.deepEqual(inside, ['tool-agent-team', 'agent-team'],
+      `哨兵区内只应有本插件两条行，实际：${inside.join(', ')}`);
+    // ③ 外来行一条都不能丢（这是本次 P0 的核心）。
+    for (const key of ['dsh-permission-presets', 'llm-pi-ai', 'JIYUAN_API_KEY']) {
+      assert.ok(fixed.includes(key), `归一化把外来内容删掉了：${key} 不见了`);
+    }
+    // ④ 幂等：对已健康的文本再归一化必须逐字不变（否则 repair --apply 每次都重写）。
+    assert.equal(heal.normalizeManagedBlock(fixed), fixed, '归一化必须幂等（第二次调用逐字不变）');
+
+    // ⑤ 两份实现必须一致：repair.cjs 也必须导出/实现同样的两个概念（防只修一边）。
+    const repairSrc = readFileSync(path.join(__dirname, 'repair.cjs'), 'utf8');
+    assert.ok(repairSrc.includes('function removeManagedBlock'), 'repair.cjs 必须有 removeManagedBlock（救出外来行）');
+    assert.ok(repairSrc.includes('managedBlockPrefix'), 'repair.cjs 必须把块写进文件开头（managedBlockPrefix）');
+    assert.ok(repairSrc.includes('function managedRegion'), 'repair.cjs 必须有 managedRegion');
+    assert.ok(/MANAGED_ROW_IDS\s*=\s*\[[^\]]*'tool-agent-team'[^\]]*'agent-team'/u.test(repairSrc),
+      'repair.cjs 的 MANAGED_ROW_IDS 必须同时含 tool-agent-team 与 agent-team');
+    assert.ok(/MANAGED_ROW_IDS\s*=\s*Object\.freeze\(\[[^\]]*'tool-agent-team'[^\]]*'agent-team'/u.test(
+      readFileSync(path.join(LIB, 'self-heal.js'), 'utf8')),
+      'self-heal.js 的 MANAGED_ROW_IDS 必须同时含 tool-agent-team 与 agent-team');
+  });
+
+  await check('markdown 表格渲染：解析器存在且成表（用户 2026-10-09 截图报「表格渲染有问题」）', () => {
+    // 用户截图里 `| 检查项 | 结果 |` / `|---|---|` 原样显示成乱码 —— 渲染器缺表格支持。
+    // 完整的**行为**断言在 .probe/test-table.cjs 与 .probe/ws-e2e.mjs（需要浏览器 DOM）；
+    // 这里做静态闸门：解析器必须在，且被 wsMarkdown 调用（防有人删掉后无人察觉）。
+    const src = readFileSync(require('node:path').join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(src.includes('function wsTableAt('), 'client.js 缺少 wsTableAt 表格解析器');
+    assert.ok(src.includes('const table = wsTableAt(lines, i)'), 'wsMarkdown 必须调用 wsTableAt');
+    assert.ok(src.includes('.dat-ws .md table{'), '缺少表格样式（.dat-ws .md table）');
+    assert.ok(src.includes('md-table'), '缺少表格容器样式（.md-table，用于横向滚动）');
+  });
+
+  await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
+    // 用户 2026-10-09：「一定要正确，和我用官方的对话框没太大区别」。
+    // 官方真值来自 dsh-client-ui-conversation/lib/client.js 的 locale 块，
+    // 提取脚本 .probe/extract-tool-titles-zh.cjs（58 条）。
+    // 旧实现是自造文案（「已读取文件」「修改了文件」「已搜索代码」）—— 与官方不一致。
+    const expect = {
+      read: '读取', read_image: '读取图片', grep: '搜索文件内容', glob: '查找文件',
+      write: '写入', edit: '编辑', apply_patch: '编辑', bash: '运行命令', pwsh: '运行命令',
+      web_search: '网页搜索', web_fetch: '网页获取', subagent: '创建子智能体',
+      spawn_teammate: '创建队友', send_message: '发送消息', list_agents: '查看子智能体',
+      wait_agent: '等待子智能体', team_task_create: '创建团队任务', get_team_task: '读取团队任务',
+      read_terminal: '读取终端', lsp: '查询代码符号', find_references: '查找引用',
+    };
+    for (const [tool, label] of Object.entries(expect)) {
+      assert.equal(graph.toolRowLabel(tool), label, `${tool} 应为官方文案「${label}」`);
+    }
+    // 认不出来的工具回退到官方 generic（「工具调用」），**不许自造新词**。
+    assert.equal(graph.toolRowLabel('some_unknown_tool'), '工具调用', '未知工具应回退官方 generic 文案');
+    // 反面对照：自造文案一个都不许再出现。
+    for (const banned of ['已读取文件', '已写入文件', '修改了文件', '已搜索代码', '执行了命令', '已调用工具']) {
+      const hit = Object.keys(expect).some((k) => graph.toolRowLabel(k) === banned);
+      assert.ok(!hit, `官方文案里没有「${banned}」，不该出现`);
+    }
   });
 
   await check('collectGraph：持久兜底必须走 ctx.get()（属性访问未 inject 的服务会抛错 → 兜底恒失效）', async () => {
