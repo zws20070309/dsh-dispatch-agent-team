@@ -1153,6 +1153,111 @@ function functionBodyOf(source, needle) {
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
   });
 
+  await check('team 行：sender 走结构化字段，正文保持纯净 markdown（弹窗乱码修复）', () => {
+    // 用户 2026-10-11 报障：弹窗里 `##`、`**`、反引号全部裸显（「乱码」）。
+    // 根因（真实会话 session-7ac4a2ae seq=66 实测）：队员的 report_result 报告正文**就是
+    // markdown**（`## 3) 抽查复核`、`**P2**`、`` `dev/...` ``），但有两处叠加问题：
+    //   ① 渲染层（client.js）只给 assistant 行走 wsMarkdown，team 行 textContent 直出；
+    //   ② 数据层（graph.js）把 `sender → ` 拼在正文最前面 —— 即使 ① 修了，
+    //      「plan-critic → ## 3) 抽查复核」的第一行也会因行首混入非 markdown 前缀
+    //      而把标题语法破坏掉。
+    //
+    // 本闸门钉住 ②（数据层契约）：team 行必须有结构化 senderName，正文**不得**再带
+    // `sender → ` 前缀。①由 client-smoke-test 与渲染分支覆盖（"assistant|team|notice" 分支）。
+    const rows = graph.extractConversation([
+      { type: 'team/message/queued', data: { message: { id: 'r1', senderName: 'plan-critic', targetId: 'lead', content: [{ type: 'text', text: '## 3) 抽查复核\n- **P2** `a.m:1` 存在\n\nVERDICT: ACCEPT' }] } } },
+    ], 10);
+    assert.equal(rows.length, 1, `应成 1 行，实际 ${rows.length}`);
+    const row = rows[0];
+    assert.equal(row.kind, 'team');
+    assert.equal(row.senderName, 'plan-critic', 'senderName 必须是结构化字段（渲染层据此显示 who 标签）');
+    assert.ok(!row.text.startsWith('plan-critic → '), '正文不得再拼 sender 前缀（会破坏首行 markdown）');
+    assert.ok(row.text.startsWith('## 3)'), `正文第一行必须保持 markdown 原样，实际 ${JSON.stringify(row.text.slice(0, 20))}`);
+    assert.ok(row.text.includes('**P2**') && row.text.includes('VERDICT'), '正文内容不能丢');
+
+    // 反例：sender 缺失时用 '?'，依然不拼进正文。
+    const rows2 = graph.extractConversation([
+      { type: 'team/message/queued', data: { message: { id: 'r2', targetId: 'lead', content: [{ type: 'text', text: '## 标题' }] } } },
+    ], 10);
+    assert.equal(rows2[0].senderName, '?', 'senderName 缺失时回退 "?"');
+    assert.ok(rows2[0].text.startsWith('## 标题'), '正文依然纯净');
+  });
+
+  await check('extractConversation：被中止的回合只有 reasoning 块时，对话不能整片空白', () => {
+    // 用户 2026-10-10 报障：「工作区里面空的，看不到回复」。
+    // 根因（真实会话 session-93e1ac65 seq=19 实测）：用户 `/team` 后中止那一轮，
+    // DSH 落盘的 assistant/message 里 content **只有一个 reasoning 块**
+    // （`[{type:'reasoning', text:<37428 字符>}]`，data.stream 只有 2 条记录：
+    //  `chunk/block-start(blockType:reasoning)` 与 `reasoning-chunks`，没有任何 usage）。
+    // 而 textOfBlocks 只认 `type === 'text'` ⇒ 返回空串 ⇒ 对话详情**整片空白**，
+    // 用户看不到任何内容，尽管模型确实产出了 3.7 万字。
+    //
+    // 这条闸门钉住修复：reasoning-only 的 assistant 消息必须成行，且**必须带
+    // reasoning:true 标记**（渲染层据此如实标注「仅思考内容」，避免被当成正式回复）。
+    const onlyReasoning = [
+      { type: 'assistant/message', data: { turn: 1, step: 1, interrupted: true, message: { role: 'assistant', content: [{ type: 'reasoning', text: 'Let me think about this task carefully.' }] } } },
+    ];
+    const rows = graph.extractConversation(onlyReasoning, 10);
+    assert.equal(rows.length, 1, `reasoning-only 的回合必须成 1 行，实际 ${rows.length} 行（回归：对话会整片空白）`);
+    assert.equal(rows[0].kind, 'assistant');
+    assert.equal(rows[0].reasoning, true, 'reasoning 兜底行必须带 reasoning:true，渲染层据此标注');
+    assert.ok(rows[0].text.includes('Let me think'), 'reasoning 文本要真的进去');
+
+    // 反例：**有正文**的回合绝不能用 reasoning 顶替正文（避免思考淹没对话）。
+    const withText = [
+      { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '内部推理不该显示' }, { type: 'text', text: '正式回复' }] } } },
+    ];
+    const rows2 = graph.extractConversation(withText, 10);
+    assert.equal(rows2.length, 1, '有正文时应只成 1 行');
+    assert.equal(rows2[0].text, '正式回复', '有 text 块时必须用 text，不能被 reasoning 顶替');
+    assert.ok(rows2[0].reasoning !== true, '有正文的行不该被标成 reasoning');
+
+    // 空 content 不能凭空造行。
+    const empty = [{ type: 'assistant/message', data: { message: { content: [] } } }];
+    assert.equal(graph.extractConversation(empty, 10).length, 0, '空 content 不该成行');
+  });
+
+  await check('hasUsage：没有 provider usage 时必须为 false（「没测量」不能画成「测到 0」）', () => {
+    // 用户 2026-10-10 报障：「卡片看不到基本信息」（0/0/0 TODO、0 out、0 cache、0% hit）。
+    // 根因（真实会话 session-93e1ac65 seq=19 实测）：被中止的回合没有产生 usage chunk
+    // ⇒ data.usage === undefined、data.stream 只有 block-start 与 reasoning-chunks
+    // ⇒ 四桶全停在 0。旧渲染把「**没有测量**」画成「**测到 0**」，
+    // 而同一屏的「输出速度」却显示 `—`（client.js 用 tps>0 判定），两处口径自相矛盾。
+    //
+    // 这条闸门钉住 hasUsage 的语义：只有**真的**收到过 usage 才为 true。
+    const noUsage = [
+      { type: 'model/selection', data: { provider: 'raccoon', model: 'sn-glm-5-3' } },
+      { type: 'request/context', data: { provider: 'raccoon', model: 'sn-glm-5-3', contextWindow: 1000000 } },
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'assistant/message', data: { turn: 1, step: 1, interrupted: true, message: { content: [{ type: 'reasoning', text: 'x' }] }, stream: [{ type: 'chunk', chunk: { type: 'block-start', index: 0, blockType: 'reasoning' } }, { type: 'reasoning-chunks', index: 0, dt: [1, 2] }] } },
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+    ];
+    const stats = graph.foldSession(noUsage);
+    const g = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', stats]]), tasks: [] });
+    assert.equal(g.nodes[0].hasUsage, false, '没有任何 usage 时必须 hasUsage=false（否则卡片会显示骗人的 0）');
+    assert.equal(g.totals.hasUsage, false, 'totals.hasUsage 必须同为 false（底栏同一口径）');
+
+    // 有 usage 时必须为 true，且数值进四桶。
+    const withUsage = [
+      { type: 'assistant/message', data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 900, cacheWriteTokens: 0 } } },
+    ];
+    const s2 = graph.foldSession(withUsage);
+    const g2 = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s2]]), tasks: [] });
+    assert.equal(g2.nodes[0].hasUsage, true, '收到过 usage 时必须 hasUsage=true');
+    assert.equal(g2.nodes[0].usage.outputTokens, 50, 'outputTokens 要进桶');
+    assert.equal(g2.nodes[0].usage.cacheReadTokens, 900, 'cacheReadTokens 要进桶');
+    assert.equal(g2.totals.hasUsage, true, 'totals.hasUsage 必须同为 true');
+
+    // 官方两层形状（{type:'chunk', chunk:{type:'usage', usage}}）也必须认。
+    const twoLayer = [
+      { type: 'assistant/message', data: { turn: 1, step: 1, stream: [{ type: 'chunk', chunk: { type: 'usage', usage: { inputTokens: 7, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0 } } }] } },
+    ];
+    const s3 = graph.foldSession(twoLayer);
+    const g3 = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s3]]), tasks: [] });
+    assert.equal(g3.nodes[0].hasUsage, true, '两层形状的 usage 也要认（否则回退成 undefined）');
+    assert.equal(g3.nodes[0].usage.outputTokens, 3, '两层形状的 outputTokens 要进桶');
+  });
+
   await check('dispatch-mode preset 必须把 tool-ask-user 设为 mode: timed（否则弹窗回答关不掉官方提问卡）', () => {
     // 用户 2026-10-10 报障：「我在弹窗里回答了问题，点发送后显示已回答，
     // 但退出工作区后官方页面仍显示等待我回答」。
@@ -1186,6 +1291,99 @@ function functionBodyOf(source, needle) {
       + '插件（以及工作区弹窗）永远无法关闭官方提问卡，用户会看到「已回答但官方仍等待」');
     assert.ok(/^\s*timeout:\s*\d+\s*$/m.test(block),
       'mode: timed 必须同时给一个默认 timeout（秒），否则官方按未配置处理');
+  });
+
+  await check('增量折叠游标：必须推进到「连续可读」的位置，不能按条数、也不能按 session.seq', () => {
+    // ── 用户 2026-10-10 报障「工作区没有实时更新」的根因之一（P1）────────────────
+    // 活体增量折叠用 `consumedSeq` 当游标，而 `session.seq`（已分配序号）与
+    // `eventAt(seq)`（已落盘日志）在写入过程中会短暂不一致 —— 空洞（undefined）。
+    // 三种推进口径的后果实测（模拟 seq 0..9、3/4 缺失、第 2 轮后补齐）：
+    //   * `consumedSeq += events.length`（**旧实现**）：游标与 seq 空间累积偏差 ⇒
+    //     空洞在**中间**时游标落后 ⇒ 同一批事件被反复折叠（token/时长/TODO 重复累加）。
+    //     实测：seq 3/4 缺失时第一轮得 8 条 → 游标 0→8 而真实已扫到 9 ⇒ 下一轮重折 seq 8。
+    //   * `consumedSeq = session.seq`：空洞被**永久跳过** ⇒ 后补落盘的事件再也读不到。
+    //     实测：漏掉 2 条 ⇒ outputTokens 少算 200（800 而非 1000）。
+    //   * `consumedSeq = safeUntil`（**现实现**）：只推进到连续读到处 ⇒ 两种场景都正确。
+    //
+    // 这条闸门用「中间有空洞 + 后补落盘」的真实场景钉住现实现的行为。
+    const mk = (seq) => ({
+      type: 'assistant/message', seq, time: 1000 + seq,
+      data: { turn: seq, step: 1, usage: { inputTokens: 0, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    });
+    const END = 10;
+    const store = new Map();
+    for (let i = 0; i < END; i += 1) { if (i === 3 || i === 4) continue; store.set(i, mk(i)) }
+
+    // 复刻现实现的口径（safeUntil）
+    const readSafe = (from) => {
+      const out = [];
+      let safeUntil = from;
+      for (let seq = from; seq < END; seq += 1) {
+        const e = store.get(seq);
+        if (e === undefined) break;
+        out.push(e);
+        safeUntil = seq + 1;
+      }
+      return { events: out, safeUntil };
+    };
+    const stats = graph.emptyStats();
+    let cursor = 0;
+    for (let round = 1; round <= 4; round += 1) {
+      const { events, safeUntil } = readSafe(cursor);
+      graph.foldEvents(stats, events);
+      if (safeUntil > cursor) cursor = safeUntil;
+      if (round === 2) for (let i = 0; i < END; i += 1) if (!store.has(i)) store.set(i, mk(i));
+    }
+    assert.equal(cursor, END, `游标最终应推进到 ${END}，实际 ${cursor}`);
+    assert.equal(stats.usage.outputTokens, END * 100,
+      `中间有空洞时不能漏读也不能重复折叠：期望 ${END * 100}，实际 ${stats.usage.outputTokens}`);
+
+    // 反例 1：按条数推进（旧实现）在有空洞且空洞在**中间**时游标落后 ⇒ 同一事件被折叠两次。
+    // ⚠️ 判据必须用「同一 seq 的事件被折了几次」，不能看 outputTokens 是否变大 ——
+    //    foldEvents 对同 turn/step 是 **last-wins 替换**语义，重复折叠不会累加（反而会抵消）。
+    //    所以这里直接数「同一 seq 被喂进 foldEvents 的次数」。
+    {
+      const s2 = new Map();
+      for (let i = 0; i < END; i += 1) { if (i === 5) continue; s2.set(i, mk(i)) } // 空洞在中间（seq 5）
+      const readByLength = (from) => {
+        const out = []
+        for (let seq = from; seq < END; seq += 1) { const e = s2.get(seq); if (e !== undefined) out.push(e) }
+        return out
+      }
+      const seenByLength = new Map()
+      let cur = 0
+      for (let round = 1; round <= 3; round += 1) {
+        const evs = readByLength(cur)
+        for (const e of evs) seenByLength.set(e.seq, (seenByLength.get(e.seq) ?? 0) + 1)
+        cur += evs.length   // 旧口径
+      }
+      const dup = [...seenByLength.entries()].filter(([, n]) => n > 1).map(([seq, n]) => `seq${seq}×${n}`)
+      assert.ok(dup.length > 0,
+        `旧口径（+= events.length）在空洞位于中间时应当把后续事件**重复读入**（这正是要修掉的 bug）；`
+        + `实际没有任何重复：${JSON.stringify([...seenByLength.entries()])}`)
+    }
+
+    // 反例 2：按 session.seq 推进会永久跳过空洞 —— 用「同一 seq 被读到的次数」判据：
+    // 空洞（seq 3/4）永远读不到 ⇒ 它们从未进入折叠。
+    {
+      const s3 = new Map();
+      for (let i = 0; i < END; i += 1) { if (i === 3 || i === 4) continue; s3.set(i, mk(i)) }
+      const readToEnd = (from) => {
+        const out = []
+        for (let seq = from; seq < END; seq += 1) { const e = s3.get(seq); if (e !== undefined) out.push(e) }
+        return out
+      }
+      const seen = new Set()
+      let cur = 0
+      for (let round = 1; round <= 3; round += 1) {
+        for (const e of readToEnd(cur)) seen.add(e.seq)
+        cur = END   // 旧口径 2
+        if (round === 1) for (let i = 0; i < END; i += 1) if (!s3.has(i)) s3.set(i, mk(i))
+      }
+      assert.ok(!seen.has(3) || !seen.has(4),
+        `按 session.seq 推进应当**永久跳过**空洞（这正是不能采用它的原因）；`
+        + `实际读到的 seq：${JSON.stringify([...seen].sort((a, b) => a - b))}`)
+    }
   });
 
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
