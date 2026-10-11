@@ -254,8 +254,35 @@
                   maxRounds: 64
 
           # ── everyday tools ──────────────────────────────────────────────────────
+          # ⚠️ 必须显式设 `mode: timed`（2026-10-10，用户报障「弹窗回答了但官方仍等待」）：
+          #
+          # 官方 `ask_user_question` 有**两条互不相通的路径**，由工具 schema 是否声明
+          # `timeout` 参数决定（dsh-user-questions/lib/index.js:190 的 timed 判定）：
+          #   * legacy（默认、无 config）：提问走 `ctx.waterfall("user-questions/request")`
+          #     （同文件 :681），答案**只能**由持有该 waterfall 的一方给出 ——
+          #     而它只存在于官方前端内存里（dsh-client-ui-user-questions/lib/client.js:1927
+          #     `ctx.remote.$on("user-questions/request", ...)`，:1795 `await waterfall.result`）。
+          #     宿主侧没有任何 API 能 resolve 它，所以**插件无法关闭官方提问卡**：
+          #     `userQuestions.answer()` 的 :554 `continued(agent).find(...)` 找不到
+          #     （:200 `if (!fold.timed || ...) return fold` —— 投影整条跳过 legacy）
+          #     ⇒ :555 `return false`。实测（.probe/verify-timed-legacy-real.cjs）：
+          #     会话 session-3cc0092d 的 request/header 里 ask_user_question 参数只有
+          #     `["questions"]` ⇒ legacy ⇒ 弹窗回答只能作为普通消息排队，而 agent
+          #     正阻塞在工具调用里，官方界面永远显示「等待回答」。
+          #   * timed（本行 config）：提问进入 `userQuestions` 投影（:199-237 记 continued）,
+          #     超时后模型可继续工作，问题**仍可回答**；此时官方卡片自己的提交路径变为
+          #     RPC（dsh-client-ui-user-questions/lib/client.js:396-405 的
+          #     `this.#state === "continued" && rpc !== void 0 → rpc.answer(answer)`）,
+          #     与插件走的是**同一条** `userQuestions.answer` ⇒ 弹窗回答能真正 settle。
+          #
+          # timeout: 600 = 每次 timed 调用的默认期限（秒）。600s 足够用户在工作区里
+          # 慢慢选；到期后提问不消失（问题仍可回答），只是模型可以继续干活。
+          # 模型仍可对单次调用传 `timeout: -1` 表示无限等（官方 README「模型得到什么」）。
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
+            config:
+              mode: timed
+              timeout: 600
 
           - id: tool-todo
             name: '@deepseek-ai/dsh-tool-todo'
