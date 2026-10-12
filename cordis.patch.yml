@@ -62,8 +62,12 @@
     # ⚠️ vendor 化（2026-10-11 第二轮，用户要求「卸载本机 dsh-ops 也要可用」）：
     #   name 指向**本包自己的 vendor 入口**（exports['./ops-file'] → vendor/ops/lib/...），
     #   不再指向 dsh-ops 实装包 —— 卸载 dsh-ops 后本行照常解析、照常挂载。
-    #   * vendor/ops/lib/ 是 dsh-ops 0.2.6 lib/ 的完整运行时拷贝（14 模块依赖闭包实测，
+    #   * vendor/ops/lib/ 是 dsh-ops 0.2.9 lib/ 的完整运行时拷贝（14 模块依赖闭包实测，
     #     除 Node 内置外零外部包；插件页 manifest 用 vendor/ops/lib/components/file/package.json）；
+    #     2026-10-12 从官方 v0.2.9 tag 同步（此前副本 = v0.2.8，逐文件 SHA256 核对一致后只换
+    #     实际变更的 config-updates.js / shells.js —— file 组件入口 import 整个 lib 闭包，
+    #     无法拆分同步）。0.2.9 三项修复：WSL 启动器误选、ops_bash 未声明参数静默忽略、
+    #     配置迁移不再 Entry.update() 重挂（后者与本包 profile 补丁装载方式直接相关）；
     #   * fastctx.exe（Rust 二进制）在 vendor/fastctx/target/release/ —— dsh-ops 的
     #     resolveBinary 搜索链第 2 环「vendored source build」用 PACKAGE_ROOT（= vendor
     #     拷贝自身的包根）计算 repoBuildFile，恰好命中该路径（实验验证：三场景全对）。
