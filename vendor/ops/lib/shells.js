@@ -82,6 +82,17 @@ export const DEFAULT_MAX_OUTPUT_BYTES = 64_000
 export const DEFAULT_MAX_SPILL_BYTES = 64 * 1024 * 1024
 
 /**
+ * Every argument `ops_bash` declares, in schema order.
+ *
+ * `execute` enforces this list while `parameters.properties` documents it, and
+ * the two are written separately, so they can drift: a name added to the schema
+ * but not here would be refused as unknown, and a name kept here after the
+ * schema drops it would silently pass through. `test/shells.test.mjs` pins the
+ * two against each other.
+ */
+export const BASH_ARGUMENTS = Object.freeze(['command', 'script_path', 'workdir', 'timeoutMs', 'graceMs'])
+
+/**
  * Model-friendly environment overrides: disable colors, pagers, and interactive
  * terminal features that would garble tool output. This is the upstream bash
  * executor's set verbatim (`packages/shell/bash-local/src/index.ts:27-32`),
@@ -414,7 +425,7 @@ export function provisionedShell({ kind, env, platform = process.platform, arch 
  * @param {string|undefined} options.pathValue - the PATH value to walk.
  * @returns {string|undefined} the first existing entry, or undefined.
  */
-function fromPath({ names, pathValue }) {
+function fromPath({ names, pathValue, reject }) {
   if (typeof pathValue !== 'string' || pathValue.trim() === '') return undefined
   for (const entry of pathValue.split(path.delimiter)) {
     // PATH entries may carry surrounding quotes from `setx`-style definitions.
@@ -422,10 +433,29 @@ function fromPath({ names, pathValue }) {
     if (directory === '' || !path.isAbsolute(directory)) continue
     for (const name of names) {
       const file = path.join(directory, name)
-      if (isSpawnableFile(file)) return file
+      if (isSpawnableFile(file) && !(reject?.(file) ?? false)) return file
     }
   }
   return undefined
+}
+
+/**
+ * Windows ships `%SystemRoot%\\System32\\bash.exe` as the WSL distribution
+ * launcher, not as a POSIX shell. Treating it as a normal PATH bash silently
+ * moves commands into a Linux distribution, so it must never be selected by
+ * the system fallback. `path.win32` is intentional: tests can exercise the
+ * Windows resolver while running on another host platform.
+ * @param {string} file - candidate executable.
+ * @param {NodeJS.ProcessEnv} env - environment containing SystemRoot.
+ * @param {string} platform - target platform.
+ * @returns {boolean} whether the candidate is the WSL launcher.
+ */
+function isWslBashLauncher(file, env, platform) {
+  if (platform !== 'win32') return false
+  const systemRoot = env.SystemRoot ?? env.SYSTEMROOT
+  if (typeof systemRoot !== 'string' || systemRoot.trim() === '') return false
+  const normalize = value => path.win32.normalize(value).replace(/[\\/]+$/, '').toLowerCase()
+  return normalize(file) === normalize(path.win32.join(systemRoot, 'System32', 'bash.exe'))
 }
 
 /**
@@ -544,7 +574,11 @@ function resolveBash({
         + (bundledDetail === undefined ? '' : ` (${bundledDetail})`),
     }
   }
-  const onPath = fromPath({ names: executableNames('bash', platform), pathValue: env.PATH ?? env.Path })
+  const onPath = fromPath({
+    names: executableNames('bash', platform),
+    pathValue: env.PATH ?? env.Path,
+    reject: file => isWslBashLauncher(file, env, platform),
+  })
   if (onPath !== undefined) {
     return { available: true, file: onPath, source: 'path', detail: 'bash found on PATH' }
   }
@@ -685,6 +719,39 @@ function assertPositiveFinite(name, value) {
 }
 
 /**
+ * Refuse arguments this tool does not declare.
+ *
+ * A first-party tool built with the harness's `defineTool` gets its arguments
+ * checked against the parameter schema before its body runs
+ * (`dsh-tools/lib/index.js`: `validate(args)` → `ToolArgsError`). This plugin
+ * registers a plain definition through `ctx.tools.register` instead, to stay
+ * free of any `@deepseek-ai/*` value import, and that path validates only
+ * `output.schema`: the model's arguments reach `execute` verbatim. Reading the
+ * known fields with `args?.name` then drops an undeclared key in silence — the
+ * call reports success while ignoring what the caller asked for.
+ *
+ * `run_in_background` is the costly case, because the host's own `bash` and
+ * `pwsh` tools really do accept it. A command that never exits (a server, a
+ * watcher) then runs in the foreground and occupies the call for the whole
+ * `timeoutMs`, which may be as much as {@link MAX_BASH_TIMEOUT_MS}.
+ * @param {unknown} args - the model arguments.
+ * @param {readonly string[]} known - the argument names the schema declares.
+ * @returns {void}
+ * @throws {Error} when `args` is not an object, or carries an undeclared key.
+ */
+function assertKnownArguments(args, known) {
+  if (args === undefined || args === null) return
+  if (typeof args !== 'object' || Array.isArray(args)) {
+    throw new Error(`invalid arguments: expected an object, got ${JSON.stringify(args)}`)
+  }
+  const unknown = Object.keys(args).filter(key => !known.includes(key))
+  if (unknown.length === 0) return
+  const names = unknown.map(key => JSON.stringify(key)).join(', ')
+  throw new Error(`invalid arguments: unknown ${unknown.length === 1 ? 'key' : 'keys'} ${names}; `
+    + `this tool accepts ${known.join(', ')}`)
+}
+
+/**
  * Compose the model-facing text for one settled run.
  *
  * The shape matches the host's own bash tool
@@ -788,7 +855,8 @@ export function bashToolDescription() {
     + 'quotes, backslashes or non-ASCII text, write the script to a file first and pass script_path '
     + 'instead of embedding it in command. Use command for short commands and pipelines. Fix failed '
     + 'bash commands here, do not switch shells or mix PowerShell syntax. Output is bounded with '
-    + 'spill paths; verify absolute targets before delete/move.'
+    + 'spill paths; verify absolute targets before delete/move. Foreground only: no run_in_background '
+    + 'and no job id, so a server or watcher occupies the call until timeoutMs; use host pwsh for background.'
 }
 
 /**
@@ -854,6 +922,7 @@ export function bashToolDefinition({ file, source, subprocess }) {
      * @returns {Promise<object>} the canonical result value.
      */
     async execute(args, exec) {
+      assertKnownArguments(args, BASH_ARGUMENTS)
       const command = args?.command
       const scriptPath = args?.script_path
       if (command !== undefined && (typeof command !== 'string' || command.trim() === '')) {

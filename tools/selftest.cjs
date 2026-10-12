@@ -1423,10 +1423,11 @@ function functionBodyOf(source, needle) {
     // 安装的 ops 卸载了也可以用；别人装了 ops 可以兼容不报错，没装 ops 也能装我的插件」。
     //
     // 落地形态（四处协同，缺一即坏）：
-    //   ① vendor/ops/lib/ —— dsh-ops 0.2.6 lib/ 的完整运行时拷贝（14 模块依赖闭包，
+    //   ① vendor/ops/lib/ —— dsh-ops 0.2.9 lib/ 的完整运行时拷贝（14 模块依赖闭包，
     //      除 Node 内置外零外部包）；vendor/ops/vendor/fastctx/target/release/fastctx.exe
     //      是工具的 Rust 执行体（dsh-ops binary.js 搜索链第 2 环 repoBuildFile 命中，
     //      PACKAGE_ROOT 在 vendor 副本里指向 vendor/ops，实测 resolveBinary+probeBinary 通过）。
+    //      （2026-10-12 从官方 v0.2.9 同步；此前副本为 v0.2.8。）
     //   ② cordis.patch.yml 第 4 行 `- id: ops-file / name: @zws/dsh-dispatch-agent-team/ops-file`
     //      —— name 指向**本包自己的 exports 子路径**（./ops-file），卸载独立 dsh-ops 后
     //      本行照常解析挂载。id 不能沿用 dsh-ops-file（会被它的 bundle 行覆盖，
@@ -1765,6 +1766,49 @@ function functionBodyOf(source, needle) {
     assert.equal(g.nodes[0].runtimeMs, 30000);
     assert.ok(g.nodes[0].tps > 0, `tps 应 > 0，实际 ${g.nodes[0].tps}`);
     assert.equal(g.nodes[0].openTurns, 1, '未闭合 turn 数要如实暴露给客户端');
+  });
+
+  await check('effectiveRuntimeMs / buildGraph：活体会话的运行时长按**墙钟**推进（用户 2026-10-12 报「运行 0 秒、不实时」）', () => {
+    // 回归两层（同一个函数的两条分支）：
+    //   ① 活体（传 now）→ 基准是**现在**：长思考 / 长工具调用期间数字也在走，
+    //      而不是只在有新事件落地时才跳一格；
+    //   ② 已死（不传 now，或 liveAt 过期）→ 基准仍是最后一条事件时间：
+    //      绝不把「会话已经停了多久」算进运行时长（否则宿主重启后的历史队员集体虚增）。
+    const now = Date.now();
+    const open = graph.emptyStats();
+    open.runtimeMs = 5000;                        // 已闭合回合累计
+    open.openTurns = new Map([[1, now - 60000]]); // 未闭合回合：60 秒前开始
+    open.lastTime = now - 10000;                  // 最后一条事件：10 秒前
+    open.liveAt = now;                            // 本轮刚读到活体 session
+    const statsOf = (s) => {
+      const g = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s]]), tasks: [] });
+      return g.nodes[0].runtimeMs;
+    };
+    const liveMs = statsOf(open);
+    assert.ok(liveMs >= 65000 && liveMs <= 66000,
+      `活体：应为 5000+(now−起点)=65000ms 量级（墙钟），实际 ${liveMs}`);
+    // 不传 now 的纯函数口径不变（旧的「最后事件时间 − 起点」）
+    assert.equal(graph.effectiveRuntimeMs(open), 55000, '不传 now：基准 = 最后事件时间（5000+50000）');
+    // liveAt 过期（队员 agent 已消失）→ 必须回落到事件时间，不得虚增
+    const expired = { ...open, liveAt: now - 10 * 60 * 1000 };
+    assert.equal(statsOf(expired), 55000, '窗口过期后必须回落到「最后事件时间 − 起点」');
+    // now 早于最后事件时不得倒退
+    assert.equal(graph.effectiveRuntimeMs(open, now - 60000), 55000, 'now 早于最后事件时取两者较大，不得倒退');
+  });
+
+  await check('工作区实时刷新：浮窗打开不得冻结卡片与浮窗指标（用户 2026-10-12 报「弹窗一开就不更新」）', () => {
+    // 症状：点了 lead 卡片开浮窗后，工作区卡片的「运行 0 秒」与浮窗指标格永远不变。
+    // 根因（实测复现，见 .probe/repro-freeze.mjs）：wsLoad 在浮窗打开时**整轮跳过**刷新
+    // （旧注释担心「重绘让抽屉引用变陈旧」，但刷新本来就就地更新、不重建节点），
+    // 而浮窗指标格又是「建一次 DOM 就不再取值」⇒ 两者叠加 = 打开浮窗后所有数字冻结。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(!/state\.drawer\.classList\.contains\('on'\)\)\s*return/.test(src),
+      'wsLoad 不得因「浮窗开着」跳过刷新（会让卡片与浮窗指标冻死在开窗那一刻）');
+    assert.ok(/function wsSyncDrawerCells\(/.test(src), '缺少 wsSyncDrawerCells（浮窗指标的就地同步器）');
+    assert.ok(/state\.drawerCells = cellValues/.test(src), 'wsOpenDrawer 必须登记浮窗指标单元格');
+    assert.ok(/wsSyncDrawerCells\(state\.drawerCells, shown\)/.test(src),
+      'wsApplyGraph 必须把每一帧数据同步进已打开的浮窗指标格');
+    assert.ok(/state\.drawerCells = undefined/.test(src), '关窗必须撤销登记（否则对已关的浮窗空跑）');
   });
 
   await check('buildGraph：承接边方向按主导信息流，不随名单顺序漂移（用户 #7）', () => {
