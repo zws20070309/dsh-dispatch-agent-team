@@ -308,12 +308,27 @@ function functionBodyOf(source, needle) {
     }
   });
 
-  await check('PLAYBOOK 含分轮面试式提问的关键要素（设计树/前沿/分轮/格式/等答复/事实归 Lead）', () => {
+  await check('PLAYBOOK 含分轮面试式提问的关键要素（设计树/前沿/卡片提问/事实归 Lead）——用户 2026-10-13', () => {
     const text = playbook.PLAYBOOK;
-    for (const marker of ['设计树', '前沿', '推荐：', '找事实是你的工作', '不要替用户拍板', '用户明确说', '共享理解']) {
+    for (const marker of ['设计树', '前沿', '找事实是你的工作', '不要替用户拍板', '用户明确说', '共享理解']) {
       assert.ok(text.includes(marker), `PLAYBOOK 缺少标记：${marker}`);
     }
-    assert.ok(/Q1/u.test(text) && /Q2/u.test(text), 'PLAYBOOK 缺少 Q1/Q2 的排版示例');
+    assert.ok(/Q1/u.test(text) && /Q2/u.test(text), 'PLAYBOOK 缺少 Q1/Q2 的编号约定');
+    // ⚠️ 这条断言是 2026-10-13 换掉的：旧文本要求「编号（Q1、Q2…）并给出推荐答案，然后
+    // **停下来等**」+ 正文排版「**Q1 — <标题>**：<正文>」/「推荐：<推荐答案>」——
+    // 那套排版**就是 bug 本身**：Lead 照做就把问题写成了正文，回合随即结束，
+    // 用户必须再发一条才能继续（实测 session-00001001：seq 19 正文提问 → seq 21 turn/end
+    // → seq 26 用户不得不自己打字「不是中断会话向我提问，是聊天界面跳弹窗跟我提问啊」
+    // → seq 27 才改用 ask_user_question 卡片）。
+    // 现在钉的是新契约：必须用卡片问，且不许只写在正文里。
+    assert.ok(text.includes('ask_user_question'),
+      'PLAYBOOK 没让 Lead 用 ask_user_question 弹卡片提问 —— 它会退回正文提问，回合结束 = 会话断');
+    assert.ok(/问题不许只写在正文里/.test(text),
+      'PLAYBOOK 缺少「问题不许只写在正文里」这条硬约束（正文提问就是断会话的那条路）');
+    assert.ok(/会话断/.test(text),
+      'PLAYBOOK 必须把「为什么」留在文本里（正文提问 = 会话断）：没有理由模型不会遵守');
+    assert.ok(!/停下来等/.test(text),
+      'PLAYBOOK 又出现了「停下来等」——旧措辞会诱导模型把问题写成正文后结束回合');
   });
 
   await check('PLAYBOOK：只提 /team，不提已删除的 /team-off，并交代用 disable_agent_team 关团队', () => {
@@ -663,7 +678,12 @@ function functionBodyOf(source, needle) {
       //      「（它对你不可用）」的原因、blocked 的判据、冻结文件的举例与「让 Lead 判断」）。
       // 教训记在这里：那次为守住 3800/1150 而删掉的是**信息**，不是冗余；压缩该合并同义表述，
       // 不该删事实。上调幅度只覆盖真实新增 + 一点余量，不开口子。
-      PLAYBOOK: 3900,        // 调度模式方法论（Lead 与所有请求的前缀）
+      // 2026-10-13 上调 3900→4000（PLAYBOOK 实测 3988）：唯一来源是第一章那条**新信息** ——
+      //   提问必须用 `ask_user_question` 弹**卡片**，不许把问题写成正文再结束回合。
+      //   旧文本更短（它写的是排版样式「Q1 — <标题>」，而那正是导致会话断的错指令），
+      //   所以这次不是往上堆，是把一条错指令换成一条对指令 + 它必须留在文本里的理由：
+      //   模型只有知道「正文提问 = 回合结束 = 用户得再发一条」才会遵守卡片。
+      PLAYBOOK: 4000,        // 调度模式方法论（Lead 与所有请求的前缀）
       TEAM_POLICY: 800,      // 团队运行期事实（开后才有）
       TEAMMATE_CARD: 1250,   // 队员卡（每个队员的固定前缀）；留 ~50 余量，避免再次为「贴边」删信息
     };
@@ -713,8 +733,11 @@ function functionBodyOf(source, needle) {
       assert.ok(card.includes(marker), `队员卡丢了这个细节：「${marker}」——它是信息，不是冗余`);
     }
     const pb = playbook.PLAYBOOK;
-    for (const marker of ['（工具面强制）', '不许当事实', '真实调用链验证', '推荐：<推荐答案>',
-      '冻结的验收文件（只读）', '工具会把该角色的使命/纪律/写权限自动拼在你正文之前']) {
+    for (const marker of ['（工具面强制）', '不许当事实', '真实调用链验证',
+      '冻结的验收文件（只读）', '工具会把该角色的使命/纪律/写权限自动拼在你正文之前',
+      // 「（推荐）」= 卡片里推荐项的标注约定（2026-10-13 取代旧的正文排版「推荐：<推荐答案>」，
+      // 那套正文排版正是断会话的错指令；信息本身没丢，只是搬进了卡片字段）。
+      '（推荐）', '答案以**工具结果**回来']) {
       assert.ok(pb.includes(marker), `PLAYBOOK 丢了这个细节：「${marker}」——它是信息，不是冗余`);
     }
   });
@@ -1354,8 +1377,14 @@ function functionBodyOf(source, needle) {
     assert.ok(/^\s*mode:\s*timed\s*$/m.test(block),
       'tool-ask-user 必须设 mode: timed —— 否则提问走 legacy waterfall，'
       + '插件（以及工作区弹窗）永远无法关闭官方提问卡，用户会看到「已回答但官方仍等待」');
-    assert.ok(/^\s*timeout:\s*\d+\s*$/m.test(block),
-      'mode: timed 必须同时给一个默认 timeout（秒），否则官方按未配置处理');
+    // 默认期限允许 -1（无限等）或正整数秒。2026-10-13 从 600 改成 -1：
+    // 有限期限到期时返回 {"pending":true} ⇒ **模型在没有答案的情况下被放行**，
+    // 用户之后的答案以另一条 user 消息在新回合送达 —— 对「没答复不能往下走」的
+    // 分轮面试就是「会话断了」。实测本机 4 个会话真出现过 pending。
+    assert.ok(/^\s*timeout:\s*(-1|\d+)\s*$/m.test(block),
+      'mode: timed 必须同时给一个默认 timeout（-1 无限等，或正整数秒），否则官方按未配置处理');
+    assert.ok(/^\s*timeout:\s*-1\s*$/m.test(block),
+      '默认 timeout 必须是 -1：有限期限到期会把模型放行（pending），会话就断了');
   });
 
   await check('增量折叠游标：必须推进到「连续可读」的位置，不能按条数、也不能按 session.seq', () => {
