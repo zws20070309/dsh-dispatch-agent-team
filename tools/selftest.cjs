@@ -1183,6 +1183,62 @@ function functionBodyOf(source, needle) {
     assert.ok(rows2[0].text.startsWith('## 标题'), '正文依然纯净');
   });
 
+  await check('extractConversation：工具行带 callId、正文行带 turn/step（弹窗流式层的去重判据）', () => {
+    // 2026-10-13 弹窗实时化的配套：覆盖层要判断「这条流式内容是不是已经进持久行了」。
+    // 判据只能是 callId 与 (turn, step) —— 名字与目标都可能重复（连续两次 read 同一文件）。
+    const rows = graph.extractConversation([
+      { type: 'assistant/message', data: { turn: 2, step: 3, message: { content: [{ type: 'text', text: '正文' }] } } },
+      { type: 'tool/call', data: { turn: 2, step: 3, callId: 'call-x', name: 'read', arguments: '{"file_path":"a/b.md"}' } },
+    ], 10);
+    const asst = rows.find((r) => r.kind === 'assistant');
+    assert.equal(asst.turn, 2, 'assistant 行没带 turn');
+    assert.equal(asst.step, 3, 'assistant 行没带 step');
+    const tool = rows.find((r) => r.kind === 'tool');
+    assert.equal(tool.callId, 'call-x', '工具行没带 callId');
+    // reasoning 兜底行同样要带（它和正文行是同一回合的两种形态）
+    const onlyR = graph.extractConversation([
+      { type: 'assistant/message', data: { turn: 5, step: 1, message: { content: [{ type: 'reasoning', text: '在想' }] } } },
+    ], 10);
+    assert.equal(onlyR[0].turn, 5, 'reasoning 行没带 turn');
+    assert.equal(onlyR[0].step, 1, 'reasoning 行没带 step');
+  });
+
+  await check('settledStepsOf：整步结算的名单准确，且不受工具行折叠影响', () => {
+    // 折叠判据必须吃**完整事件**：extractConversation 会把成串工具行折成一条计数行，
+    // 被吞掉的行其 turn/step 就不在返回结果里 —— 前端只看行会漏判、重复显示。
+    const many = [];
+    for (let i = 0; i < 12; i += 1) {
+      many.push({ type: 'tool/call', data: { turn: 1, step: 2, callId: 'c' + i, name: 'read', arguments: '{"file_path":"f' + i + '"}' } });
+    }
+    const steps = graph.settledStepsOf(many);
+    assert.ok(steps.includes('1:2'), 'tool/call 没算进结算名单：' + JSON.stringify(steps));
+    assert.equal(graph.extractConversation(many, 50).filter((r) => r.kind === 'tool').length < 12, true,
+      '前提不成立：这批工具行没被折叠，测不到「折叠导致漏判」');
+    assert.deepEqual(graph.settledStepsOf([]), [], '空事件该给空名单');
+    assert.deepEqual(graph.settledStepsOf(null), [], 'null 不该抛错');
+    // 没有 turn/step 的事件（如 user/message）不进名单
+    assert.deepEqual(graph.settledStepsOf([{ type: 'tool/call', data: { name: 'read' } }]), [], '缺 turn/step 不该进名单');
+  });
+
+  await check('toolLabelTable：给全驼峰与下划线两种键，且与 toolRowLabel 同口径', () => {
+    // 浏览器半的流式覆盖层要用它给「正在生成的工具调用」出标签；
+    // 事件里的名字是 read_image，官方表编的是 readImage —— 两种键都得在。
+    const table = graph.toolLabelTable();
+    assert.equal(typeof table.generic, 'string', '缺 generic 兜底');
+    assert.equal(table.titles.read, graph.toolRowLabel('read'), '驼峰键与 toolRowLabel 不一致');
+    assert.equal(table.titles.read_image, graph.toolRowLabel('read_image'), '下划线键与 toolRowLabel 不一致');
+    assert.equal(table.titles.grep, graph.toolRowLabel('grep'), 'grep 标签不一致');
+    // 别名工具（官方表里没有、本机确实存在）也要能查到
+    assert.equal(table.titles.web_search, graph.toolRowLabel('web_search'), '别名工具没进表');
+    assert.equal(table.titles.report_result, graph.toolRowLabel('report_result'), '团队工具没进表');
+    // 原型键不能是**自己的**键：这张表要过 JSON 边界送到浏览器，宿主这边只能保证
+    // 「只写真实工具名」。读到 constructor/toString 这类值时的兜底在浏览器那一侧
+    // （wsToolLabel 用 typeof === 'string' 过滤），由 .probe/verify-p1p2.mjs 端到端验。
+    assert.equal(Object.prototype.hasOwnProperty.call(table.titles, 'constructor'), false,
+      '原型键不该是自己的键');
+    assert.ok(Object.values(table.titles).every((v) => typeof v === 'string'), '表里混进了非字符串值');
+  });
+
   await check('extractConversation：被中止的回合只有 reasoning 块时，对话不能整片空白', () => {
     // 用户 2026-10-10 报障：「工作区里面空的，看不到回复」。
     // 根因（真实会话 session-93e1ac65 seq=19 实测）：用户 `/team` 后中止那一轮，
@@ -1203,14 +1259,23 @@ function functionBodyOf(source, needle) {
     assert.equal(rows[0].reasoning, true, 'reasoning 兜底行必须带 reasoning:true，渲染层据此标注');
     assert.ok(rows[0].text.includes('Let me think'), 'reasoning 文本要真的进去');
 
-    // 反例：**有正文**的回合绝不能用 reasoning 顶替正文（避免思考淹没对话）。
+    // 反例（2026-10-13 改口径）：**有正文**时思考也显示，但是**折叠行**，
+    // 且绝不顶替正文 —— 官方界面就是把 reasoning 做成可展开的披露行
+    // （dsh-client-ui-chat 的 ReasoningRow），实测 session-99c20ab2 每条
+    // assistant/message 都是 reasoning + text 并存。旧断言「有正文只成 1 行」
+    // 会让弹窗的流式思考在结算后凭空消失，所以换成下面这三条：
     const withText = [
-      { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '内部推理不该显示' }, { type: 'text', text: '正式回复' }] } } },
+      { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'reasoning', text: '内部推理' }, { type: 'text', text: '正式回复' }] } } },
     ];
     const rows2 = graph.extractConversation(withText, 10);
-    assert.equal(rows2.length, 1, '有正文时应只成 1 行');
-    assert.equal(rows2[0].text, '正式回复', '有 text 块时必须用 text，不能被 reasoning 顶替');
-    assert.ok(rows2[0].reasoning !== true, '有正文的行不该被标成 reasoning');
+    assert.equal(rows2.length, 2, '有正文时思考与正文各成一行，实际 ' + rows2.length + ' 行');
+    assert.equal(rows2[0].reasoning, true, '思考行在前（与官方顺序一致）');
+    assert.equal(rows2[0].collapsed, true, '有正文时思考行必须标 collapsed（渲染层据此折叠）');
+    assert.equal(rows2[1].text, '正式回复', '有 text 块时必须用 text，不能被 reasoning 顶替');
+    assert.equal(rows2[1].reasoning, undefined, '正文行不许带 reasoning 标记');
+    // 没有正文（被中止）时思考行仍然在，但**不折叠** —— 那时它是唯一内容
+    assert.equal(graph.extractConversation(onlyReasoning, 10)[0].collapsed, false,
+      'reasoning-only 的行不该折叠（折叠了就没有任何可见内容了）');
 
     // 空 content 不能凭空造行。
     const empty = [{ type: 'assistant/message', data: { message: { content: [] } } }];
@@ -1809,6 +1874,94 @@ function functionBodyOf(source, needle) {
     assert.ok(/wsSyncDrawerCells\(state\.drawerCells, shown\)/.test(src),
       'wsApplyGraph 必须把每一帧数据同步进已打开的浮窗指标格');
     assert.ok(/state\.drawerCells = undefined/.test(src), '关窗必须撤销登记（否则对已关的浮窗空跑）');
+  });
+
+  await check('弹窗回答必须走官方提问卡（等价，不是消息投递）——用户 2026-10-13', () => {
+    // 症状（截图 131622 / 130722）：弹窗里回答 Lead 的提问，答案变成一条
+    // `【回答提问】…` 的**普通消息**插进对话，官方提问卡还挂着等。
+    // 实测 session-99c20ab2 seq 21/22：两条这样的插话，因为用户又点了一次提交。
+    // 根因：宿主平面只有两条通道 —— userQuestions.answer（只认 continued 态，
+    // timed 未超时的提问是 open 态 → 恒 false）与「拼一条消息发出去」。
+    // 修法：弹窗在前端拿官方那张 PendingQuestion 卡，调它**自己的** answer()
+    // （dsh-client-ui-user-questions/lib/client.js:396-406）—— 与在聊天界面点提交
+    // 是同一个方法、同一个对象，这才是等价。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/function bridgeQuestionCard\(/.test(src), '缺少 bridgeQuestionCard（从 uiSession 快照取官方提问卡）');
+    assert.ok(/card\.callId === callId/.test(src),
+      '取卡必须按 callId 精确匹配：否则会替用户答掉另一个问题');
+    // 提交路径上，官方卡必须排在 team-answer 之前（先卡、拿不到卡才兜底）
+    const submitAt = src.indexOf('submit.addEventListener');
+    const cardAt = src.indexOf('bridgeQuestionCard(node.id, callId)', submitAt);
+    const hostAt = src.indexOf("apiCall('team-answer'", submitAt);
+    assert.ok(cardAt > 0 && hostAt > cardAt,
+      '提交回答必须先试官方卡、再退宿主通道（顺序错了就还是消息投递）');
+    assert.ok(/await official\.answer\(\{ answers \}\)/.test(src),
+      '必须把整批答案交给官方卡的 answer()（官方 composer 同款批次形状）');
+    // 官方卡失败时不得静默降级成消息投递（那正是用户反对的「以为回答了其实没回答」）
+    assert.ok(/wsQCardFailed/.test(src), '官方卡失败要如实报错，不能偷偷改走投递');
+    // 本地记一笔已答：宿主日志要等整步结算才有答案，期间不能把刚答完的卡画回可点
+    assert.ok(/const cardAnswered = new Map\(\)/.test(src), '缺少 cardAnswered（本地已答记录）');
+    assert.ok(/cardAnswered\.has\(q\.callId\)/.test(src),
+      '提问盒的签名/未答计数必须认本地已答记录（否则刚答完的卡会退回可点）');
+  });
+
+  await check('弹窗实时：必须订阅官方 eventSource 并成对释放引用——用户 2026-10-13', () => {
+    // 症状：首 token 前进弹窗只看得到自己发的消息，思考要等 Lead 提问时才一次性涌出。
+    // 根因：弹窗只读**持久日志**，而 assistant/message 与 tool/call 都是整步结算才落盘
+    // （实测 session-99c20ab2 seq 19/20 同一毫秒）⇒ 结算前那个数据源里根本没有思考。
+    // 修法：retain 目标会话，订阅官方对话自己在用的 eventSource —— 它带 transient 的
+    // assistant/live-chunk（dsh-api-session-controller/lib/client.js:428-432 无条件
+    // 带 assistantStream:true；:2128-2131 每个 token append 一行）。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/function wsFoldLive\(/.test(src), '缺少 wsFoldLive（transient 流 → 对话行）');
+    assert.ok(/bridgeRetain\(node\.id\)/.test(src), '弹窗必须 retain 目标会话吃官方对象层');
+    assert.ok(/live\.eventSource\.subscribe\(onFeed\)/.test(src), '必须订阅官方那份窗口');
+    // retain 是引用计数：开一次放一次，漏放就永久多占一格
+    assert.ok((src.match(/state\.drawerLive/g) || []).length >= 4,
+      'drawerLive 句柄要在开/关两处都处理（订阅、释放、防抖计时器）');
+    assert.ok(/live\.release\(\)/.test(src), '关窗必须 release retain 引用');
+    // 绝不能复用 mainView：那会把用户正在看的聊天页切走
+    assert.ok(!/source:\s*['"]mainView['"]/.test(src),
+      '不得用 mainView 作 retain 来源（会抢走用户的主视图）');
+    assert.ok(/BRIDGE_RETAIN_SOURCE/.test(src), 'retain 来源必须是自定义标签');
+    // 订阅回调里不许直接打宿主接口（每个 token 都会同步回调）
+    const feedAt = src.indexOf('const onFeed = () =>');
+    const feedBody = src.slice(feedAt, src.indexOf('let unsubscribe', feedAt));
+    assert.ok(!/apiCall\(/.test(feedBody),
+      'eventSource 回调里不得直接发请求（每个 token 都回调，会打爆宿主）');
+    assert.ok(/setTimeout\(\(\) => \{/.test(feedBody), '结算后的补拉必须走防抖');
+    // 去重判据：工具按 callId、正文按 (turn,step)，两者缺一就会重复显示
+    assert.ok(/paintedCalls\.has\(row\.callId\)/.test(src), '工具行去重必须按 callId');
+    assert.ok(/settledSteps\.has\(String\(row\.turn\)/.test(src), '正文去重必须按 (turn,step)');
+    // 拿不到桥必须还能用（退回轮询持久日志），不能空白
+    assert.ok(/state\.drawerLive !== undefined && state\.drawerLive\.hasFeed === true/.test(src),
+      '轮询档位要认覆盖层是否存在：没桥时仍按快档盯日志');
+  });
+
+  await check('lib/client.js 没有未闭合的 JSDoc 块（node --check 抓不到这类吞代码的错）', () => {
+    // 真实事故（2026-10-13 本次开发）：写注释时开了 `/**` 却用 `//` 续行、
+    // 也没有 `*/` 收尾 ⇒ 从那一行起整段被当成注释，**紧跟其后的 const 声明被吃掉**。
+    // 语法完全合法（node --check 与 45 个冒烟用例全绿），只有真浏览器运行时才炸：
+    //   ReferenceError: BRIDGE_RETAIN_SOURCE is not defined
+    // 本仓库的 client.js 是手写 bundle、没有构建期类型检查，所以这条只能靠源码扫描钉住。
+    const files = ['client.js', 'graph.js', 'runtime.js', 'tools.js', 'roster.js', 'playbook.js', 'index.js', 'preset.js'];
+    const offenders = [];
+    for (const file of files) {
+      const lines = readFileSync(path.join(LIB, file), 'utf8').split('\n');
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        // 只认「行首是 /**、本行没有 */」的块开头
+        if (!/^\s*\/\*\*/.test(line) || line.includes('*/')) continue;
+        let closed = false;
+        for (let k = i + 1; k < lines.length; k += 1) {
+          if (lines[k].includes('*/')) { closed = true; break }
+          // 续行必须是 * 开头；出现 // 或代码就说明这个块从来没打算闭合
+          if (!/^\s*\*/.test(lines[k])) break;
+        }
+        if (!closed) offenders.push(file + ':' + (i + 1) + '  ' + line.trim().slice(0, 70));
+      }
+    }
+    assert.deepEqual(offenders, [], '未闭合的 JSDoc 会吃掉后面的代码：\n      ' + offenders.join('\n      '));
   });
 
   await check('buildGraph：承接边方向按主导信息流，不随名单顺序漂移（用户 #7）', () => {
