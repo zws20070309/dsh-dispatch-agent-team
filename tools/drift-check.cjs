@@ -1622,6 +1622,47 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+  check('官方 submitDrafts 仍是「没填自定义就不出现 custom 键」的形状（答案批次唯一真值）', () => {
+    const uq = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-user-questions/lib/client.js') || '';
+    if (uq === '') return '读不到 dsh-client-ui-user-questions/lib/client.js';
+    // 弹窗的答案批次是**照抄**官方 submitDrafts 的（lib/client.js 提交处理器）。
+    // 官方哪天改成写 undefined，我们照抄的那份就得跟着改；更常出事的是反过来 ——
+    // 官方仍是条件展开，而我们漂回了 `custom: undefined`（那就是本次报障）。
+    if (!/\.\.\.custom === "" \? \{\} : \{ custom \}/.test(uq)) {
+      return '官方 submitDrafts 的 custom 键形状变了（原：条件展开）—— 必须重核弹窗答案批次：'
+        + '载荷里出现嵌套 undefined 会被网关拒，ask_user_question 当场以 isError 结算'
+        + '（实测 session-a0705a45 seq 22）';
+    }
+    if (!/const answer = \{ answers: questions\.map/.test(uq)) {
+      return '官方批次外层形状变了（原：{ answers: questions.map(...) }）';
+    }
+    return true;
+  });
+
+  check('网关仍校验远程事件返回值的 lossless-JSON（弹窗载荷为何不许含 undefined）', () => {
+    const gw = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-gateway/lib/client.js') || '';
+    if (gw === '') return '读不到 dsh-api-gateway/lib/client.js';
+    // 这条钉的是「答案批次必须用条件展开」的**根因**：answer() → waterfall.resolve(answer)，
+    // 这个 answer 作为远程事件的返回值回传宿主并被下面这行校验；嵌套 undefined 判 false
+    // ⇒ 抛错 ⇒ 工具调用以 isError 结算（提问被打死）。
+    if (!/is not lossless JSON data/.test(gw)) {
+      return '网关不再校验远程事件返回值 —— 弹窗答案批次的 undefined 约束可能已放宽，'
+        + 'lib/client.js 的注释与 tools/selftest.cjs 的对应闸门需要重核';
+    }
+    if (!/function visitJsonValue/.test(gw)) return 'visitJsonValue 不见了（校验实现改名/重构）';
+    // 它仍然把非 object（含 undefined）判 false —— 这就是嵌套 undefined 致命的依据。
+    if (!/if \(typeof value !== "object"\) return false;/.test(gw)) {
+      return 'visitJsonValue 对非 object（含 undefined）的处理变了 —— 重核弹窗批次形状约束';
+    }
+    // 并且 answer() 依然「永远 resolve」：所以弹窗必须自己验结算（bridgeQuestionOutcome）。
+    const uq = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-user-questions/lib/client.js') || '';
+    if (!/waterfall\.resolve\(answer\)/.test(uq)) {
+      return '官方 answer() 不再只是 waterfall.resolve(answer) —— 若它现在会回报失败，'
+        + '弹窗的 bridgeQuestionOutcome 验结算可以简化，但语义要重新核对';
+    }
+    return true;
+  });
+
   // ── 输出 ───────────────────────────────────────────────────────────────────
   let failed = 0;
   let skipped = 0;

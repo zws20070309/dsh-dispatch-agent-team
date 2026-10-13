@@ -1905,6 +1905,57 @@ function functionBodyOf(source, needle) {
       '提问盒的签名/未答计数必须认本地已答记录（否则刚答完的卡会退回可点）');
   });
 
+  await check('答案批次不得含 undefined —— 含就把提问当场打死（2026-10-13 实测）', () => {
+    // 这条闸门是上一次「等价」修法**自己**的 bug，也是最贵的一条：
+    // 浏览器探针 23 项全绿，真机却坏了。症状（截图 192100/192148）：
+    // 弹窗里点提交，官方卡**没关**，答案变成 `【回答提问】n_count：8` 的插话。
+    //
+    // 根因链（全部实测，session-a0705a45）：
+    //   1. 旧写法 `custom: 空 ? undefined : 值` 造出一个**自有键 + undefined 值**的对象；
+    //   2. 官方 answer() 只是 waterfall.resolve，载荷作为**远程事件返回值**回传宿主；
+    //   3. dsh-api-gateway/lib/client.js:880 用 isRemoteJsonValue 校验，
+    //      visitJsonValue(:93-96) 对**嵌套 undefined** 直接判 false；
+    //   4. 于是抛 "Remote event listener result is not lossless JSON data"
+    //      ⇒ seq 22 的 tool/result isError:true ⇒ **提问当场死掉**；
+    //   5. 而 answer() 永远 resolve ⇒ 弹窗谎报「已通过官方提问卡回答」。
+    // 官方自己的 submitDrafts（dsh-client-ui-user-questions/lib/client.js:936-948）
+    // 用的是条件展开：没填自定义就**整个键都不出现**。照它写。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const submitAt = src.indexOf('submit.addEventListener');
+    assert.ok(submitAt > 0, '找不到提交处理器');
+    const buildAt = src.indexOf('const answers = items.map', submitAt);
+    assert.ok(buildAt > 0, '找不到答案批次的构造点');
+    const build = src.slice(buildAt, src.indexOf('void (async () =>', buildAt));
+    assert.ok(!/custom:\s*[^\n]*undefined/.test(build),
+      '答案批次里出现了 `custom: …undefined`：嵌套 undefined 会被网关拒，'+
+      'ask_user_question 当场以 isError 结算（提问被打死）。必须用条件展开 '+
+      '`...(custom === \'\' ? {} : { custom })`，没填时整个键都不出现');
+    assert.ok(/\.\.\.\(custom === '' \? \{\} : \{ custom \}\)/.test(build),
+      '答案批次必须用官方同款条件展开构造 custom 键');
+    // 光有载荷正确还不够：answer() 会 resolve，必须**验结算**才能报「已回答」。
+    assert.ok(/function bridgeQuestionOutcome\(/.test(src),
+      '缺少 bridgeQuestionOutcome：answer() 永远 resolve，不验结算就是谎报已回答');
+    assert.ok(/bridgeQuestionOutcome\(live, callId\)/.test(src),
+      '提交后必须查这次工具调用的结算结果（answered/dead/unknown）');
+    assert.ok(/outcome === 'dead'/.test(src), "必须区分「提问已死」这条路径");
+    const deadAt = src.indexOf("outcome === 'dead'");
+    // 只看 dead 分支**自己**那一段（到它的 return 为止）：再往后就是成功路径，
+    // 那里当然有 cardAnswered.set，别把窗口开大了误伤。
+    const deadBlock = src.slice(deadAt, src.indexOf('return', deadAt) + 6);
+    assert.ok(!/cardAnswered\.set/.test(deadBlock),
+      '提问已死时**不许**写 cardAnswered：那等于把没被接受的答案记成已回答');
+    assert.ok(/wsQCardDead/.test(src), '提问已死要有如实的界面措辞');
+    // note 必须留在 DOM 里：markCardAnswered 会 textContent='' 重建整张卡，
+    // 之前把说明写进已脱离 DOM 的节点，用户从来没看见过那句实话。
+    const markDef = src.slice(src.indexOf('const markCardAnswered'), src.indexOf('const loadQuestions'));
+    assert.ok(/if \(keep !== undefined && keep !== null\) cardEl\.appendChild\(keep\)/.test(markDef),
+      'markCardAnswered 重建卡后必须把状态提示节点接回 DOM（否则那句实话没人看得见）');
+    // 调用里嵌套了 items.map(...)，所以按行匹配，别用 [^)]* 那种跨不过 ')' 的正则。
+    const noteKept = src.split('\n').filter((line) => /markCardAnswered\(card,/.test(line) && /,\s*note\)/.test(line)).length;
+    assert.ok(noteKept >= 2,
+      '两条回答通道收卡时都要把 note 传进去（实测抓到 ' + noteKept + ' 处，需要 ≥2）');
+  });
+
   await check('弹窗实时：必须订阅官方 eventSource 并成对释放引用——用户 2026-10-13', () => {
     // 症状：首 token 前进弹窗只看得到自己发的消息，思考要等 Lead 提问时才一次性涌出。
     // 根因：弹窗只读**持久日志**，而 assistant/message 与 tool/call 都是整步结算才落盘
