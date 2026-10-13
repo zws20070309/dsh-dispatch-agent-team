@@ -1930,6 +1930,17 @@ function functionBodyOf(source, needle) {
     assert.ok(!/apiCall\(/.test(feedBody),
       'eventSource 回调里不得直接发请求（每个 token 都回调，会打爆宿主）');
     assert.ok(/setTimeout\(\(\) => \{/.test(feedBody), '结算后的补拉必须走防抖');
+    // 兜底轮询链**只能有一个启动点**：scheduleDrawer 每次把 state.drawerTimer 覆盖成
+    // 最新那个 handle，于是关窗时 clearTimeout 只能停掉一条 —— 多出来的那条会一直
+    // 按秒打宿主接口（本次开发就引入过这个 bug：同步 kickoff 与 .then 里的 kickoff 并存）。
+    // 合法形状只有 `.then(成功回调, 失败回调)` 这两处引用（互斥，只会执行一个）；
+    // 任何「单独成一行」的 kickoffDrawer() 调用都是第二个启动点。
+    const standaloneKickoff = src.split('\n').some((line) => /^\s*kickoffDrawer\(\)\s*$/.test(line));
+    assert.equal(standaloneKickoff, false,
+      'kickoffDrawer 不许单独成行调用 —— 那会与 .then 里的启动点并存，形成两条独立轮询链'
+      + '（关窗只能停掉一条，另一条继续按秒打宿主接口）');
+    assert.equal((src.match(/\bkickoffDrawer\(\)/g) || []).length, 2,
+      'kickoffDrawer 应当只出现在 .then 的成功/失败两个回调里（各一次）');
     // 去重判据：工具按 callId、正文按 (turn,step)，两者缺一就会重复显示
     assert.ok(/paintedCalls\.has\(row\.callId\)/.test(src), '工具行去重必须按 callId');
     assert.ok(/settledSteps\.has\(String\(row\.turn\)/.test(src), '正文去重必须按 (turn,step)');
