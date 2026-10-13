@@ -1523,6 +1523,105 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+  // ── 工作区弹窗与官方界面等价所依赖的官方实现（2026-10-13 新增）──────────────
+  // 弹窗的「实时」与「等价」不是走公开 API 契约，而是**复用官方前端自己在用的对象**
+  // （同一份 eventSource、同一张 PendingQuestion 卡）。官方一改形状，我们的失败方式
+  // 是静默的（画不出流式内容 / 取不到卡 → 悄悄退回消息投递），所以每条都要钉住。
+  check('uiSession.sessionStatus 快照仍带 pendingInteraction（弹窗取官方提问卡的入口）', () => {
+    const uiSession = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-session/lib/client.js') || '';
+    if (uiSession === '') return '读不到 dsh-client-ui-session/lib/client.js';
+    // 弹窗靠 sessionStatus.getSnapshot().get(sessionId).pendingInteraction 拿那张卡
+    // （lib/client.js 的 bridgeQuestionCard）。官方把它改名或挪出快照 ⇒ 取不到卡
+    // ⇒ 弹窗回答**静默退回消息投递**，正是用户 2026-10-13 报的那个症状。
+    if (!/sessionStatus = \{/.test(uiSession)) return 'UiSession 上的 sessionStatus 字段形状变了';
+    if (!/pendingInteraction: this\.pendingSnapshot\.get\(id\)/.test(uiSession)) {
+      return 'sessionStatus 快照里不再挂 pendingInteraction —— 弹窗取不到官方提问卡，'
+        + '回答会退回消息投递（等价性丢失）。需要改 lib/client.js 的 bridgeQuestionCard 的取法';
+    }
+    if (!/registerPendingInteraction\(precedence\)/.test(uiSession)) {
+      return 'registerPendingInteraction 的签名形状变了（提问卡域的注册入口）';
+    }
+    return true;
+  });
+
+  check('官方 PendingQuestion 仍有 answer() 与 callId（弹窗按 callId 精确回答）', () => {
+    const uq = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-user-questions/lib/client.js') || '';
+    if (uq === '') return '读不到 dsh-client-ui-user-questions/lib/client.js';
+    // 弹窗提交回答调的就是这个 answer()（官方 composer 用的同一个方法）：
+    // 未超时走前端 waterfall.resolve，已超时走 RPC —— 这两条都在它内部。
+    if (!/answer\(answer\) \{/.test(uq)) {
+      return 'PendingQuestion.answer() 的形状变了 —— 弹窗没有等价通道可走，'
+        + '回答会退回消息投递（官方卡不关）';
+    }
+    if (!/this\.callId = callId/.test(uq)) {
+      return '卡上不再有 callId 字段 —— 弹窗无法按调用精确匹配，'
+        + '可能替用户答掉另一个问题（bridgeQuestionCard 的判据失效）';
+    }
+    if (!/keyOf\(sessionId, callId\)/.test(uq)) return '卡的键构造方式变了（keyOf），取卡判据要重核';
+    // 通道内部的两条路（waterfall / continued+rpc）必须还在，否则「等价」的含义变了。
+    if (!/#state === "continued" && rpc !== void 0/.test(uq)) {
+      return 'answer() 里 continued→RPC 那条分支形状变了，弹窗回答的语义需要重新核对';
+    }
+    return true;
+  });
+
+  check('sessions.retain 仍给 binding.eventSource，且 assistantStream 无条件开（弹窗实时的来源）', () => {
+    const sc = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js') || '';
+    if (sc === '') return '读不到 dsh-api-session-controller/lib/client.js';
+    if (!/retain\(target, options\)/.test(sc)) return 'ClientSessions.retain 的签名形状变了';
+    // binding 里必须还带 eventSource（弹窗订阅的就是它）。
+    if (!/eventSource: session\.eventSource/.test(sc)) {
+      return 'binding 里没有 eventSource 了 —— 弹窗拿不到官方那份事件窗口，'
+        + '思考与工具调用会退回「整步结算才出现」（用户 2026-10-13 报的症状）';
+    }
+    // 关键前提：follow 无条件带 assistantStream: true。官方若改成「按需 opt-in」，
+    // 我们 retain 的会话就拿不到 transient 行，弹窗会静默变成不实时。
+    if (!/assistantStream: true/.test(sc)) {
+      return 'follow() 不再无条件带 assistantStream: true —— transient 流可能缺席，'
+        + '弹窗的流式覆盖层会静默失效（需要显式 opt-in 或换数据源）';
+    }
+    if (!/"assistant\/live-chunk"/.test(sc)) {
+      return 'transient 行的事件类型改名了（原 "assistant/live-chunk"）—— lib/client.js 的 wsFoldLive 要跟着改'
+    }
+    return true;
+  });
+
+  check('wsFoldLive 的分块规则仍与官方 BlockAssembler 一致（chunk 类型与 name 赋值语义）', () => {
+    const assembler = asar.read('dsh/node_modules/@deepseek-ai/dsh-llm/lib/types/assembler.js') || '';
+    if (assembler === '') return '读不到 dsh-llm/lib/types/assembler.js';
+    for (const kind of ["case 'block-start'", "case 'text-delta'", "case 'reasoning-delta'", "case 'tool-call-delta'", "case 'block-end'"]) {
+      if (!assembler.includes(kind)) return `官方 BlockAssembler 的分支少了 ${kind} —— 覆盖层分块要跟着改`;
+    }
+    // 名字是**赋值**、参数是**累加**：本插件的 wsFoldLive 必须同语义，
+    // 否则 provider 重复带名字时会拼出 "readread" 这种标签。
+    if (!/partial\.toolCallName = chunk\.name/.test(assembler)) {
+      return '官方 toolCallName 不再是赋值语义 —— 核对 lib/client.js 的 wsFoldLive 是否仍一致'
+    }
+    if (!/argumentsDelta/.test(assembler)) return 'argumentsDelta 字段不见了（覆盖层的参数摘要靠它）';
+    const mine = readFileOr(path.join(PLUGIN_DIR, 'lib', 'client.js'));
+    if (mine === '') return '读不到 lib/client.js';
+    if (!/block\.name = chunk\.name/.test(mine)) {
+      return '本插件的 tool-call 名字不再是赋值 —— 与官方不一致，会拼出重复标签';
+    }
+    return true;
+  });
+
+  check('官方 userQuestions.answer 仍只认 continued 态（弹窗为何必须走前端卡）', () => {
+    const host = asar.read('dsh/node_modules/@deepseek-ai/dsh-user-questions/lib/index.js') || '';
+    if (host === '') return '读不到 dsh-user-questions/lib/index.js';
+    // 这条钉的是**根因**：宿主 answer() 只从 continued(agent) 里找问题，
+    // 而 timed 未超时的提问是 open 态 ⇒ 恒 false。这正是弹窗过去只能退成消息投递的原因，
+    // 也是「必须在前端拿那张卡」这条设计的依据。官方若哪天支持 open 态，
+    // 通道⓪ 仍然正确，但 lib/runtime.js 上面那段解释要重写。
+    if (!/continued\(agent\) \{/.test(host)) return 'UserQuestionService.continued() 形状变了';
+    if (!/answer\(agent, callId, answer\) \{/.test(host)) return '宿主 answer() 签名形状变了';
+    if (!/this\.continued\(agent\)\.find/.test(host)) {
+      return '宿主 answer() 不再只从 continued(agent) 里找问题 —— 本插件「弹窗必须走前端卡」的'
+        + '根因解释已过时，需要更新 lib/runtime.js 的 teamAnswer 注释与通道顺序';
+    }
+    return true;
+  });
+
   // ── 输出 ───────────────────────────────────────────────────────────────────
   let failed = 0;
   let skipped = 0;
