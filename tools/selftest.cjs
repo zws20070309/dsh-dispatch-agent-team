@@ -2083,6 +2083,51 @@ function functionBodyOf(source, needle) {
     assert.equal(lone.ok, false, 'members 只有 lead 一个时不该判成团队（实测 213 份缓存里只有 9 份 members 非空）');
   });
 
+  await check('statsForSession：持久快照冻住的 openTurns 视为可疑并冷却重读自愈（2026-10-12 真机幻影灰点根因）', async () => {
+    // 真机取证（session-0000100e，宿主 21:12 启动后未重启）：队员 agent 被回收的瞬间，
+    // 最后一行 turn/end 还没落盘（researcher 的 turn 2 在 22:42:18 闭合，快照只折到
+    // 22:42:11）→ 持久缓存 openTurns=1 永久冻结，工作区把它画成灰色「空闲」。
+    // 修法：openTurns>0 的持久缓存 = 可疑，冷却（FAILED_RETRY_MS）后重读；
+    // 重读到 openTurns=0 即自愈并停止重读；真死在半路的成员重读依旧 >0（节流兜底）。
+    const graph = await load('graph.js');
+    graph.resetStatsCacheForTest();
+    const t0 = 1_000_000;
+    const partial = [
+      { type: 'turn/start', seq: 0, time: t0, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 1, time: t0 + 3000, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 } } },
+      { type: 'step/end', seq: 2, time: t0 + 3500, data: { turn: 1, step: 1 } },
+    ];
+    const closed = [...partial, { type: 'turn/end', seq: 3, time: t0 + 4000, data: { turn: 1, reason: { kind: 'completed' } } }];
+    let events = partial;
+    let reads = 0;
+    const persistence = {
+      open: async () => ({
+        inheritedEventCount: 0,
+        read: async () => { reads += 1; return { events }; },
+        close: async () => {},
+      }),
+    };
+    const notes = [];
+    // ① 首折：agent 刚消失、日志还没写完 → openTurns=1（当时的「真相」）
+    const s1 = await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 4000);
+    assert.equal(s1.openTurns.size, 1, 'agent 消瞬间的快照确实带着未闭合 turn');
+    assert.equal(reads, 1);
+    // ② 冷却期内不重读（防每 1.2s 轮询整读大日志）
+    const s2 = await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 5000);
+    assert.equal(reads, 1, '冷却期内不得重读');
+    assert.equal(s2.openTurns.size, 1);
+    // ③ 日志补全（turn/end 落盘）+ 冷却过期 → 重读自愈
+    events = closed;
+    const s3 = await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 20000);
+    assert.equal(reads, 2, '冷却过期后应重读一次');
+    assert.equal(s3.openTurns.size, 0, '重读后 turn 已闭合（幻影消除）');
+    assert.equal(s3.runtimeMs, 4000, '运行时长按闭合 turn 结算');
+    // ④ 自愈后不再是可疑缓存：不再重读
+    await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 21000);
+    assert.equal(reads, 2, '自愈后不得继续重读');
+    graph.resetStatsCacheForTest();
+  });
+
   console.log('');
   console.log('lib/tools.js（report_result 的形状校验）');
 
