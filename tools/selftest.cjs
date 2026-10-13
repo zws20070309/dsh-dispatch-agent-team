@@ -1936,6 +1936,16 @@ function functionBodyOf(source, needle) {
     // 拿不到桥必须还能用（退回轮询持久日志），不能空白
     assert.ok(/state\.drawerLive !== undefined && state\.drawerLive\.hasFeed === true/.test(src),
       '轮询档位要认覆盖层是否存在：没桥时仍按快档盯日志');
+    // 宿主半要**重启 DSH** 才生效，浏览器半只要刷新页面 —— 两者可能不同版本。
+    // 旧宿主回的是旧形状（没有 settledSteps、工具行没有 callId），去重判据会全部失效，
+    // 已经结算的流式内容会与持久行同时画两遍。所以必须有协议闸门，缺位时退回只轮询。
+    assert.ok(/let hostLiveCapable = false/.test(src), '缺少宿主协议能力标志');
+    assert.ok(/if \(Array\.isArray\(result\.settledSteps\)\) hostLiveCapable = true/.test(src),
+      '能力判定必须落在 team-conversation 的回执上（带 settledSteps 才算新宿主）');
+    assert.ok(/if \(!hostLiveCapable \|\| liveRows\.length === 0\) return base/.test(src),
+      '旧宿主时必须**不画**覆盖层（否则同一段思考显示两遍）');
+    assert.ok(/hasFeed === true && hostLiveCapable/.test(src),
+      '轮询降档也要认能力闸门：旧宿主下覆盖层被丢掉，实时性还得靠轮询');
   });
 
   await check('lib/client.js 没有未闭合的 JSDoc 块（node --check 抓不到这类吞代码的错）', () => {
