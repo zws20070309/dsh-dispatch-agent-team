@@ -67,6 +67,24 @@ node tools/install.cjs
 如果源码目录与桌面端实际加载的那份是两个目录，改完要同步一次：
 `node tools/sync-to-dsh.cjs`（`--dry-run` 只看差异）。
 
+### 分支约定（用户 2026-10-14 定案）
+
+**日常改动一律在 `dev`，提交后推 `origin/dev`；攒一批再合并进 `main`**（合并需用户批准，
+历史上是 10-09、10-11、10-14 三次）。`main` 是仓库默认分支，也是「已发布」的那一份。
+
+为什么必须定期合：GitHub 贡献图**只统计默认分支可达的提交**。实测 10-13 那 17 个提交
+只推了 dev 时，图上 10-13 = 0；合并进 main 后同一格变成 17。所以「改动都在远端、图上却是 0」
+不是丢提交，是分支问题 —— 先 `git ls-remote origin dev` 确认在不在，再看 main 可不可达。
+
+合并的做法（照 10-14 那次）：
+
+1. `git merge-tree --write-tree origin/main origin/dev` 先干跑，确认零冲突；
+2. **用临时 worktree 操作**（`git worktree add <tmp> --detach origin/main`），不要在正在运行的
+   插件目录里 checkout —— 那个目录是桌面端实际加载的 junction，切分支会当场改变插件代码；
+3. `git merge --no-ff origin/dev`（保留合并提交，与历史两次一致）；
+4. 核对 `git diff --stat HEAD origin/dev` 为空，再 `git push origin HEAD:main`；
+5. `git worktree remove <tmp>`，确认插件目录仍在 `dev` 且工作树干净。
+
 ## 使用
 
 ### 开启与关闭团队
