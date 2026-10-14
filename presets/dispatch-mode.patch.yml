@@ -275,14 +275,22 @@
           #     `this.#state === "continued" && rpc !== void 0 → rpc.answer(answer)`）,
           #     与插件走的是**同一条** `userQuestions.answer` ⇒ 弹窗回答能真正 settle。
           #
-          # timeout: 600 = 每次 timed 调用的默认期限（秒）。600s 足够用户在工作区里
-          # 慢慢选；到期后提问不消失（问题仍可回答），只是模型可以继续干活。
-          # 模型仍可对单次调用传 `timeout: -1` 表示无限等（官方 README「模型得到什么」）。
+          # timeout: -1 = 每次 timed 调用的**默认**期限（无限等）。为什么不是 600（2026-10-13）：
+          # 有限期限到期时工具返回的是 `{"pending":true,...}` —— **模型在没有答案的情况下被放行**，
+          # 用户随后给的答案会以「另一条 user 消息」在**新回合**送达。对调度模式这就是「会话断了」：
+          # 分轮面试的整条纪律是「没答复不能往下走、不要替用户拍板」，而官方 pendingNotice 自己
+          # 写着 "Do not treat this as permission"。实测本机 4 个会话真出现过 pending（如
+          # session-3cc0092d seq 2671）。-1 让卡片一直挂着等，答案以**工具结果**回到同一个回合 ——
+          # 这正是官方 README 的用法：「如果没有回答就无法安全继续，请使用 -1」。
+          # 已在本机验证：timed 模式下显式传 -1 的两次调用（session-00ca844f、session-d67b00d3）
+          # 都正常返回了答案批次。模型仍可对单次调用传正数期限，-1 只是缺省。
+          # 注意：mode 仍是 timed —— schema 因此带 timeout 参数，提问进 userQuestions 投影，
+          # 官方卡与插件弹窗都拿得到（见上面 mode: timed 那段）。
           - id: tool-ask-user
             name: '@deepseek-ai/dsh-tool-ask-user'
             config:
               mode: timed
-              timeout: 600
+              timeout: -1
 
           - id: tool-todo
             name: '@deepseek-ai/dsh-tool-todo'
