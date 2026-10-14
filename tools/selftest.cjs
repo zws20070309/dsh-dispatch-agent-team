@@ -308,12 +308,27 @@ function functionBodyOf(source, needle) {
     }
   });
 
-  await check('PLAYBOOK 含分轮面试式提问的关键要素（设计树/前沿/分轮/格式/等答复/事实归 Lead）', () => {
+  await check('PLAYBOOK 含分轮面试式提问的关键要素（设计树/前沿/卡片提问/事实归 Lead）——用户 2026-10-13', () => {
     const text = playbook.PLAYBOOK;
-    for (const marker of ['设计树', '前沿', '推荐：', '找事实是你的工作', '不要替用户拍板', '用户明确说', '共享理解']) {
+    for (const marker of ['设计树', '前沿', '找事实是你的工作', '不要替用户拍板', '用户明确说', '共享理解']) {
       assert.ok(text.includes(marker), `PLAYBOOK 缺少标记：${marker}`);
     }
-    assert.ok(/Q1/u.test(text) && /Q2/u.test(text), 'PLAYBOOK 缺少 Q1/Q2 的排版示例');
+    assert.ok(/Q1/u.test(text) && /Q2/u.test(text), 'PLAYBOOK 缺少 Q1/Q2 的编号约定');
+    // ⚠️ 这条断言是 2026-10-13 换掉的：旧文本要求「编号（Q1、Q2…）并给出推荐答案，然后
+    // **停下来等**」+ 正文排版「**Q1 — <标题>**：<正文>」/「推荐：<推荐答案>」——
+    // 那套排版**就是 bug 本身**：Lead 照做就把问题写成了正文，回合随即结束，
+    // 用户必须再发一条才能继续（实测 session-00001001：seq 19 正文提问 → seq 21 turn/end
+    // → seq 26 用户不得不自己打字「不是中断会话向我提问，是聊天界面跳弹窗跟我提问啊」
+    // → seq 27 才改用 ask_user_question 卡片）。
+    // 现在钉的是新契约：必须用卡片问，且不许只写在正文里。
+    assert.ok(text.includes('ask_user_question'),
+      'PLAYBOOK 没让 Lead 用 ask_user_question 弹卡片提问 —— 它会退回正文提问，回合结束 = 会话断');
+    assert.ok(/问题不许只写在正文里/.test(text),
+      'PLAYBOOK 缺少「问题不许只写在正文里」这条硬约束（正文提问就是断会话的那条路）');
+    assert.ok(/会话断/.test(text),
+      'PLAYBOOK 必须把「为什么」留在文本里（正文提问 = 会话断）：没有理由模型不会遵守');
+    assert.ok(!/停下来等/.test(text),
+      'PLAYBOOK 又出现了「停下来等」——旧措辞会诱导模型把问题写成正文后结束回合');
   });
 
   await check('PLAYBOOK：只提 /team，不提已删除的 /team-off，并交代用 disable_agent_team 关团队', () => {
@@ -663,7 +678,12 @@ function functionBodyOf(source, needle) {
       //      「（它对你不可用）」的原因、blocked 的判据、冻结文件的举例与「让 Lead 判断」）。
       // 教训记在这里：那次为守住 3800/1150 而删掉的是**信息**，不是冗余；压缩该合并同义表述，
       // 不该删事实。上调幅度只覆盖真实新增 + 一点余量，不开口子。
-      PLAYBOOK: 3900,        // 调度模式方法论（Lead 与所有请求的前缀）
+      // 2026-10-13 上调 3900→4000（PLAYBOOK 实测 3988）：唯一来源是第一章那条**新信息** ——
+      //   提问必须用 `ask_user_question` 弹**卡片**，不许把问题写成正文再结束回合。
+      //   旧文本更短（它写的是排版样式「Q1 — <标题>」，而那正是导致会话断的错指令），
+      //   所以这次不是往上堆，是把一条错指令换成一条对指令 + 它必须留在文本里的理由：
+      //   模型只有知道「正文提问 = 回合结束 = 用户得再发一条」才会遵守卡片。
+      PLAYBOOK: 4000,        // 调度模式方法论（Lead 与所有请求的前缀）
       TEAM_POLICY: 800,      // 团队运行期事实（开后才有）
       TEAMMATE_CARD: 1250,   // 队员卡（每个队员的固定前缀）；留 ~50 余量，避免再次为「贴边」删信息
     };
@@ -713,8 +733,11 @@ function functionBodyOf(source, needle) {
       assert.ok(card.includes(marker), `队员卡丢了这个细节：「${marker}」——它是信息，不是冗余`);
     }
     const pb = playbook.PLAYBOOK;
-    for (const marker of ['（工具面强制）', '不许当事实', '真实调用链验证', '推荐：<推荐答案>',
-      '冻结的验收文件（只读）', '工具会把该角色的使命/纪律/写权限自动拼在你正文之前']) {
+    for (const marker of ['（工具面强制）', '不许当事实', '真实调用链验证',
+      '冻结的验收文件（只读）', '工具会把该角色的使命/纪律/写权限自动拼在你正文之前',
+      // 「（推荐）」= 卡片里推荐项的标注约定（2026-10-13 取代旧的正文排版「推荐：<推荐答案>」，
+      // 那套正文排版正是断会话的错指令；信息本身没丢，只是搬进了卡片字段）。
+      '（推荐）', '答案以**工具结果**回来']) {
       assert.ok(pb.includes(marker), `PLAYBOOK 丢了这个细节：「${marker}」——它是信息，不是冗余`);
     }
   });
@@ -1183,6 +1206,62 @@ function functionBodyOf(source, needle) {
     assert.ok(rows2[0].text.startsWith('## 标题'), '正文依然纯净');
   });
 
+  await check('extractConversation：工具行带 callId、正文行带 turn/step（弹窗流式层的去重判据）', () => {
+    // 2026-10-13 弹窗实时化的配套：覆盖层要判断「这条流式内容是不是已经进持久行了」。
+    // 判据只能是 callId 与 (turn, step) —— 名字与目标都可能重复（连续两次 read 同一文件）。
+    const rows = graph.extractConversation([
+      { type: 'assistant/message', data: { turn: 2, step: 3, message: { content: [{ type: 'text', text: '正文' }] } } },
+      { type: 'tool/call', data: { turn: 2, step: 3, callId: 'call-x', name: 'read', arguments: '{"file_path":"a/b.md"}' } },
+    ], 10);
+    const asst = rows.find((r) => r.kind === 'assistant');
+    assert.equal(asst.turn, 2, 'assistant 行没带 turn');
+    assert.equal(asst.step, 3, 'assistant 行没带 step');
+    const tool = rows.find((r) => r.kind === 'tool');
+    assert.equal(tool.callId, 'call-x', '工具行没带 callId');
+    // reasoning 兜底行同样要带（它和正文行是同一回合的两种形态）
+    const onlyR = graph.extractConversation([
+      { type: 'assistant/message', data: { turn: 5, step: 1, message: { content: [{ type: 'reasoning', text: '在想' }] } } },
+    ], 10);
+    assert.equal(onlyR[0].turn, 5, 'reasoning 行没带 turn');
+    assert.equal(onlyR[0].step, 1, 'reasoning 行没带 step');
+  });
+
+  await check('settledStepsOf：整步结算的名单准确，且不受工具行折叠影响', () => {
+    // 折叠判据必须吃**完整事件**：extractConversation 会把成串工具行折成一条计数行，
+    // 被吞掉的行其 turn/step 就不在返回结果里 —— 前端只看行会漏判、重复显示。
+    const many = [];
+    for (let i = 0; i < 12; i += 1) {
+      many.push({ type: 'tool/call', data: { turn: 1, step: 2, callId: 'c' + i, name: 'read', arguments: '{"file_path":"f' + i + '"}' } });
+    }
+    const steps = graph.settledStepsOf(many);
+    assert.ok(steps.includes('1:2'), 'tool/call 没算进结算名单：' + JSON.stringify(steps));
+    assert.equal(graph.extractConversation(many, 50).filter((r) => r.kind === 'tool').length < 12, true,
+      '前提不成立：这批工具行没被折叠，测不到「折叠导致漏判」');
+    assert.deepEqual(graph.settledStepsOf([]), [], '空事件该给空名单');
+    assert.deepEqual(graph.settledStepsOf(null), [], 'null 不该抛错');
+    // 没有 turn/step 的事件（如 user/message）不进名单
+    assert.deepEqual(graph.settledStepsOf([{ type: 'tool/call', data: { name: 'read' } }]), [], '缺 turn/step 不该进名单');
+  });
+
+  await check('toolLabelTable：给全驼峰与下划线两种键，且与 toolRowLabel 同口径', () => {
+    // 浏览器半的流式覆盖层要用它给「正在生成的工具调用」出标签；
+    // 事件里的名字是 read_image，官方表编的是 readImage —— 两种键都得在。
+    const table = graph.toolLabelTable();
+    assert.equal(typeof table.generic, 'string', '缺 generic 兜底');
+    assert.equal(table.titles.read, graph.toolRowLabel('read'), '驼峰键与 toolRowLabel 不一致');
+    assert.equal(table.titles.read_image, graph.toolRowLabel('read_image'), '下划线键与 toolRowLabel 不一致');
+    assert.equal(table.titles.grep, graph.toolRowLabel('grep'), 'grep 标签不一致');
+    // 别名工具（官方表里没有、本机确实存在）也要能查到
+    assert.equal(table.titles.web_search, graph.toolRowLabel('web_search'), '别名工具没进表');
+    assert.equal(table.titles.report_result, graph.toolRowLabel('report_result'), '团队工具没进表');
+    // 原型键不能是**自己的**键：这张表要过 JSON 边界送到浏览器，宿主这边只能保证
+    // 「只写真实工具名」。读到 constructor/toString 这类值时的兜底在浏览器那一侧
+    // （wsToolLabel 用 typeof === 'string' 过滤），由 .probe/verify-p1p2.mjs 端到端验。
+    assert.equal(Object.prototype.hasOwnProperty.call(table.titles, 'constructor'), false,
+      '原型键不该是自己的键');
+    assert.ok(Object.values(table.titles).every((v) => typeof v === 'string'), '表里混进了非字符串值');
+  });
+
   await check('extractConversation：被中止的回合只有 reasoning 块时，对话不能整片空白', () => {
     // 用户 2026-10-10 报障：「工作区里面空的，看不到回复」。
     // 根因（真实会话 session-00001008 seq=19 实测）：用户 `/team` 后中止那一轮，
@@ -1203,14 +1282,23 @@ function functionBodyOf(source, needle) {
     assert.equal(rows[0].reasoning, true, 'reasoning 兜底行必须带 reasoning:true，渲染层据此标注');
     assert.ok(rows[0].text.includes('Let me think'), 'reasoning 文本要真的进去');
 
-    // 反例：**有正文**的回合绝不能用 reasoning 顶替正文（避免思考淹没对话）。
+    // 反例（2026-10-13 改口径）：**有正文**时思考也显示，但是**折叠行**，
+    // 且绝不顶替正文 —— 官方界面就是把 reasoning 做成可展开的披露行
+    // （dsh-client-ui-chat 的 ReasoningRow），实测 session-0000100a 每条
+    // assistant/message 都是 reasoning + text 并存。旧断言「有正文只成 1 行」
+    // 会让弹窗的流式思考在结算后凭空消失，所以换成下面这三条：
     const withText = [
-      { type: 'assistant/message', data: { message: { content: [{ type: 'reasoning', text: '内部推理不该显示' }, { type: 'text', text: '正式回复' }] } } },
+      { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'reasoning', text: '内部推理' }, { type: 'text', text: '正式回复' }] } } },
     ];
     const rows2 = graph.extractConversation(withText, 10);
-    assert.equal(rows2.length, 1, '有正文时应只成 1 行');
-    assert.equal(rows2[0].text, '正式回复', '有 text 块时必须用 text，不能被 reasoning 顶替');
-    assert.ok(rows2[0].reasoning !== true, '有正文的行不该被标成 reasoning');
+    assert.equal(rows2.length, 2, '有正文时思考与正文各成一行，实际 ' + rows2.length + ' 行');
+    assert.equal(rows2[0].reasoning, true, '思考行在前（与官方顺序一致）');
+    assert.equal(rows2[0].collapsed, true, '有正文时思考行必须标 collapsed（渲染层据此折叠）');
+    assert.equal(rows2[1].text, '正式回复', '有 text 块时必须用 text，不能被 reasoning 顶替');
+    assert.equal(rows2[1].reasoning, undefined, '正文行不许带 reasoning 标记');
+    // 没有正文（被中止）时思考行仍然在，但**不折叠** —— 那时它是唯一内容
+    assert.equal(graph.extractConversation(onlyReasoning, 10)[0].collapsed, false,
+      'reasoning-only 的行不该折叠（折叠了就没有任何可见内容了）');
 
     // 空 content 不能凭空造行。
     const empty = [{ type: 'assistant/message', data: { message: { content: [] } } }];
@@ -1289,8 +1377,14 @@ function functionBodyOf(source, needle) {
     assert.ok(/^\s*mode:\s*timed\s*$/m.test(block),
       'tool-ask-user 必须设 mode: timed —— 否则提问走 legacy waterfall，'
       + '插件（以及工作区弹窗）永远无法关闭官方提问卡，用户会看到「已回答但官方仍等待」');
-    assert.ok(/^\s*timeout:\s*\d+\s*$/m.test(block),
-      'mode: timed 必须同时给一个默认 timeout（秒），否则官方按未配置处理');
+    // 默认期限允许 -1（无限等）或正整数秒。2026-10-13 从 600 改成 -1：
+    // 有限期限到期时返回 {"pending":true} ⇒ **模型在没有答案的情况下被放行**，
+    // 用户之后的答案以另一条 user 消息在新回合送达 —— 对「没答复不能往下走」的
+    // 分轮面试就是「会话断了」。实测本机 4 个会话真出现过 pending。
+    assert.ok(/^\s*timeout:\s*(-1|\d+)\s*$/m.test(block),
+      'mode: timed 必须同时给一个默认 timeout（-1 无限等，或正整数秒），否则官方按未配置处理');
+    assert.ok(/^\s*timeout:\s*-1\s*$/m.test(block),
+      '默认 timeout 必须是 -1：有限期限到期会把模型放行（pending），会话就断了');
   });
 
   await check('增量折叠游标：必须推进到「连续可读」的位置，不能按条数、也不能按 session.seq', () => {
@@ -1423,10 +1517,11 @@ function functionBodyOf(source, needle) {
     // 安装的 ops 卸载了也可以用；别人装了 ops 可以兼容不报错，没装 ops 也能装我的插件」。
     //
     // 落地形态（四处协同，缺一即坏）：
-    //   ① vendor/ops/lib/ —— dsh-ops 0.2.6 lib/ 的完整运行时拷贝（14 模块依赖闭包，
+    //   ① vendor/ops/lib/ —— dsh-ops 0.2.9 lib/ 的完整运行时拷贝（14 模块依赖闭包，
     //      除 Node 内置外零外部包）；vendor/ops/vendor/fastctx/target/release/fastctx.exe
     //      是工具的 Rust 执行体（dsh-ops binary.js 搜索链第 2 环 repoBuildFile 命中，
     //      PACKAGE_ROOT 在 vendor 副本里指向 vendor/ops，实测 resolveBinary+probeBinary 通过）。
+    //      （2026-10-12 从官方 v0.2.9 同步；此前副本为 v0.2.8。）
     //   ② cordis.patch.yml 第 4 行 `- id: ops-file / name: @zws/dsh-dispatch-agent-team/ops-file`
     //      —— name 指向**本包自己的 exports 子路径**（./ops-file），卸载独立 dsh-ops 后
     //      本行照常解析挂载。id 不能沿用 dsh-ops-file（会被它的 bundle 行覆盖，
@@ -1767,6 +1862,209 @@ function functionBodyOf(source, needle) {
     assert.equal(g.nodes[0].openTurns, 1, '未闭合 turn 数要如实暴露给客户端');
   });
 
+  await check('effectiveRuntimeMs / buildGraph：活体会话的运行时长按**墙钟**推进（用户 2026-10-12 报「运行 0 秒、不实时」）', () => {
+    // 回归两层（同一个函数的两条分支）：
+    //   ① 活体（传 now）→ 基准是**现在**：长思考 / 长工具调用期间数字也在走，
+    //      而不是只在有新事件落地时才跳一格；
+    //   ② 已死（不传 now，或 liveAt 过期）→ 基准仍是最后一条事件时间：
+    //      绝不把「会话已经停了多久」算进运行时长（否则宿主重启后的历史队员集体虚增）。
+    const now = Date.now();
+    const open = graph.emptyStats();
+    open.runtimeMs = 5000;                        // 已闭合回合累计
+    open.openTurns = new Map([[1, now - 60000]]); // 未闭合回合：60 秒前开始
+    open.lastTime = now - 10000;                  // 最后一条事件：10 秒前
+    open.liveAt = now;                            // 本轮刚读到活体 session
+    const statsOf = (s) => {
+      const g = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s]]), tasks: [] });
+      return g.nodes[0].runtimeMs;
+    };
+    const liveMs = statsOf(open);
+    assert.ok(liveMs >= 65000 && liveMs <= 66000,
+      `活体：应为 5000+(now−起点)=65000ms 量级（墙钟），实际 ${liveMs}`);
+    // 不传 now 的纯函数口径不变（旧的「最后事件时间 − 起点」）
+    assert.equal(graph.effectiveRuntimeMs(open), 55000, '不传 now：基准 = 最后事件时间（5000+50000）');
+    // liveAt 过期（队员 agent 已消失）→ 必须回落到事件时间，不得虚增
+    const expired = { ...open, liveAt: now - 10 * 60 * 1000 };
+    assert.equal(statsOf(expired), 55000, '窗口过期后必须回落到「最后事件时间 − 起点」');
+    // now 早于最后事件时不得倒退
+    assert.equal(graph.effectiveRuntimeMs(open, now - 60000), 55000, 'now 早于最后事件时取两者较大，不得倒退');
+  });
+
+  await check('工作区实时刷新：浮窗打开不得冻结卡片与浮窗指标（用户 2026-10-12 报「弹窗一开就不更新」）', () => {
+    // 症状：点了 lead 卡片开浮窗后，工作区卡片的「运行 0 秒」与浮窗指标格永远不变。
+    // 根因（实测复现，见 .probe/repro-freeze.mjs）：wsLoad 在浮窗打开时**整轮跳过**刷新
+    // （旧注释担心「重绘让抽屉引用变陈旧」，但刷新本来就就地更新、不重建节点），
+    // 而浮窗指标格又是「建一次 DOM 就不再取值」⇒ 两者叠加 = 打开浮窗后所有数字冻结。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(!/state\.drawer\.classList\.contains\('on'\)\)\s*return/.test(src),
+      'wsLoad 不得因「浮窗开着」跳过刷新（会让卡片与浮窗指标冻死在开窗那一刻）');
+    assert.ok(/function wsSyncDrawerCells\(/.test(src), '缺少 wsSyncDrawerCells（浮窗指标的就地同步器）');
+    assert.ok(/state\.drawerCells = cellValues/.test(src), 'wsOpenDrawer 必须登记浮窗指标单元格');
+    assert.ok(/wsSyncDrawerCells\(state\.drawerCells, shown\)/.test(src),
+      'wsApplyGraph 必须把每一帧数据同步进已打开的浮窗指标格');
+    assert.ok(/state\.drawerCells = undefined/.test(src), '关窗必须撤销登记（否则对已关的浮窗空跑）');
+  });
+
+  await check('弹窗回答必须走官方提问卡（等价，不是消息投递）——用户 2026-10-13', () => {
+    // 症状（截图 131622 / 130722）：弹窗里回答 Lead 的提问，答案变成一条
+    // `【回答提问】…` 的**普通消息**插进对话，官方提问卡还挂着等。
+    // 实测 session-0000100a seq 21/22：两条这样的插话，因为用户又点了一次提交。
+    // 根因：宿主平面只有两条通道 —— userQuestions.answer（只认 continued 态，
+    // timed 未超时的提问是 open 态 → 恒 false）与「拼一条消息发出去」。
+    // 修法：弹窗在前端拿官方那张 PendingQuestion 卡，调它**自己的** answer()
+    // （dsh-client-ui-user-questions/lib/client.js:396-406）—— 与在聊天界面点提交
+    // 是同一个方法、同一个对象，这才是等价。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/function bridgeQuestionCard\(/.test(src), '缺少 bridgeQuestionCard（从 uiSession 快照取官方提问卡）');
+    assert.ok(/card\.callId === callId/.test(src),
+      '取卡必须按 callId 精确匹配：否则会替用户答掉另一个问题');
+    // 提交路径上，官方卡必须排在 team-answer 之前（先卡、拿不到卡才兜底）
+    const submitAt = src.indexOf('submit.addEventListener');
+    const cardAt = src.indexOf('bridgeQuestionCard(node.id, callId)', submitAt);
+    const hostAt = src.indexOf("apiCall('team-answer'", submitAt);
+    assert.ok(cardAt > 0 && hostAt > cardAt,
+      '提交回答必须先试官方卡、再退宿主通道（顺序错了就还是消息投递）');
+    assert.ok(/await official\.answer\(\{ answers \}\)/.test(src),
+      '必须把整批答案交给官方卡的 answer()（官方 composer 同款批次形状）');
+    // 官方卡失败时不得静默降级成消息投递（那正是用户反对的「以为回答了其实没回答」）
+    assert.ok(/wsQCardFailed/.test(src), '官方卡失败要如实报错，不能偷偷改走投递');
+    // 本地记一笔已答：宿主日志要等整步结算才有答案，期间不能把刚答完的卡画回可点
+    assert.ok(/const cardAnswered = new Map\(\)/.test(src), '缺少 cardAnswered（本地已答记录）');
+    assert.ok(/cardAnswered\.has\(q\.callId\)/.test(src),
+      '提问盒的签名/未答计数必须认本地已答记录（否则刚答完的卡会退回可点）');
+  });
+
+  await check('答案批次不得含 undefined —— 含就把提问当场打死（2026-10-13 实测）', () => {
+    // 这条闸门是上一次「等价」修法**自己**的 bug，也是最贵的一条：
+    // 浏览器探针 23 项全绿，真机却坏了。症状（截图 192100/192148）：
+    // 弹窗里点提交，官方卡**没关**，答案变成 `【回答提问】n_count：8` 的插话。
+    //
+    // 根因链（全部实测，session-00001004）：
+    //   1. 旧写法 `custom: 空 ? undefined : 值` 造出一个**自有键 + undefined 值**的对象；
+    //   2. 官方 answer() 只是 waterfall.resolve，载荷作为**远程事件返回值**回传宿主；
+    //   3. dsh-api-gateway/lib/client.js:880 用 isRemoteJsonValue 校验，
+    //      visitJsonValue(:93-96) 对**嵌套 undefined** 直接判 false；
+    //   4. 于是抛 "Remote event listener result is not lossless JSON data"
+    //      ⇒ seq 22 的 tool/result isError:true ⇒ **提问当场死掉**；
+    //   5. 而 answer() 永远 resolve ⇒ 弹窗谎报「已通过官方提问卡回答」。
+    // 官方自己的 submitDrafts（dsh-client-ui-user-questions/lib/client.js:936-948）
+    // 用的是条件展开：没填自定义就**整个键都不出现**。照它写。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const submitAt = src.indexOf('submit.addEventListener');
+    assert.ok(submitAt > 0, '找不到提交处理器');
+    const buildAt = src.indexOf('const answers = items.map', submitAt);
+    assert.ok(buildAt > 0, '找不到答案批次的构造点');
+    const build = src.slice(buildAt, src.indexOf('void (async () =>', buildAt));
+    assert.ok(!/custom:\s*[^\n]*undefined/.test(build),
+      '答案批次里出现了 `custom: …undefined`：嵌套 undefined 会被网关拒，'+
+      'ask_user_question 当场以 isError 结算（提问被打死）。必须用条件展开 '+
+      '`...(custom === \'\' ? {} : { custom })`，没填时整个键都不出现');
+    assert.ok(/\.\.\.\(custom === '' \? \{\} : \{ custom \}\)/.test(build),
+      '答案批次必须用官方同款条件展开构造 custom 键');
+    // 光有载荷正确还不够：answer() 会 resolve，必须**验结算**才能报「已回答」。
+    assert.ok(/function bridgeQuestionOutcome\(/.test(src),
+      '缺少 bridgeQuestionOutcome：answer() 永远 resolve，不验结算就是谎报已回答');
+    assert.ok(/bridgeQuestionOutcome\(live, callId\)/.test(src),
+      '提交后必须查这次工具调用的结算结果（answered/dead/unknown）');
+    assert.ok(/outcome === 'dead'/.test(src), "必须区分「提问已死」这条路径");
+    const deadAt = src.indexOf("outcome === 'dead'");
+    // 只看 dead 分支**自己**那一段（到它的 return 为止）：再往后就是成功路径，
+    // 那里当然有 cardAnswered.set，别把窗口开大了误伤。
+    const deadBlock = src.slice(deadAt, src.indexOf('return', deadAt) + 6);
+    assert.ok(!/cardAnswered\.set/.test(deadBlock),
+      '提问已死时**不许**写 cardAnswered：那等于把没被接受的答案记成已回答');
+    assert.ok(/wsQCardDead/.test(src), '提问已死要有如实的界面措辞');
+    // note 必须留在 DOM 里：markCardAnswered 会 textContent='' 重建整张卡，
+    // 之前把说明写进已脱离 DOM 的节点，用户从来没看见过那句实话。
+    const markDef = src.slice(src.indexOf('const markCardAnswered'), src.indexOf('const loadQuestions'));
+    assert.ok(/if \(keep !== undefined && keep !== null\) cardEl\.appendChild\(keep\)/.test(markDef),
+      'markCardAnswered 重建卡后必须把状态提示节点接回 DOM（否则那句实话没人看得见）');
+    // 调用里嵌套了 items.map(...)，所以按行匹配，别用 [^)]* 那种跨不过 ')' 的正则。
+    const noteKept = src.split('\n').filter((line) => /markCardAnswered\(card,/.test(line) && /,\s*note\)/.test(line)).length;
+    assert.ok(noteKept >= 2,
+      '两条回答通道收卡时都要把 note 传进去（实测抓到 ' + noteKept + ' 处，需要 ≥2）');
+  });
+
+  await check('弹窗实时：必须订阅官方 eventSource 并成对释放引用——用户 2026-10-13', () => {
+    // 症状：首 token 前进弹窗只看得到自己发的消息，思考要等 Lead 提问时才一次性涌出。
+    // 根因：弹窗只读**持久日志**，而 assistant/message 与 tool/call 都是整步结算才落盘
+    // （实测 session-0000100a seq 19/20 同一毫秒）⇒ 结算前那个数据源里根本没有思考。
+    // 修法：retain 目标会话，订阅官方对话自己在用的 eventSource —— 它带 transient 的
+    // assistant/live-chunk（dsh-api-session-controller/lib/client.js:428-432 无条件
+    // 带 assistantStream:true；:2128-2131 每个 token append 一行）。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/function wsFoldLive\(/.test(src), '缺少 wsFoldLive（transient 流 → 对话行）');
+    assert.ok(/bridgeRetain\(node\.id\)/.test(src), '弹窗必须 retain 目标会话吃官方对象层');
+    assert.ok(/live\.eventSource\.subscribe\(onFeed\)/.test(src), '必须订阅官方那份窗口');
+    // retain 是引用计数：开一次放一次，漏放就永久多占一格
+    assert.ok((src.match(/state\.drawerLive/g) || []).length >= 4,
+      'drawerLive 句柄要在开/关两处都处理（订阅、释放、防抖计时器）');
+    assert.ok(/live\.release\(\)/.test(src), '关窗必须 release retain 引用');
+    // 绝不能复用 mainView：那会把用户正在看的聊天页切走
+    assert.ok(!/source:\s*['"]mainView['"]/.test(src),
+      '不得用 mainView 作 retain 来源（会抢走用户的主视图）');
+    assert.ok(/BRIDGE_RETAIN_SOURCE/.test(src), 'retain 来源必须是自定义标签');
+    // 订阅回调里不许直接打宿主接口（每个 token 都会同步回调）
+    const feedAt = src.indexOf('const onFeed = () =>');
+    const feedBody = src.slice(feedAt, src.indexOf('let unsubscribe', feedAt));
+    assert.ok(!/apiCall\(/.test(feedBody),
+      'eventSource 回调里不得直接发请求（每个 token 都回调，会打爆宿主）');
+    assert.ok(/setTimeout\(\(\) => \{/.test(feedBody), '结算后的补拉必须走防抖');
+    // 兜底轮询链**只能有一个启动点**：scheduleDrawer 每次把 state.drawerTimer 覆盖成
+    // 最新那个 handle，于是关窗时 clearTimeout 只能停掉一条 —— 多出来的那条会一直
+    // 按秒打宿主接口（本次开发就引入过这个 bug：同步 kickoff 与 .then 里的 kickoff 并存）。
+    // 合法形状只有 `.then(成功回调, 失败回调)` 这两处引用（互斥，只会执行一个）；
+    // 任何「单独成一行」的 kickoffDrawer() 调用都是第二个启动点。
+    const standaloneKickoff = src.split('\n').some((line) => /^\s*kickoffDrawer\(\)\s*$/.test(line));
+    assert.equal(standaloneKickoff, false,
+      'kickoffDrawer 不许单独成行调用 —— 那会与 .then 里的启动点并存，形成两条独立轮询链'
+      + '（关窗只能停掉一条，另一条继续按秒打宿主接口）');
+    assert.equal((src.match(/\bkickoffDrawer\(\)/g) || []).length, 2,
+      'kickoffDrawer 应当只出现在 .then 的成功/失败两个回调里（各一次）');
+    // 去重判据：工具按 callId、正文按 (turn,step)，两者缺一就会重复显示
+    assert.ok(/paintedCalls\.has\(row\.callId\)/.test(src), '工具行去重必须按 callId');
+    assert.ok(/settledSteps\.has\(String\(row\.turn\)/.test(src), '正文去重必须按 (turn,step)');
+    // 拿不到桥必须还能用（退回轮询持久日志），不能空白
+    assert.ok(/state\.drawerLive !== undefined && state\.drawerLive\.hasFeed === true/.test(src),
+      '轮询档位要认覆盖层是否存在：没桥时仍按快档盯日志');
+    // 宿主半要**重启 DSH** 才生效，浏览器半只要刷新页面 —— 两者可能不同版本。
+    // 旧宿主回的是旧形状（没有 settledSteps、工具行没有 callId），去重判据会全部失效，
+    // 已经结算的流式内容会与持久行同时画两遍。所以必须有协议闸门，缺位时退回只轮询。
+    assert.ok(/let hostLiveCapable = false/.test(src), '缺少宿主协议能力标志');
+    assert.ok(/if \(Array\.isArray\(result\.settledSteps\)\) hostLiveCapable = true/.test(src),
+      '能力判定必须落在 team-conversation 的回执上（带 settledSteps 才算新宿主）');
+    assert.ok(/if \(!hostLiveCapable \|\| liveRows\.length === 0\) return base/.test(src),
+      '旧宿主时必须**不画**覆盖层（否则同一段思考显示两遍）');
+    assert.ok(/hasFeed === true && hostLiveCapable/.test(src),
+      '轮询降档也要认能力闸门：旧宿主下覆盖层被丢掉，实时性还得靠轮询');
+  });
+
+  await check('lib/client.js 没有未闭合的 JSDoc 块（node --check 抓不到这类吞代码的错）', () => {
+    // 真实事故（2026-10-13 本次开发）：写注释时开了 `/**` 却用 `//` 续行、
+    // 也没有 `*/` 收尾 ⇒ 从那一行起整段被当成注释，**紧跟其后的 const 声明被吃掉**。
+    // 语法完全合法（node --check 与 45 个冒烟用例全绿），只有真浏览器运行时才炸：
+    //   ReferenceError: BRIDGE_RETAIN_SOURCE is not defined
+    // 本仓库的 client.js 是手写 bundle、没有构建期类型检查，所以这条只能靠源码扫描钉住。
+    const files = ['client.js', 'graph.js', 'runtime.js', 'tools.js', 'roster.js', 'playbook.js', 'index.js', 'preset.js'];
+    const offenders = [];
+    for (const file of files) {
+      const lines = readFileSync(path.join(LIB, file), 'utf8').split('\n');
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        // 只认「行首是 /**、本行没有 */」的块开头
+        if (!/^\s*\/\*\*/.test(line) || line.includes('*/')) continue;
+        let closed = false;
+        for (let k = i + 1; k < lines.length; k += 1) {
+          if (lines[k].includes('*/')) { closed = true; break }
+          // 续行必须是 * 开头；出现 // 或代码就说明这个块从来没打算闭合
+          if (!/^\s*\*/.test(lines[k])) break;
+        }
+        if (!closed) offenders.push(file + ':' + (i + 1) + '  ' + line.trim().slice(0, 70));
+      }
+    }
+    assert.deepEqual(offenders, [], '未闭合的 JSDoc 会吃掉后面的代码：\n      ' + offenders.join('\n      '));
+  });
+
   await check('buildGraph：承接边方向按主导信息流，不随名单顺序漂移（用户 #7）', () => {
     // 回归：旧实现把 pair 内**先遇到的**那条当 from（由名单顺序决定）→ 双向边里约一半流光反着播。
     const mk = (wrote, read) => {
@@ -2037,6 +2335,51 @@ function functionBodyOf(source, needle) {
     };
     const lone = await runtimeMod.leadForSession(ctxLone, LEAD);
     assert.equal(lone.ok, false, 'members 只有 lead 一个时不该判成团队（实测 213 份缓存里只有 9 份 members 非空）');
+  });
+
+  await check('statsForSession：持久快照冻住的 openTurns 视为可疑并冷却重读自愈（2026-10-12 真机幻影灰点根因）', async () => {
+    // 真机取证（session-0000100e，宿主 21:12 启动后未重启）：队员 agent 被回收的瞬间，
+    // 最后一行 turn/end 还没落盘（researcher 的 turn 2 在 22:42:18 闭合，快照只折到
+    // 22:42:11）→ 持久缓存 openTurns=1 永久冻结，工作区把它画成灰色「空闲」。
+    // 修法：openTurns>0 的持久缓存 = 可疑，冷却（FAILED_RETRY_MS）后重读；
+    // 重读到 openTurns=0 即自愈并停止重读；真死在半路的成员重读依旧 >0（节流兜底）。
+    const graph = await load('graph.js');
+    graph.resetStatsCacheForTest();
+    const t0 = 1_000_000;
+    const partial = [
+      { type: 'turn/start', seq: 0, time: t0, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 1, time: t0 + 3000, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 } } },
+      { type: 'step/end', seq: 2, time: t0 + 3500, data: { turn: 1, step: 1 } },
+    ];
+    const closed = [...partial, { type: 'turn/end', seq: 3, time: t0 + 4000, data: { turn: 1, reason: { kind: 'completed' } } }];
+    let events = partial;
+    let reads = 0;
+    const persistence = {
+      open: async () => ({
+        inheritedEventCount: 0,
+        read: async () => { reads += 1; return { events }; },
+        close: async () => {},
+      }),
+    };
+    const notes = [];
+    // ① 首折：agent 刚消失、日志还没写完 → openTurns=1（当时的「真相」）
+    const s1 = await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 4000);
+    assert.equal(s1.openTurns.size, 1, 'agent 消瞬间的快照确实带着未闭合 turn');
+    assert.equal(reads, 1);
+    // ② 冷却期内不重读（防每 1.2s 轮询整读大日志）
+    const s2 = await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 5000);
+    assert.equal(reads, 1, '冷却期内不得重读');
+    assert.equal(s2.openTurns.size, 1);
+    // ③ 日志补全（turn/end 落盘）+ 冷却过期 → 重读自愈
+    events = closed;
+    const s3 = await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 20000);
+    assert.equal(reads, 2, '冷却过期后应重读一次');
+    assert.equal(s3.openTurns.size, 0, '重读后 turn 已闭合（幻影消除）');
+    assert.equal(s3.runtimeMs, 4000, '运行时长按闭合 turn 结算');
+    // ④ 自愈后不再是可疑缓存：不再重读
+    await graph.statsForSession('member-phantom', undefined, persistence, notes, t0 + 21000);
+    assert.equal(reads, 2, '自愈后不得继续重读');
+    graph.resetStatsCacheForTest();
   });
 
   console.log('');
