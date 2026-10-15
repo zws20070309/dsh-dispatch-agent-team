@@ -1912,6 +1912,67 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+    // ── 批量调用档（both）所依赖的官方形状（2026-10-15 用户选路径 1）──────────────
+    // 本插件不开新预设、不改官方文件，只在队员自己的作用域喊一句 presentAs('both')。
+    // 这句话的全部效力都压在下面这几行官方代码上 —— 它们任一变动，功能就静默变成
+    // 「开关拨了但什么都没发生」，所以逐条钉住。
+    const batchTools = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
+    const batchScope = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
+    const batchPres = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-tool-presentation/lib/index.js') || '';
+    const batchMcp = asar.read('dsh/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js') || '';
+
+    check('官方仍有第三档 both，且 both = 全部工具 + run_code（批量调用档就挂在这一行上）', () => {
+      if (batchTools === '') return '读不到 dsh-tools';
+      if (!batchTools.includes('"both"')) return 'dsh-tools 的 mode 联合类型里没有 both 了：这一档没有承载物，功能必须改道';
+      if (!batchTools.includes('knownNames: [...view.knownNames, RUN_CODE_NAME]')) {
+        return 'both 分支不再是「继承面全部名字 + run_code」：本插件的判据与 §7.10 的断言要按新形状重写';
+      }
+      if (!batchTools.includes('schemas.filter((schema) => schema.name === RUN_CODE_NAME)')) {
+        return 'ptc 分支不再是「只留 run_code」：用户报的那个报错现象已经变了，§7.10 的对照基线要重写';
+      }
+      return true;
+    });
+
+    check('presentAs 仍是 per-scope 声明口，modeFor 仍是「最近的一层赢」', () => {
+      if (!batchTools.includes('presentAs(mode) {')) return 'ctx.tools.presentAs 不见了或改名了：applyMemberBatch 会走「取不到就记诊断」那条降级路';
+      if (!batchTools.includes('for (let index = layers.length - 1; index >= 0; index -= 1)')) {
+        return 'modeFor 不再是「从最近一层往前找第一个声明」：自己那层压不住预设那层，路径 1 的前提没了';
+      }
+      if (!batchScope.includes('farthest ancestor first and the exact scope last')) {
+        return 'dsh-scope 的 chainLayers 顺序注释变了（顺序一旦翻转，上面那条判据就是假的，功能会反过来被预设压住）';
+      }
+      return true;
+    });
+
+    check('装配期仍要求 ptcRuntime —— 本插件那条守卫的理由还成立', () => {
+      if (!batchTools.includes('requires a PTC runtime')) {
+        return 'dsh-tools 不再因缺 PTC 运行时抛错：applyMemberBatch 里的守卫可以删（删之前请同步 §7.10 那条负对照）';
+      }
+      if (!batchTools.includes('mode !== "native"')) return 'run_code 的注入条件变了（不再是「非 native 就注入」）：both 档拿不到 run_code 时 §7.10 会先红';
+      if (!batchTools.includes('is the only tool you can call directly')) {
+        return '官方 PTC_ONLY 文案变了：§7.10 拿它当钥匙，both/ptc 两条断言会假绿或假红，按新文案改判据';
+      }
+      return true;
+    });
+
+    check('呈现档声明包仍把 native|ptc|both 转成 presentAs（官方自己的换档机制没变）', () => {
+      if (batchPres === '') return '读不到 dsh-agent-tool-presentation';
+      for (const value of ['"native"', '"ptc"', '"both"']) {
+        if (!batchPres.includes(value)) return '声明包的 Config 联合类型里少了 ' + value;
+      }
+      if (!batchPres.includes('tools.presentAs(config.mode)')) return '声明包不再调 presentAs：官方换档机制变了，本插件直接 presentAs 的前提要重新核';
+      return true;
+    });
+
+    check('MCP 工具仍注册进调用方作用域（用户后加的 MCP 要能被队员看到，这一档才有意义）', () => {
+      if (batchMcp === '') return '读不到 dsh-mcp-client：MCP 工具进不来，用户那条「以后加的 MCP 也要能看到」失效';
+      if (!batchMcp.includes('ctx.tools.register(definition)')) return 'MCP 工具不再走 ctx.tools.register：它落在哪一层要重新核（both 档可能看不见它）';
+      if (!batchMcp.includes('const publicName = publicToolName(opts.serverName, tool.name)')) {
+        return 'MCP 工具的公开名规则变了：文档里写的 mcp__<server>__<tool> 与 §7.10 之外的判据都要跟着改';
+      }
+      return true;
+    });
+
   check('白名单三个 id 在本机真的注册着（standard/ptc 来自官方 bundle，极简灰度来自 profile patch）', () => {
     const roster = readFileOr(path.join(PLUGIN_DIR, 'lib', 'roster.js'));
     const ids = ['ptc', 'standard', 'minimal-grayscale'];

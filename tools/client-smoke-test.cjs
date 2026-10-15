@@ -1147,6 +1147,171 @@ async function main() {
     });
   }
 
+  // ── 11) 批量调用开关（both 档，2026-10-15 用户选路径 1：默认开 + 开关放控件列左边）──
+  //
+  // 这一维最容易出的两种错：① 开关被摞进右边那一列（用户明确不要的版面）；
+  // ② 拨了开关但保存时被别的列挤掉（草稿行是四字段对象，任何一处绕过 makeRow 都会丢）。
+  // 所以断言同时盯**结构**（直接子节点）与**往返**（读回来 = 显示 = 存回去）。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: {
+          version: 1,
+          roles: {
+            builder: { provider: 'p', model: 'm1', preset: 'ptc', batch: false },
+            scout: { batch: false },
+          },
+        },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1', efforts: [{ id: 'low', name: 'Low' }] }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'bbb:2', diagnostics: [] },
+    });
+    /** 某个角色行里那一颗批量开关（连同它那一格与整行）。 */
+    const batchBox = (root, roleId) => {
+      const row = findAll(root, (node) => {
+        if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+        const code = findAll(node, (inner) => inner.type === 'code')[0];
+        return code !== undefined && textOf(code) === roleId;
+      })[0];
+      if (row === undefined) return undefined;
+      const cell = findAll(row, (node) => node.type === 'label' && node.props.className === 'dat-batch')[0];
+      if (cell === undefined) return undefined;
+      const box = findAll(cell, (node) => node.type === 'input')[0];
+      return box === undefined ? undefined : { cell, box, row };
+    };
+    /** 某个角色行里、列标题为 label 的那个下拉（与 §9 同一套定位：按标题文字，不按位置）。 */
+    const selectOf = (root, roleId, label) => {
+      const row = findAll(root, (node) => {
+        if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+        const code = findAll(node, (inner) => inner.type === 'code')[0];
+        return code !== undefined && textOf(code) === roleId;
+      })[0];
+      if (row === undefined) return undefined;
+      for (const field of findAll(row, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== label) continue;
+        const sel = findAll(field, (node) => node.type === 'select')[0];
+        if (sel !== undefined) return sel;
+      }
+      return undefined;
+    };
+    const bulkBatchBox = (root) => {
+      const bulk = findAll(root, (node) => node.type === 'div' && node.props.className === 'dat-bulk')[0];
+      if (bulk === undefined) return undefined;
+      for (const field of findAll(bulk, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== '批量调用（应用到全部角色）') continue;
+        const box = findAll(field, (node) => node.type === 'input')[0];
+        if (box !== undefined) return { field, box };
+      }
+      return undefined;
+    };
+    const save = () => {
+      const btn = findAll(page.tree(), (node) => node.type === 'button' && textOf(node).includes('保存'))[0];
+      btn.props.onClick();
+    };
+
+    check('每个角色行都有一颗批量开关，已关掉的那颗显示为未勾选（读回来 = 显示）', () => {
+      const tree = page.tree();
+      const scout = batchBox(tree, 'scout');
+      if (scout === undefined) return 'scout 行里没有 dat-batch 那一格';
+      if (scout.box.props.checked !== false) return '配置里 batch:false，界面上却仍是勾选状态';
+      const researcher = batchBox(tree, 'researcher');
+      if (researcher === undefined) return 'researcher 行里没有 dat-batch 那一格';
+      if (researcher.box.props.checked !== true) return '没配任何维度的角色应当默认打勾（默认开）';
+      const builder = batchBox(tree, 'builder');
+      if (builder === undefined || builder.box.props.checked !== false) return 'builder 的 batch:false 没读回来';
+      return true;
+    });
+
+    check('版面：批量开关是 dat-row 的直接子节点，且不在 dat-ctl 那一列里', () => {
+      const found = batchBox(page.tree(), 'scout');
+      if (found === undefined) return '找不到 scout 的开关';
+      const ctl = findAll(found.row, (node) => node.type === 'div' && node.props.className === 'dat-ctl')[0];
+      if (ctl === undefined) return '找不到 dat-ctl（行结构变了，本条判据要重写）';
+      if (findAll(ctl, (node) => node === found.cell).length > 0) return '批量开关被放进了 dat-ctl 那一列';
+      if ((found.row.props.children || []).indexOf(found.cell) < 0) return 'dat-batch 不是 dat-row 的直接子节点';
+      return true;
+    });
+
+    check('统一那一格：角色不一致时不打勾（有一格关掉就不打勾）', () => {
+      const bulk = bulkBatchBox(page.tree());
+      if (bulk === undefined) return '统一选择块里找不到「批量调用（应用到全部角色）」';
+      if (bulk.box.props.checked !== false) return 'scout/builder 是关的，统一格却打勾了（骗人）';
+      return true;
+    });
+
+    check('关掉批量后再改模型，batch 仍是 false（四字段收口到 makeRow 的行为证明）', () => {
+      const researcher = batchBox(page.tree(), 'researcher');
+      researcher.box.props.onChange({ target: { checked: false } });
+      const model = selectOf(page.repaint(), 'researcher', '模型');
+      if (model === undefined) return '找不到 researcher 的模型下拉';
+      model.props.onChange({ target: { value: 'p1\u0000m1' } });
+      const after = batchBox(page.repaint(), 'researcher');
+      if (after === undefined || after.box.props.checked !== false) return '改模型把批量开关拨回了开';
+      return true;
+    });
+
+    check('统一开关：一次拨全部角色，且不动模型/强度/预设', () => {
+      const bulk = bulkBatchBox(page.tree());
+      if (bulk === undefined) return '找不到统一格';
+      bulk.box.props.onChange({ target: { checked: true } });
+      const after = page.repaint();
+      const bad = [];
+      for (const role of ROLES) {
+        const found = batchBox(after, role.id);
+        if (found === undefined || found.box.props.checked !== true) bad.push(role.id);
+      }
+      if (bad.length > 0) return '统一开后仍未勾选的角色：' + bad.join(' ');
+      const preset = selectOf(after, 'builder', 'agent 预设');
+      if (preset === undefined || preset.props.value !== 'ptc') return '统一批量把 builder 的预设改掉了：' + JSON.stringify(preset === undefined ? null : preset.props.value);
+      bulk.box.props.onChange({ target: { checked: false } });
+      const off = page.repaint();
+      const stillOn = ROLES.filter((role) => {
+        const found = batchBox(off, role.id);
+        return found === undefined || found.box.props.checked !== false;
+      }).map((role) => role.id);
+      if (stillOn.length > 0) return '统一关后仍在勾选的角色：' + stillOn.join(' ');
+      return true;
+    });
+
+    save();
+    await page.settle();
+    await page.settle();
+    check('保存时 batch:false 真的进了 payload（与模型/预设同在一行、互不挤掉）', () => {
+      const setCall = page.sent().filter((entry) => entry.op === 'set').pop();
+      if (setCall === undefined) return '没有发出 set 请求';
+      const roles = setCall.args.roles;
+      const scout = roles.scout;
+      if (scout === undefined || scout.batch !== false) return 'scout 的 batch:false 丢了：' + JSON.stringify(scout);
+      if (scout.provider !== undefined) return 'scout 不该带模型：' + JSON.stringify(scout);
+      const researcher = roles.researcher;
+      if (researcher === undefined || researcher.batch !== false) return 'researcher 的 batch:false 丢了：' + JSON.stringify(researcher);
+      if (researcher.provider !== 'p1' || researcher.model !== 'm1') return 'researcher 的模型丢了：' + JSON.stringify(researcher);
+      const builder = roles.builder;
+      if (builder === undefined || builder.preset !== 'ptc' || builder.batch !== false) return 'builder 两维没同时活下来：' + JSON.stringify(builder);
+      return true;
+    });
+
+    // 上一轮保存后组件按宿主回包重建草稿（fixture 回的是 roles:{}），这里正好从「全默认」起算。
+    check('拨开关再拨回去 = 不算未保存改动（默认值不留残骸行）', () => {
+      const found = batchBox(page.tree(), 'researcher');
+      if (found === undefined) return '找不到 researcher 的开关';
+      found.box.props.onChange({ target: { checked: false } });
+      const dirty = textOf(page.repaint());
+      if (dirty.includes('有未保存改动') === false) return '关掉批量没有产生未保存提示（这一维没进指纹？）';
+      const back = batchBox(page.tree(), 'researcher');
+      back.box.props.onChange({ target: { checked: true } });
+      const clean = textOf(page.repaint());
+      if (clean.includes('有未保存改动') === true) return '拨回默认（开）之后仍提示未保存：说明默认值被写成了显式行，配置会越长越脏';
+      return true;
+    });
+  }
   // ── 7) 加载失败路径 ───────────────────────────────────────────────────────
   {
     const page = await mount({

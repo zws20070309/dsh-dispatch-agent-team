@@ -1241,6 +1241,132 @@ async function main() {
     return true;
   });
 
+  // ── 7.10) 批量调用档（both）：2026-10-15 用户选路径 1 —— 在队员**自己的作用域**声明 presentAs
+  //
+  // 为什么这一节必须用**真 dsh-tools**：「ptc 把送给模型的工具裁成一个 run_code」这件事只有
+  // 官方那份 wireSchemas 能证明（dsh-tools/lib/index.js:2831-2848），而「自己那一层压得住
+  // 预设那一层」也只有官方 modeFor + 真 ScopedLayers 能证明（:2767-2774 + dsh-scope:155-169）。
+  // 上面 §7.9 的 fake 注册表只管组合继承，管不到呈现档。
+  {
+    check('守卫先跑对：没有 ptcRuntime 时安装路径不开这一档，并留下一条点名的诊断', () => {
+      const lines = runtime.notes().join('\n');
+      if (!lines.includes('批量调用（both）未开启')) return '安装路径没记「批量调用未开启」这条诊断（守卫没跑？）';
+      if (!lines.includes('ptcRuntime')) return '诊断没点名 ptcRuntime，用户照着改不了：' + lines.slice(-320);
+      return true;
+    });
+
+    // 现在把 PTC 运行时补进部署面（官方 requirePtcRuntime 读的就是这个服务名）。
+    root.plugin({
+      name: 'fake-ptc-runtime',
+      apply(ctx) {
+        ctx.provide('ptcRuntime', {
+          language: 'typescript',
+          resolve: (spec) => spec,
+          run: async () => ({ output: '', diagnostics: [] }),
+        });
+      },
+    });
+    await tick();
+    if (root.get('ptcRuntime') === undefined) {
+      console.error('[integration-test] 假 ptcRuntime 没起来：ctx.provide 的语义或 root.plugin 的时机变了。');
+      process.exit(2);
+    }
+
+    const wireOf = (scopeKey) => root.get('tools').wireSchemas(scopeKey);
+
+    // 纯 ptc 的对照组合：一份 preset 作用域声明 ptc，一名队员挂在它下面。
+    const ptcStandKey = { name: 'stand-ptc-presentation' };
+    const ptcStandScope = createScope(root, ptcStandKey);
+    ptcStandScope.ctx.get('tools').register(syntheticTool('stand_native_tool'));
+    ptcStandScope.ctx.get('tools').presentAs('ptc');
+    const mateFKey = { name: 'stand-member-f' };
+    const mateFScope = createScope(root, mateFKey, { parent: ptcStandKey });
+    mateFScope.ctx.get('tools').register(syntheticTool('mate_own_tool'));
+
+    check('对照基线：纯 ptc 档送给模型的工具真的只剩 run_code（用户截图「移除 35 个」那一行）', () => {
+      const names = wireOf(mateFKey).knownNames;
+      if (names.length !== 1 || names[0] !== 'run_code') return 'ptc 档没把工具裁成一个：' + names.join(', ');
+      return true;
+    });
+
+    check('在队员自己那一层声明 both：原生工具全部回来，run_code 也留着', () => {
+      mateFScope.ctx.get('tools').presentAs('both');
+      const names = wireOf(mateFKey).knownNames;
+      if (!names.includes('run_code')) return 'both 档丢了 run_code（批量能力就没了）：' + names.join(', ');
+      if (!names.includes('stand_native_tool')) return 'both 档没把继承面的工具放回来：' + names.join(', ');
+      if (!names.includes('mate_own_tool')) return 'both 档丢了队员自有工具：' + names.join(', ');
+      return true;
+    });
+
+    // 本文件的 check **不等 Promise**（与 selftest 不同）：要 await 的东西一律在外面先取好。
+    const bothPrompt = await promptOf(mateFKey);
+    const ptcPrompt = await promptOf(ptcStandKey);
+
+    check('both 档不再教模型「只能直接调 run_code」（PTC_ONLY 段只属于 ptc 档）', () => {
+      // 官方那句的原文在 dsh-tools/lib/index.js:2517：'run_code is the only tool you can call directly …'。
+      // 判据取它**独有**的片段；别拿报错文案里的 'callable directly' 当钥匙（第一版就是这么写错的，
+      // 症状是「正向断言假通过 + 负对照报空转」）。
+      const PTC_ONLY = 'is the only tool you can call directly';
+      if (bothPrompt.includes(PTC_ONLY)) return 'both 档的提示词里出现了 ptc-only 那句：模型会被它误导';
+      if (!ptcPrompt.includes(PTC_ONLY)) return '负对照不成立：ptc 档里也没有那句，本条断言是空转的';
+      return true;
+    });
+
+    check('both 档仍然拿到 SDK 段（程序内 tools.x() 的说明书，批量能力靠它）', () => {
+      if (!bothPrompt.includes('mate_own_tool') && !bothPrompt.includes('run_code')) {
+        return 'both 档的提示词里没有 SDK/工具声明：' + bothPrompt.slice(0, 200);
+      }
+      return true;
+    });
+
+    // 真安装路径：装了 ptcRuntime 之后，agent/created 上的 applyMemberBatch 必须自己把这一档声明上。
+    const mateEKey = { name: 'stand-member-e' };
+    const mateEScope = createScope(root, mateEKey);
+    const mateESession = makeStandSession('stand-verify-e', 'dispatch-mode', false);
+    const mateE = { id: 'stand-verify-e', ctx: agentCtx(mateEScope.ctx), options: {}, session: mateESession };
+    agents.push(mateE);
+    membershipById.set(mateE.id, { root: standLead, id: mateE.id, role: 'teammate', name: 'verify' });
+    joinOrRebind(mateE.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateE });
+    await tick();
+    await tick();
+    await tick();
+
+    check('真安装路径：默认开的一档让队员的 wire 里同时有 run_code 与团队工具', () => {
+      const names = wireOf(mateEKey).knownNames;
+      if (!names.includes('run_code')) return '安装路径没把 both 档声明上（wire 里没有 run_code）：' + names.join(', ');
+      if (!names.includes(roster.REPORT_TOOL_NAME)) return 'both 档下团队工具 report_result 不见了：' + names.join(', ');
+      return true;
+    });
+
+    // 关掉批量的角色：先落配置、再派队员，最后同步断言（同上，check 不等 Promise）。
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { scout: { preset: 'standard', batch: false } },
+    });
+    const mateGKey = { name: 'stand-member-g' };
+    const mateGScope = createScope(root, mateGKey);
+    const mateGSession = makeStandSession('stand-scout-g', 'dispatch-mode', false);
+    const mateG = { id: 'stand-scout-g', ctx: agentCtx(mateGScope.ctx), options: {}, session: mateGSession };
+    agents.push(mateG);
+    membershipById.set(mateG.id, { root: standLead, id: mateG.id, role: 'teammate', name: 'scout' });
+    joinOrRebind(mateG.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateG });
+    await tick();
+    await tick();
+    await tick();
+
+    check('角色显式关掉批量：新队员的 wire 里就不该有 run_code（关掉 = 完全沿用预设自己的档）', () => {
+      const names = wireOf(mateGKey).knownNames;
+      if (names.includes('run_code')) return 'batch:false 的角色还是拿到了 run_code（开关没接上）：' + names.join(', ');
+      if (!names.includes(roster.REPORT_TOOL_NAME)) return '关掉批量把团队工具也弄丢了：' + names.join(', ');
+      return true;
+    });
+
+    // 这一节改过配置，后面的路由层断言要从干净状态起算。
+    await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
+
+  }
   // ── 队员预设：路由层的形状与白名单（2026-10-15）────────────────────────────
   const presetSaved = await callApi('POST', GATE, {
     op: 'set',

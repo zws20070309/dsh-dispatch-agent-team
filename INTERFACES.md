@@ -213,7 +213,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2465`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2574`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
@@ -538,6 +538,58 @@ own 层团队工具不受伤、会话日志落了 `agent-preset/selected` 且投
 id 没装时降级并留诊断。路由层另有 5 条（只配预设能落盘 / 读回来一致 / 可用性表形状 /
 白名单外拒绝 / `roles` 整表替换语义）。`drift-check` 8 条钉住上面引用的每一处官方实现。
 
+### 3.7 队员的批量调用档（both，2026-10-15 用户选路径 1）
+
+官方把「工具怎么呈现给模型」做成**三档**，本插件只在队员自己的作用域上换这一档，不开新预设、不改任何官方文件。
+
+| 档 | 送给模型的工具 | 直调别的工具 | run_code | PTC_ONLY 那句提示词 |
+|---|---|---|---|---|
+| native | 全部 | 可 | **没有** | 无 |
+| ptc | 只有 run_code | **报 unknown tool** | 有 | 有 |
+| both | 全部 **+** run_code | 可 | 有 | 无 |
+
+证据（本轮实读 asar，路径都是 dsh-tools/lib/index.js）：三档的 Config 在 :2665-2672；
+wireSchemas 的三个分支在 :2831-2848（ptc 是 schemas.filter(name === RUN_CODE_NAME)，
+both 是 knownNames: [...view.knownNames, RUN_CODE_NAME]）；run_code 只在非 native 时注入（:2979）；
+报错抛出点 :3185、判据 collapses() :3099-3100（**只有 ptc 档会折叠直调**）；
+PTC_ONLY_INSTRUCTION :2517 且 both 渲染为空（:2725 官方注释原话
+「both renders empty: native calls do execute there, so the rule is false」）。
+
+**三条规则**：
+
+1. **默认开**。配置里没有 batch 键 = 开，只有显式 batch: false 才关（roleBatchOn 判 !== false）。
+   老配置因此零迁移。关掉 = 完全沿用所选预设自己的档（选 PTC 就是纯 PTC），这是「关」唯一的诚实语义。
+2. **声明在队员自己那一层**：agent.ctx.tools.presentAs('both')（:2810）。它压得住预设那层的 ptc，
+   依据是 modeFor 从作用域链**尾部**往前取第一个声明（:2767-2774）+ chainLayers 的顺序
+   「farthest ancestor first and the exact scope last」（dsh-scope/lib/index.js:155-169）。
+   与 §3.6 的预设重绑**互不依赖**：重绑换的是祖先层，这里写的是自己那层。
+3. **守卫：没有 ptcRuntime 就不声明**。官方在**装配期**才要它（requirePtcRuntime :2863-2865 抛
+   mode "both" requires a PTC runtime），而那句跑在 systemPrompt.assemble 里面 —— 后果是这名队员
+   **每一次请求都失败**，比不开这一档糟得多。所以 applyMemberBatch 先 pick(ctx, 'ptcRuntime') 探一次，
+   探不到就记一条点名原因的诊断（integration-test §7.10 有这条负对照：把守卫反过来写，测试当场崩在官方那句错上）。
+
+**代价（必须让用户看见）**：both 会注册 SDK 段（sdkSection :2745-2757，按作用域现生成）。
+真机实测同一名队员的系统提示词 7,821 字 → 45,874 字（session-94195680 的两名 ptc 队员）。
+这一段进缓存前缀，跨队员按 (预设, 模型) 分组共享。
+
+**MCP 工具（用户 2026-10-15 点名要考虑）**：MCP 服务器的工具由
+@deepseek-ai/dsh-mcp-client/lib/index.js:153 的 ctx.tools.register(definition) 注册进**该行所在的作用域**；
+本机 profiles/desktop/cordis.patch.yml:58-73 的 mcp-matlab 是**顶层行**，所以落在 host/全局层
+→ Lead 与所有队员都继承得到，公开名 mcp__<serverName>__<tool>（:131）。以后新加 MCP 走同一条路，
+**本插件不需要改任何代码**。呈现档只影响怎么用：ptc 下只能在 run_code 程序里 await tools.mcp__matlab__x(...)
+（SDK 段列的是 view().visible 全量，:3027 sdkSchemas）；both 下**直调与程序内调用两条路都在**。
+真机现状（2026-10-15 实测，别当成「已生效」）：MATLAB MCP 进程在跑（PID 42384/54328），
+历史日志里 mcp__matlab__* 出现在 13,487 次请求中（37 个名字齐全），但**今天这个进程里 Lead 与 4 名队员
+的 wire 都没有它**，只剩 list_mcp_resources 那三个资源工具 —— 即「服务器活着、工具没注册进本进程」，
+与呈现档无关，是另一条待查项。
+
+**已知缺陷（未修，别算进这一档的账）**：§3.6 的预设重绑落在队员**第一个请求之后**
+（真机 seq=7 agent-preset/selected → seq=13 request/header 仍是 35 个工具 → seq=26 才剩 1 个）。
+select() 是先 await recompose() 再落事件（registry :760-761），所以换挂载本身已完成，
+晚生效的原因在装配侧（两个候选：presentAs 只赋 layer.mode 不发 tools/change，或 agent-loop 在回合起点快照工具表）。
+批量档默认开时**恰好掩盖**它：第一发就是 both（自己那层、同步声明），所以看不到「旧档」的现象。
+根因未钉死前不许说已修。
+
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
 九个工具的**蓝本是官方 0.1.7 源码**（照抄，不要自创）：
@@ -811,6 +863,15 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
    否则 Windows 的 −□× 点不动（与 `.ws-drawer` 同一条理由）。三条硬规矩：按钮点击要 `stopPropagation`
    （否则同一次点击顺带把那一行折叠掉，面板一闪就没）、Esc **先**关面板再关抽屉、关抽屉顺手关面板。
    闸门：`tools/selftest.cjs` 那条「放大查看」，五处各做过变异（改坏 → 各自报出各自的原因）。
+ - **批量调用开关是第四维，且**不**摞进下拉那一列**（用户 2026-10-15 的版面要求）：它是
+   `.dat-row` 的**直接子节点**、位于 `.dat-role` 与 `.dat-ctl` 之间（正好填掉原来那块空白）。
+   默认打勾（`batch` 缺省 = 开，只有显式 `false` 才关，所以「关」才落键、配置不会越长越脏）；
+   统一那一格的判据是「**全部角色都开才打勾**」，不一致时旁边写一句原因（可以不准，不许静默）。
+   闸门：`tools/client-smoke-test.cjs` §11 七条（读回来=显示、同级、开关往返、脏标记回得去）。
+ - **草稿行只有一个构造口 `makeRow(key, effort, preset, batch)`**：加第四维时把原先散在 14 处的
+   对象字面量全部收进来。selftest 那条闸门因此从「禁两字段形状」升级成「禁任何绕过 makeRow 的
+   行字面量」—— 判据是十几条**字面文本**而不是正则（正则的转义在多层 here-string 里被吃掉过）。
+
 - **绝对不要**：写 `context.mutate` 之外的通道、注入本包没声明的服务、import 本包没声明的模块。
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
@@ -916,6 +977,16 @@ URL 级事实：**必须**用 `key: '@zws/dsh-dispatch-agent-team'`；`view: 'su
    后三条根本没测到。正确形状：先存一份真正的干净副本，每轮 `restore → mutate(单点) → 跑 → restore`，
    并且核对**失败消息的文字**是不是这一轮该报的那条（只看到 FAIL 不算，它可能是别的变异留下的）。
    同一份脚本还要在「needle 没命中」时响亮失败（`NEEDLE MISS`），否则就是空跑一轮绿。
+ - **别拿「报错文案」当「提示词判据」的钥匙**（2026-10-15 实犯）：`integration-test` §7.10 第一版
+   用 `callable directly` 判「PTC_ONLY 那句在不在」—— 那是**运行时报错**里的词（dsh-tools:2545），
+   提示词里那句官方原文是 `is the only tool you can call directly`（:2517）。结果正向断言假通过，
+   只有我特意加的**负对照**（"ptc 档里必须能看到这句"）报了「本条断言是空转的」才现形。
+   教训两条：① 判据字符串必须从**它要判的那个载体**里抄，不能从相邻现象抄；② 每条这类断言都配一个
+   反向基线，「应该出现的没出现」要能自己喊出来 —— 没有负对照，判据漂了就是一台永绿的机器。
+ - **加第 N 个维度之前，先把散落的构造点收成一个构造口**：草稿行从 14 处字面量收成 `makeRow` 一处，
+   第四维才敢加。否则每加一维都要人肉找齐 14 处、再写 14 条字面量闸门，而漏一处的表现是
+   「界面正常、保存回执正常、下次载入才发现配置没了」—— 最难查的那一类。
+
 - 只写自己名下的文件；**不要**动别人名下的文件，也不要动本文件与已冻结文件。
 - 每个 JS 文件写完后跑 `node --check <file>`（`lib/client.js` 会被 `node --check` 当作 CJS，
   它用了 `window`——用 `node --check` 仍可语法校验，若要更稳可只跑语法检查不看运行）。
