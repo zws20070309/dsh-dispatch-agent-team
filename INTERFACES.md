@@ -104,6 +104,8 @@ export const LEAD_ONLY_TEAM_TOOL_NAMES;   // ['spawn_teammate','interrupt_agent'
 export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减去上面两个，再加队员专用的 report_result 与 ask_lead
 export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）。**不许含 'skill'**：见 §3.5
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
+export const TEAMMATE_PRESET_IDS;         // 2026-10-15：可指派给队员的 agent preset id 白名单（用户定案：只放 ptc / standard / minimal-grayscale）。
+                                          //    存 id 不存显示名（注册表只回 id，名字是官方客户端本地化的）；配置里空 = 跟随 Lead。详见 §6 末「队员预设」。
 // 以下 4 个是 2026-09-30 起的既有导出（工具名与 Lead 名单的真值都在这里）：
 export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
 export const REPORT_TOOL_NAME;            // 'report_result'（队员专用）
@@ -134,6 +136,9 @@ export function nextTeammateName(role, taken);
 export function defaultConfig();    // {version, roles:{}}
 export function sanitizeConfig(raw, log?);   // 永不抛错；坏字段丢弃并 log(msg)
 export function resolveRoleRoute(config, role); // {provider,model,reasoningEffort?}|undefined
+export function resolveRolePreset(config, role); // -> preset id | undefined（undefined = 跟随 Lead，不重绑）。
+                                          //    与 resolveRoleRoute 的关键差别：模型/强度每请求实时读，preset **只在派队员那一刻读一次**
+                                          //    （官方 select() 在会话已开播时抛 agent-preset/locked）。
 export function resolveMemberRoute(explicitRoute, roleRoute, explicitEffort);
     // -> {provider,model,reasoningEffort?}|undefined；2026-10-01 修复的优先级：显式参数 >
     //    角色配置 > 两者都无(=undefined=跟随 Lead)。钉子**只**由显式参数产生（lib/runtime.js），
@@ -225,6 +230,9 @@ export function peekConfig();                    // -> 最近一次成功读到�
 export async function saveConfig(ctx, raw);      // -> {ok:true, config} | {ok:false, error:string}
                                                  //    净化后原子落盘（write tmp + rename），并立即更新 peekConfig()
 export async function listModelCatalog(ctx);     // -> {groups:[{id,name,models:[{id,name,reasoning?:{efforts:[{id,name}],defaultEffort?}}]}], failures:[]}
+export async function listTeammatePresets(ctx);  // 2026-10-15：-> {presets:[{id,name,available,reason,detail?}], notes:string[]}
+                                                 //    白名单三个 id 乘 注册表现状：现读 agentPresets.list() 并筛掉 broken（与官方选择器同源），
+                                                 //    只发事实（reason = not-registered / broken / 空），句子由页面拼；永不抛错。
 export async function preflightRoute(ctx, route);// -> {ok:boolean, route, diagnostics:string[]}
                                                  //    有 reasoningEffort 但该模型未广告 / 不在列表里 => 丢掉该字段并记 diagnostics，
                                                  //    route 仍可用（ok 保持 true）。provider/model 无法解析 => ok:false。
@@ -454,7 +462,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:537`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:561`）。
    注意 `lib/tools.js:671-675` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
