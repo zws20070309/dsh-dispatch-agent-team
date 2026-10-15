@@ -208,7 +208,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2421`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2465`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
@@ -796,6 +796,16 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
   不可用的 id **留着并禁用 + 括号写原因**，不藏（藏起来只会让人以为功能坏了）；宿主没带这张表时整列
   禁用并给出唯一原因。草稿行是 `{key, effort, preset}` 三字段对象，被 8 处重新构造 ——
   **任何一处漏带一个字段就是静默丢配置**，所以 `tools/selftest.cjs` 直接禁掉两字段形状。
+ - **配置页的下拉一律是 `.dat-bulk-ctl` / `.dat-ctl` 的**直接子节点**（2026-10-15 用户报「总控页面空白太多」）**：
+   少一个闭括号时 React 把第三列塞进第二列里面，**一句不报**，坏的只有版面（flex 容器少一格 → 左边与中间
+   各空出一整块）。判据在 `tools/client-smoke-test.cjs` §10，用的是 `node.props.children`（同级），
+   **不是** `findAll`（后代）—— 后代搜索对套娃免疫，§9 那批定位全用 findAll，所以这个 bug 一路溜到用户面前。
+ - **工具调用的展开层不许再写死尺寸**：`.dbox` 高度是 `min(52vh,480px)`（随视口），每块展开层顶上有一颗
+   「放大查看」（`wsOpenDetailZoom`）。面板**挂在 `.dat-ws` 根节点**而不是抽屉里 —— 抽屉带 `transform`，
+   固定定位的后代在它内部会改成相对抽屉定位，宽度照样被夹死；顶边必须让出 `--dat-chrome-top`，
+   否则 Windows 的 −□× 点不动（与 `.ws-drawer` 同一条理由）。三条硬规矩：按钮点击要 `stopPropagation`
+   （否则同一次点击顺带把那一行折叠掉，面板一闪就没）、Esc **先**关面板再关抽屉、关抽屉顺手关面板。
+   闸门：`tools/selftest.cjs` 那条「放大查看」，五处各做过变异（改坏 → 各自报出各自的原因）。
 - **绝对不要**：写 `context.mutate` 之外的通道、注入本包没声明的服务、import 本包没声明的模块。
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
@@ -896,6 +906,11 @@ URL 级事实：**必须**用 `key: '@zws/dsh-dispatch-agent-team'`；`view: 'su
   而**本仓库也有** `lib/index.js` —— 行号闸门按本仓库解释，于是把我引到「符号对得上但指的是
   另一处同名调用」的错上（`apply()` 的 `loadConfig` 预热在 :490，我引的 :250 是路由里另一处）。
   规矩：官方的一律写 `dsh-xxx/lib/index.js:NNN`；本仓库的才允许裸路径。
+ - **变异测试必须每轮从干净副本还原**（2026-10-15 自己犯的）：我写的变异脚本每次 `apply` 都把「当前文件」
+   备份成 clean，于是第二轮之后备份里已经带着上一轮的破坏 —— 四条变异跑完只报出**第一条**的原因，
+   后三条根本没测到。正确形状：先存一份真正的干净副本，每轮 `restore → mutate(单点) → 跑 → restore`，
+   并且核对**失败消息的文字**是不是这一轮该报的那条（只看到 FAIL 不算，它可能是别的变异留下的）。
+   同一份脚本还要在「needle 没命中」时响亮失败（`NEEDLE MISS`），否则就是空跑一轮绿。
 - 只写自己名下的文件；**不要**动别人名下的文件，也不要动本文件与已冻结文件。
 - 每个 JS 文件写完后跑 `node --check <file>`（`lib/client.js` 会被 `node --check` 当作 CJS，
   它用了 `window`——用 `node --check` 仍可语法校验，若要更稳可只跑语法检查不看运行）。
