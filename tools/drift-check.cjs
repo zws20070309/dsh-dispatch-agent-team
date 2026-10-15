@@ -1206,7 +1206,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 12g) skill：队员必须保留它，且官方「工具可见性 ↔ 技能目录」的绑定必须仍然成立。
     //
     // 为什么要有这一组（2026-10-07）：`skill` 由 preset 行带来（presets/dispatch-mode.patch.yml:142-146），
-    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:472-482），所以队员天然能用 —— 这件事此前**零闸门**。
+    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:537），所以队员天然能用 —— 这件事此前**零闸门**。
     // 失效方式与 2026-10-07 修掉的「/team 静默拒收附件」同类：插件照常加载、/team 照常可用，
     // 只是全队再也不会用技能（目录不注入 = 模型不知道有哪些技能，工具还在也等于没用）。
     // 官方实现是**两处**共同决定的，所以这里分两条钉：判据（工具身份比较）+ 事件作用域（按 agent 过滤）。
@@ -1520,6 +1520,166 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     }
     // 官方长度上限：>64 才拒（memberName 里是 value.length > 64）。
     if (!/value\.length > 64/u.test(official)) return '官方的 64 长度上限不见了这个形状，lib/roster.js 的对应判断要重核';
+    return true;
+  });
+
+  check('工具行标签表与官方 locale 逐字一致（zh 与 en 两侧都比对）', () => {
+    // lib/graph.js 的 OFFICIAL_TOOL_TITLES / _EN 是浮窗里每一行工具调用的标签。
+    // 用户 2026-10-09 的原话就是「一定要正确，和我用官方的对话框没太大区别」，
+    // 所以这两张表**必须是官方 locale 的真值**，不是我觉得顺手的措辞 ——
+    // 而「是官方真值」这件事不能靠注释里写一句「脚本抽的」就成立（注释会过时，
+    // 代码不会）。这里逐键逐值比对，官方改了我们就红。
+    const conv = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js') || '';
+    if (conv === '') return '读不到 dsh-client-ui-conversation/lib/client.js';
+    // 官方 locale 块里每个 key 出现两次：先 zh 后 en。判据不靠顺序猜：
+    // 两份都必须**恰好**出现一次（第三份=官方加了新语言，要人工决定跟哪份）。
+    const pairs = new Map();
+    const re = /"tool\.title\.([A-Za-z]+)":\s*"([^"]*)"/g;
+    let m;
+    while ((m = re.exec(conv)) !== null) {
+      if (!pairs.has(m[1])) pairs.set(m[1], []);
+      pairs.get(m[1]).push(m[2]);
+    }
+    if (pairs.size === 0) return '官方 locale 里找不到任何 tool.title.*（键的写法变了？抽表脚本与这条都要重核）';
+    const officialZh = new Map();
+    const officialEn = new Map();
+    for (const [key, values] of pairs) {
+      if (values.length !== 2) {
+        return `官方 tool.title.${key} 出现 ${values.length} 次（预期 zh/en 各一次），两侧语言无法确定`;
+      }
+      const [a, b] = values;
+      const aCjk = /[\u4e00-\u9fff]/.test(a);
+      const bCjk = /[\u4e00-\u9fff]/.test(b);
+      // 一份必须含中文、一份必须不含 —— 否则就是官方换了语言数，不能靠位置猜。
+      if (aCjk === bCjk) return `tool.title.${key} 的两份值语言属性相同（${a} / ${b}），无法判定哪份是 zh`;
+      officialZh.set(key, aCjk ? a : b);
+      officialEn.set(key, aCjk ? b : a);
+    }
+    const graphText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'graph.js'));
+    if (graphText === '') return '读不到 lib/graph.js';
+    const parse = (name) => {
+      const at = graphText.indexOf('const ' + name + ' = {');
+      if (at < 0) return null;
+      const end = graphText.indexOf('\n};', at);
+      if (end < 0) return null;
+      const out = new Map();
+      const inner = graphText.slice(at, end);
+      for (const kv of inner.matchAll(/([A-Za-z]+):\s*'([^']*)'/g)) out.set(kv[1], kv[2]);
+      return out;
+    };
+    for (const [tableName, official] of [['OFFICIAL_TOOL_TITLES', officialZh], ['OFFICIAL_TOOL_TITLES_EN', officialEn]]) {
+      const mine = parse(tableName);
+      if (mine === null) return `lib/graph.js 里找不到 ${tableName}（改名或换写法了？同步这条闸门与抽表脚本）`;
+      // 别名表 TOOL_TITLE_ALIAS 指向的是**同两张表的键**，键集合比对只看这两张表本身。
+      const ghost = [...mine.keys()].filter((k) => !official.has(k));
+      const missing = [...official.keys()].filter((k) => !mine.has(k));
+      if (ghost.length > 0) return `${tableName} 里有官方没有的键：${ghost.join(', ')}（自造标签=与官方对话框不一样）`;
+      if (missing.length > 0) return `官方新增了 ${missing.join(', ')}，${tableName} 没跟上了`;
+      const driftKeys = [...mine.keys()].filter((k) => mine.get(k) !== official.get(k));
+      const drift = driftKeys.map((k) => k + ': 本插件「' + mine.get(k) + '」/ 官方「' + official.get(k) + '」');
+      if (drift.length > 0) return `${tableName} 与官方文案不一致：${drift.join(' | ')}`;
+    }
+    // 两侧键集合必须相同：少一个键，另一种语言就查不到、回退成工具原名。
+    const zhTable = parse('OFFICIAL_TOOL_TITLES');
+    const enTable = parse('OFFICIAL_TOOL_TITLES_EN');
+    // （箭头函数体不加花括号时，换行后的 .concat 会挂到 has(k) 的返回值上 —— 布尔没有 concat。
+    //  同一个笔误我在这条闸门里犯了两次，写成分行表达式就得加括号。）
+    const onlyZh = [...zhTable.keys()].filter((k) => !enTable.has(k));
+    const onlyEn = [...enTable.keys()].filter((k) => !zhTable.has(k));
+    const asym = onlyZh.concat(onlyEn);
+    if (asym.length > 0) return '两张表键集合不相等：' + asym.join(', ');
+    return true;
+  });
+
+  // ── 本轮（弹窗等价 + i18n）新依赖的官方实现 ─────────────────────────────
+  // 这些都是**我们照着抄/照着判**的形状。官方一改，我们的失败方式是静默的
+  // （标签查不到、展开层空白、停止键没了、语言不切），所以每条都要钉。
+  check('官方工具行：resultText / formatToolBody / toolRowModel / expandable 四个形状仍在', () => {
+    const tool = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-tool/lib/client.js') || '';
+    if (tool === '') return '读不到 dsh-client-ui-tool/lib/client.js';
+    // lib/graph.js 的 resultText/formatToolBody 是这两个函数的**移植**（同输入同输出）。
+    for (const needle of ['function resultText(', 'function formatToolBody(', 'function toolRowModel(']) {
+      if (!tool.includes(needle)) return '官方少了 ' + needle + ' —— graph.js 的同名移植失去了依据，必须重读官方实现';
+    }
+    // 「有没有得展开」官方是这么判的（我们据此决定给不给箭头）：
+    if (!tool.includes('const expandable = state !== "preparing"')) {
+      return '官方 expandable 的判据变了（原：state !== "preparing" 且有输入/输出/卡片）—— 弹窗的箭头给法要重核';
+    }
+    return true;
+  });
+
+  check('官方没有「成串工具调用折叠成一组」这回事（我们那个组是自己加的）', () => {
+    // 2026-10-14 我曾断言「官方也是把成串工具调用收进一个可展开组」—— 实读后**错了**：
+    // 官方逐条渲染（ToolCallTree 在 dsh-client-ui-tool 里存在， ActivityGroup /
+    // ToolCallGroup / collapseTool 三个包里都是 0 次）。既然折叠组是本插件自己的
+    // 产品判断，那组里的每一条必须**可达**（点开能看见），否则就是藏信息。
+    // selftest 的另一条钉的是「组里有 rows、句子在客户端拼」，这条钉的是外部依据：
+    // 哪天官方真加了折叠，我们要改的是**对齐官方**而不是继续自造。
+    const tool = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-tool/lib/client.js') || '';
+    const conv = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js') || '';
+    if (tool === '' || conv === '') return '读不到官方 tool/conversation bundle';
+    for (const needle of ['ActivityGroup', 'ToolCallGroup', 'collapseTool']) {
+      if (tool.includes(needle) || conv.includes(needle)) {
+        return '官方新增了 ' + needle + '（工具折叠机制）—— 本插件的 toolgroup 应当改为对齐官方而不是自成一派';
+      }
+    }
+    if (!tool.includes('ToolCallTree')) return '官方 ToolCallTree 不见了（工具行渲染大改）—— 弹窗的工具行口径要整体重读';
+    return true;
+  });
+
+  check('官方 MarkdownText 流式期间也渲 markdown（弹窗那句「官方流式是纯文本」的依据已订正）', () => {
+    const prim = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/index.js') || '';
+    if (prim === '') return '读不到 dsh-client-ui-primitives/lib/index.js';
+    if (!prim.includes('streaming = false')) return 'MarkdownText 的 streaming 形参默认值形状变了';
+    if (!prim.includes('new StreamingRenderer')) return '官方流式渲染器 StreamingRenderer 不见了（半截语法的表现要重判）';
+    const chat = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js') || '';
+    // 官方正文/思考确实把它打开：streaming: running（chat-client.js:5822/:5911/:6005）。
+    if (chat !== '' && !chat.includes('streaming: running')) {
+      return '官方不再传 streaming: running —— 弹窗「流式期间也走 markdown」的依据要重核';
+    }
+    return true;
+  });
+
+  check('停止生成走的那条路：cancel() 仍按 address 分流 interruptByParent / session.cancel', () => {
+    // 弹窗那颗停止键调的是**官方 session.cancel()**（不是插件自己的通道）。
+    const cli = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js') || '';
+    if (cli === '') return '读不到 dsh-api-session-controller/lib/client.js';
+    if (!cli.includes('async cancel()')) return 'session.cancel() 不在了 —— 弹窗的停止键必须换通道';
+    if (!cli.includes('interruptByParent')) return 'cancel() 不再走 subagents.interruptByParent 分流（子会话寻址口径变了）';
+    // 「在跑」的真值也在这份文件里：this.running 由 :1971-1972 写。
+    if (!cli.includes('this.running = running')) return 'running 字段的写法变了 —— 按钮显隐判据（session.running）要重读';
+    return true;
+  });
+
+  check('计划审批的匹配键：plan-review / Approve / Keep planning 三个常量逐字未变', () => {
+    // 弹窗按计划判「批准」时发的批次必须与官方读取端**逐字**一致，
+    // 否则官方 :289 那一串比较不通过，计划会永远停在「等批准」。
+    const plan = asar.read('dsh/node_modules/@deepseek-ai/dsh-plan-mode/lib/index.js') || '';
+    if (plan === '') return '读不到 dsh-plan-mode/lib/index.js';
+    for (const needle of [
+      'const REVIEW_ID = "plan-review"', 'const APPROVE_LABEL = "Approve"',
+      'const KEEP_PLANNING_LABEL = "Keep planning"', 'entry.id === REVIEW_ID',
+      'item.selected[0] !== APPROVE_LABEL', 'item.custom !== void 0',
+    ]) {
+      if (!plan.includes(needle)) return '官方计划审批的判据少了「' + needle + '」—— 弹窗发的答案批次要按新判据重写';
+    }
+    // 这三个字符串是**协议**，不是文案：插件的 PLAN_REVIEW 常量必须保持官方英文原样。
+    const graph = readFileOr(path.join(PLUGIN_DIR, 'lib', 'graph.js'));
+    for (const needle of ["id: 'plan-review'", "'Approve'", "'Keep planning'"]) {
+      if (!graph.includes(needle)) return 'lib/graph.js 的计划常量不再逐字等于官方（' + needle + '）';
+    }
+    return true;
+  });
+
+  check('官方 locale 面：bind / getSnapshot / subscribe 三个方法仍给插件用', () => {
+    // i18n 的全部改动压在这三个方法上（localeText 查 bind，active 读 getSnapshot，
+    // 重刷靠 subscribe）。少任何一个，浮窗就退回「恒读 zh」或「切语言不重画」。
+    const loc = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-locale/lib/client.js') || '';
+    if (loc === '') return '读不到 dsh-client-locale/lib/client.js';
+    for (const needle of ['getSnapshot() {', 'subscribe(fn) {', 'bind(ns) {']) {
+      if (!loc.includes(needle)) return '官方 locale 少了 ' + needle + ' —— localeText/wsRelanguage 的依据要重读';
+    }
+    if (!loc.includes('active: this.resolveActive()')) return '快照里的 active 取法变了（弹窗按它判中英）';
     return true;
   });
 

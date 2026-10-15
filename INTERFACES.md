@@ -120,6 +120,12 @@ export function annotateTruncatedMembers(rows, truncatedIds);
 export const RETRY_DIAGNOSTIC_PREFIX;     // '最近一次请求被宿主自动重试：'（同样进成员行 diagnostics）
 export function annotateRetriedMembers(rows, retryBy);
                                     // -> 新数组；有重试记录的队员行追加该前缀 + 摘要，不改入参
+// 2026-10-14 新增（任务板闭环；现场 session-00001000，见 §2.1 的预算上调记录）：
+export const BOARD_CLOSURE_PREFIX;        // '任务板未闭环 '（进 Lead 行与 wait_agent 的 diagnostics）
+export const BOARD_CLOSURE_ID_LIMIT;      // 6：提示里最多点名的条目数
+export function boardClosureNote(tasks, idLimit?);  // -> 一句提示 | undefined（全闭环或读不到）；纯函数
+export function annotateBoardClosure(rows, note);
+                                    // -> 新数组；只把 note 追加到 role==='lead' 那一行的 diagnostics，不改入参
 export function askLeadMessage(question, blocking);  // -> 投递给 lead 的正文（含固定前缀）
 export function deriveRole(name);   // 'verify-2' / 'verify-deep' -> 'verify'（最长角色前缀）；
                                     // 形状不是官方队员名 -> undefined（'scout-' / 'Scout' / 'lead'）
@@ -156,11 +162,11 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 
 | 文本 | 预算 | 当前 | 谁在读 |
 |---|---|---|---|
-| `PLAYBOOK` | ≤ 4000 | **3988** | 调度模式的**每一次**请求（Lead） |
-| `TEAM_POLICY` | ≤ 800 | **758** | 团队开启后的 Lead |
-| `TEAMMATE_CARD` | ≤ 1250 | **1199** | 每个队员的固定前缀 |
-| Lead 侧合计 | ≤ 5000 | **4746** | |
-| 队员侧合计（卡 + 角色简报） | ≤ 1650 | **1574** | 简报是第一条 user 消息，同样进前缀 |
+| `PLAYBOOK` | ≤ 4250 | **4214** | 调度模式的**每一次**请求（Lead） |
+| `TEAM_POLICY` | ≤ 880 | **841** | 团队开启后的 Lead |
+| `TEAMMATE_CARD` | ≤ 1400 | **1365** | 每个队员的固定前缀 |
+| Lead 侧合计 | ≤ 5150 | **5055** | |
+| 队员侧合计（卡 + 角色简报） | ≤ 1800 | **1732** | 简报是第一条 user 消息，同样进前缀 |
 
 > 2026-10-09 上调上限（3800→3900、1150→1200、合计 4900→5000 / 1550→1600）：新增用户要求的
 > PTC 借鉴纪律（批量取证 / 先过滤后汇报），并修回同一次压缩中**误删的细节**（URL、「不知道就说
@@ -177,6 +183,30 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 同时 `presets/dispatch-mode.patch.yml` 的 `tool-ask-user.timeout` 从 600 改为 **-1**：有限期限到期
 > 返回 `{"pending":true}`，等于**在没有答案时把模型放行**，之后的答案以另一条 user 消息在新回合送达 ——
 > 那是同一个「断」的第二条路径（实测本机 4 个会话真出现过 pending）。selftest 有闸门钉住 -1。
+>
+> 2026-10-14 上调四段预算（4000→4250 / 800→880 / 1250→1400 / 合计 5000→5150 与 1650→1800）：
+> 唯一来源是**任务板闭环**这一条新纪律。依据取自 session-00001000 的会话日志——Lead 在 14:13:09
+> 用 `team_task_create` 建了 4 条任务（seq 81/84/87/90，全 pending 无 owner），到 18:54:48
+> turn/end（seq 1697）**再没有一条** `team/task` 记录；Lead 的 329 次 tool/call 里
+> `team_task_update` 为 0，7 个队员的 tool/call 里 `team_task_*` 总计为 0（工具都在它们的
+> 目录里，从各自 request/header 数出来的），而 7 个队员全部交了 `report_result` completed。
+> 旧文本提过 `team_task_create` 的名字（所以「装了没人提」那条闸门是绿的），却没有任何一句
+> **要求收尾** —— 这次补的就是那一句，加四处联动（report_result 对账 / spawn 绑定 / list_agents 与
+> wait_agent 报未闭环数）。按「先删再加」已合并一处同义表述（队员卡「别灌整段 dump」与
+> 「不贴整段日志、整个文件或长篇代码」同义，删前者），并逐句收紧新文案。
+>
+> 2026-10-15 **下调** 1740→1732（唯一来源是删掉简报首行的英文角色名）：用户先问「双语会不会
+> 让模型读一遍中文、读一遍英文」，我量完账才动手 —— 12 个 `labelEn` 里 **11 个就是 `role.id`
+> 的 Title-Case 改写**（scout→Scout、red-team→Red Team…，唯一例外 verify→Verifier 也只是同词形
+> 变化），而 id 在同一行里已经用反引号给过，所以英文侧对模型是**纯重述**；承载区分度的是中文
+> `label`（五个审查类角色的英文侧全是 …Auditor/Critic/Verifier，靠英文分不出来）。
+> 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
+> 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
+> 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2176`），字段契约见 §1 的 ROLES 行；
+> 删的只是「进模型读的那半」。
+> selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
+> （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
 
 改这四段文本后必须重跑 `node tools/selftest.cjs`：那条闸门会拿上面的数字与模块实测长度对账
 （`README` 里的旧副本已随文档精简移除，现在这份表是唯一真值）。
@@ -238,7 +268,23 @@ export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
 export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
                                             //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。
+                                            //    每个节点带 `taskTip` = **结构化**归属清单
+                                            //    `{total, rows:[{id,status,revision,subject?}], omitted}`（该成员名下
+                                            //    未删除的共享任务条目；`rows: []` = 没有）。归属在**服务端**算
+                                            //    （只有宿主读得到 listTasks），**句子在浏览器拼**（2026-10-14 i18n）：
+                                            //    服务端拼中文等于把界面语言焊死在宿主半，而知道 active 的只有浏览器。
+                                            //    同一理由用在折叠工具组（只发 `count`）与回合结局（只发
+                                            //    `reason/message/code`）。判据见 §6「服务端发事实」那条。
                                             //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
+                                            //    返回另带两个**结构化**字段（2026-10-14/15 加的）：
+                                            //    `historyRecovered` —— 成员名单是否来自历史恢复。浏览器半原来靠
+                                            //    `notes.some(n => n.includes('团队可能已结束'))` 判断，那是把**界面
+                                            //    文案当协议**用：换语言或改一个标点，琥珀色快照标记就静默消失，
+                                            //    而底栏仍写「真实会话日志」—— 用户以为团队还在跑。
+                                            //    `toolLabels` —— 官方 tool.title.* 的**两种语言各一份**
+                                            //    `{titles, titlesEn, generic, genericEn}`（同一条展开规则：驼峰键 +
+                                            //    下划线小写键 + 别名表）。服务端不知道界面语言，所以两份都发、
+                                            //    浏览器按 active 挑。与官方逐字一致由 drift-check 两侧都比对。
                                             //    **口径**：每个会话只统计「它自己的事件」，必须跳过
                                             //    fork 继承来的父会话前缀（官方 eventAt(seq) 是裸下标、
                                             //    含前缀；ownEvents()/isOwnSeq() 才是排掉它的 API）。
@@ -252,6 +298,15 @@ export async function teamConversation(ctx, sessionId, targetId, limit?);
                                             //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
                                             //    同样跳过 fork 继承前缀（否则浮窗里显示的是 Lead 的对话）。
                                             //    白名单与 teamImage 共用 teamAllowedSessions（防两处漂移）。
+export async function teamDetail(ctx, sessionId, targetId, key);
+                                            //    浮窗展开层（2026-10-14）：按**行身份**取那一行的
+                                            //    输入/输出全文。key 三种形状与 lib/graph.js 的 detailKey
+                                            //    同源：`call:<callId>` / `turn:<turn>:<step>` / `msg:<id>`。
+                                            //    授权与 teamConversation/teamImage 共用 teamAllowedSessions
+                                            //    （拿到的是会话正文，放开一边就是越权读取的口子）。
+                                            //    对话行只带 hasDetail 标记，**用户点开才调这个 op**：
+                                            //    抽屉每 1.2~3 秒轮询，把全部工具参数与结果挂上行
+                                            //    等于每轮把载荷放大几十倍（单次返回另有 DETAIL_MAX 上限）。
 export async function teamSendImages(ctx, sessionId, targetId, text, images);
                                             //    工作区抽屉：**带图片**发消息（与官方对话页一致的
                                             //    上传能力）。用户 2026-10-10：「要支持直接在弹窗上传
@@ -399,8 +454,8 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:472-482`）。
-   注意 `lib/tools.js:621-622` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:537`）。
+   注意 `lib/tools.js:671-675` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
    **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），
@@ -444,7 +499,8 @@ parameters: {
   context: { type:'string', enum:['fresh','fork'], description:'默认 fresh。' },
   model: { type:'string', description:'可选，覆盖该角色的模型；必须与 provider 成对。' },
   provider: { type:'string', description:'可选，覆盖该角色的 provider；必须与 model 成对。' },
-  reasoning_effort: { type:'string', description:'可选，覆盖该角色的思考强度；必须是该模型广告的档位。' }
+  reasoning_effort: { type:'string', description:'可选，覆盖该角色的思考强度；必须是该模型广告的档位。' },
+  task_id: { type:'string', description:'可选：这条共享任务归这个队员。创建成功后插件用 team_task_update action=reassign 绑定（pending→in_progress + owner=该队员）。绑定失败绝不撤销已创建的队员，原因进 diagnostics。' }
 }
 ```
 
@@ -464,9 +520,19 @@ parameters: {
    `provider` 由 `context` 决定（`fresh` → `spawn`，`fork` → `fork`）。
    identity prefix 照抄官方（`You are teammate "<name>".` 那段），并把角色名加进去。
 4. 返回值就是官方 `{member}` 形状，再附加 `role` 与该队员最终路由（便于 Lead 确认真的生效）。
+5. 给了 `task_id` 时：先 `getTask` 读当前 revision，再 `updateTask({action:'reassign', owner: <新队员名>})`。
+   **为什么用 reassign 而不是 claim**：`claim` 把 owner 记成调用者（`task-board.js:117` `ownerId = caller.id`），
+   而调用者是 Lead —— 条目会挂在 Lead 名下，队员反而不是 owner。`reassign` 是 Lead 专属（`:158-159`）且
+   一次就把 `status: in_progress` + owner 都落对（`:170`）。绑定失败（不存在 / 被阻塞 / 已归别人 / CAS 过期）
+   只写 diagnostics，不撤销已经创建出来的队员。
 
 其余八个工具（`send_message` / `list_agents` / `wait_agent` / `interrupt_agent` /
 `team_task_create` / `team_task_list` / `team_task_get` / `team_task_update`）**逐字照抄官方**，
+**只有两处本插件附加**（2026-10-14 任务板闭环）：`list_agents` 在调用者是 Lead 时把「任务板未闭环 N 条」
+追加进 **lead 行已有的** `diagnostics`（`annotateBoardClosure`，不新增字段 = 不动 Lead 的工具目录 =
+不动缓存前缀，与 `TRUNCATED_DIAGNOSTIC` 同法）；`wait_agent` 给返回值附加可选 `diagnostics`
+（**必须同时进 `WAIT_VALUE_SCHEMA`**：官方按 output.schema 校验返回值，漏声明就是模型侧一次
+`ToolOutputError`，`dsh-tools/lib/index.js:3541-3544`）。两处都只在 Lead 调用且任务板确有未闭环条目时才出现。
 包括 schema、description、错误处理与 `jsonOutput` 渲染方式。`TeamTaskId` 从
 `@deepseek-ai/dsh-experimental-agent-team` import（官方就是这么做的）。
 
@@ -631,6 +697,47 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     **宿主的 diagnostics 必须显示出来**（配置文件坏掉时宿主会退回空配置并记一条诊断，
     页面若忽略它，用户看到的就是「全部跟随 Lead」的假象，随手一保存就把残留内容整份覆盖）。
   - 底部一段说明：默认（不配置）= 与 Lead 完全相同的模型与思考强度。
+- 画布上的**共享任务归属**走节点卡片的悬停 `title`（`el.title = wsTaskTip(node.taskTip, node.name)`：
+  `wsNodeCard` 建卡时挂、`wsUpdateCard` 就地刷新）。用户 2026-10-08 明确要求点击卡片后的浮窗只保留
+  「指标 + 对话窗口」两块，所以这里**不新增区块** —— tooltip 零布局成本。图例那行（`wsLegendCol`）
+  同步说明「悬停卡片看任务归属」。服务端只发结构化清单，句子在这儿拼（理由见上一条与下一节）。
+- **服务端发事实，浏览器拼句子**（2026-10-14/15 定下的纪律，跨半边的文案一律照此）：
+  宿主半**不知道界面语言** —— `dsh-client-locale` 的 `getSnapshot().active` 只在浏览器里有值。
+  所以凡是会上屏的文字，宿主半只发**结构化字段**，句子由 `wsText` 按当前语言拼：
+  `taskTip` → `{total, rows, omitted}`；折叠工具组 → `{count, rows}`；回合结局 →
+  `{reason, message, code}`；历史快照 → `historyRecovered: boolean`；**画布底栏的宿主提示
+  `notes`** → `{code, params}`（七个降级事实，`code` 与浏览器半 `WS_NOTE_CODES` 双向对齐，
+  selftest 有闸门；旧宿主发纯字符串时直通显示，本半不认识的未来 code 就显示 code 本身）；
+  工具标签 → `{titles, titlesEn}` + 内容指纹 `toolLabelsHash`（**不逐轮重发**：客户端带回
+  上次的 hash，一致时服务端省略表本体 —— 整张双语表实测 7,286 字节 / graph 本体 30,656 字节）。
+  反面教材就是原先那句 `notes.some(n => n.includes('团队可能已结束'))`：把界面文案当协议用，
+  换语言或改一个标点，功能就静默失效（快照标记消失，而底栏仍写「真实会话日志」）。
+  现在这条判据是 `historyRecovered`，notes 本身也不再是句子 —— 那段 `includes` 只是历史记录，
+  **不许再往回写**（selftest 有一条闸门扫 `state.notes.join(` 直接上屏的写法）。
+- **浮窗必须跟着当前语言**（`wsText` / `fallbackText` → `localeText` → 官方 `locale.bind(NS)`）：
+  此前 `wsText` 是 `zh[key]`，**恒读中文**，119 处调用全中；补齐 `en` 也不会变英文。
+  查找顺序 = 官方 locale 链 → 本文件 `zh` → key（缺键退中文而不是退 `wsSend` 这种裸键名，
+  那是刻意选择：宁可一句中文，不给一串 camelCase）。语言切换时 `locale.subscribe` 回调
+  `wsRelanguage()`：覆盖层是命令式 DOM，官方那次 React 重渲染**不会**顺手刷它。
+  顶栏标签就地换字；抽屉关掉再重开（它的标签散在十几个闭包变量里，逐个补等于再写第二套
+  渲染逻辑 —— 那正是本仓库反复栽的「抄两份迟早漂移」；代价是滚动位置与展开态回初始，
+  换语言极低频，如实记在这儿）。
+- 两本内联字典的**键集合必须严格相等**（selftest 有闸门），且**字典之外不许有中文字面量**
+  （另一条闸门扫字符串字面量、剥掉注释）。只补 `en` 而不扫后者，英文界面照样漏几句硬中文。
+- 逐行时间与复制（P1-3）照官方**有/无与左右顺序**，不是照我觉得好用：
+  `wsFormatClock` 移植 `formatMessageClock`（chat-client.js:1057-1068：当天 `HH:mm`，
+  同年 `clock.md` + 时间，跨年 `clock.ymd` + 时间；日期格式值取自官方 locale，不写死「月/日」）。
+  谁有一行：用户行 `clock=start`（时钟在左）、助手行 `clock=end`（复制在左）、团队/通知行只有时间。
+  工具行**不给**（官方 `tool-client.js` 里 `formatMessageClock` 出现 0 次）。
+  复制的是**全文**：被截断的行先走 `team-detail` 取全文再写剪贴板，取不到就报失败 ——
+  静默复制断尾的 2000 码元比没有复制键更糟。剪贴板两条路都在（`navigator.clipboard.writeText`
+  失败/缺失退隐藏 textarea + `execCommand`），照 `dsh-client-ui-primitives` 的 `writeClipboard`。
+- 两本内联字典（`const zh` / `const en`，`ctx.locale.register(NS, { zh, en })`）**不许有零引用文案**：
+  selftest 按「键名是否以字符串字面量出现在字典之外」判引用 —— 本文件唯一的取键方式是 `zh[key]` 与 `t('key')`，
+  全文没有 `'ws' + 变量` 这类动态拼键（逐行扫过），所以字面量判据是充分的。2026-10-14 据此清掉 6 条残骸：
+  `wsDrawerRelations` / `wsDrawerNoRel` / `wsDrawerTasks` / `wsDrawerNoTask`（2026-10-08 删区块时忘了删文案）、
+  `cacheModeDefault`（zh+en，模式下拉只有 auto/on/off）、`wsCacheRead`（卡片用的是硬编码的 `cache` 微标签）、
+  `wsStateProvisioning`（`wsStateOf` 把 provisioning 归进 running）、`wsQSentAsMsg`（被 `wsQNotSettled` 取代）。
 - **绝对不要**：写 `context.mutate` 之外的通道、注入本包没声明的服务、import 本包没声明的模块。
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
@@ -699,6 +806,23 @@ URL 级事实：**必须**用 `key: '@zws/dsh-dispatch-agent-team'`；`view: 'su
 `view: 'page'` 返回完整表单。`form` 可能不存在（我们的行不声明 Config schema）——**不要依赖它**。
 
 ## 8. 通用纪律（所有人）
+
+- **代码注释与文档里的行号指针会被编辑挪走**（2026-10-15 全仓实扫，数字都用闸门那套规则数，可复跑）：
+  本仓库自引用 = 勘误表 9 处（日期化历史，闸门不核）+ 正文 17 处（官方速记 2 + 句中点不出
+  符号而机器判不了 5 + **可判 10**）。**开工前的 HEAD：可判 9 条里 5 条已指错**
+  （lib/runtime.js 对 index.js:282/:336/:539 与 integration-test 的同两条 —— 更早的欠账）。
+  本轮`git diff` 可复跑：含行号的引用句共改动 **8 行 / 9 条指针**
+  —— 上面那 5 条旧账，加上被我自己这几轮**当场弄坏**的 4 条：往 client.js 插进 800 行字典与
+  注释后，上一轮刚写对的「lib/client.js:2123-2126」飘到 React.createElement；roster.js 加几十行
+  后，一直对的 `TEAMMATE_TOOL_DENY :472-482` 也飘了。**这就是复发机制：写的时候对 ≠ 以后一直对**，
+  指针是被别人的编辑挪走的，所以要有闸门，而不是改完就算。
+  现在可判的 10 条 **0 失效**（`node tools/selftest.cjs` 里那条闸门可复跑）。闸门只管 `lib/X.js:NN` 这种**行号**指针；我最初犯的「见 §6」
+  是**章节**指针，不在它覆盖内（那次靠自查抓到，改成核实过的 :2176 与 §1 的 ROLES 行）。规矩：
+  写指针时**句子里必须点得出目标符号名**（`clipLine`、`LINE_MAX`、`TEAMMATE_TOOL_DENY`
+  这类），改完自己那条句子后要能核；大段插行之后主动复查自己写过的指针。
+  `tools/selftest.cjs` 有一条闸门核这件事：它只判「句里点得出符号」的指针（±8 行窗口
+  里必须出现该符号），勘误表整行（日期化历史）与官方包路径（全路径尾巴 / 跨行折断 /
+  句中点了 mcp-manager、dsh-xxx 的速记）都跳过，宁少判不误判。
 
 - 只写自己名下的文件；**不要**动别人名下的文件，也不要动本文件与已冻结文件。
 - 每个 JS 文件写完后跑 `node --check <file>`（`lib/client.js` 会被 `node --check` 当作 CJS，
