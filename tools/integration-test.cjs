@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:537），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:561），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -620,8 +620,8 @@ async function main() {
   // 复现 2026-09-28 用户截到的「宿主诊断（配置文件可能有问题）」假警报：
   //   ① 信息性记录（DSH 主目录 / 配置文件）与真故障共用一条通道，页面在**一切正常**时
   //      也渲染成红色告警；
-  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()`（lib/index.js:250）与
-  //      `writeStatusFile()`（lib/index.js:593 → :742 定义，内部 :762 `getConfigPath`）都是 fire-and-forget，
+  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:490）与
+  //      `writeStatusFile()`（同文件 :609 调用 → :758 定义，内部 :778 `getConfigPath`）都是 fire-and-forget，
   //      而旧实现把「已算过」的检查放在 `await settings.prepareDocument()` **之前**、
   //      赋值放在 await **之后**，于是第二个调用者从同一个窗口挤进来又算了一遍。
   // 这里用**全新的模块实例**（带 query 的 URL = 新的 ESM 记录），否则会被上面 §7 已缓存的 state 影响。
