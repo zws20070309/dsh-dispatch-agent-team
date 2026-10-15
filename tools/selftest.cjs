@@ -445,7 +445,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2421）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2465）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -2467,6 +2467,37 @@ function functionBodyOf(source, needle) {
     assert.ok(src.includes('const table = wsTableAt(lines, i)'), 'wsMarkdown 必须调用 wsTableAt');
     assert.ok(src.includes('.dat-ws .md table{'), '缺少表格样式（.dat-ws .md table）');
     assert.ok(src.includes('md-table'), '缺少表格容器样式（.md-table，用于横向滚动）');
+  });
+
+  await check('抽屉工具调用「放大查看」：面板随视口自适应，展开层高度不再写死（用户 2026-10-15 报「固定容器太窄」）', () => {
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    // ① 展开层高度必须**随视口**，旧的写死值不许回来（写死 260px 就是这次报障的正面原因）。
+    assert.ok(src.includes('max-height:min(52vh,480px)'), '展开层高度没改成随视口自适应（仍是固定 px）');
+    assert.ok(!src.includes('max-height:260px'), '旧的写死高度 max-height:260px 又回来了');
+    // ② 面板本体：CSS 与三个函数都必须在。
+    assert.ok(src.includes('.dat-ws .ws-zoom{'), '缺少放大面板的 CSS（.ws-zoom）');
+    assert.ok(src.includes('width:min(1180px,100%)'), '面板宽度不是自适应的（写死宽度 = 又一次「固定容器」）');
+    for (const fn of ['function wsOpenDetailZoom(', 'function wsCloseDetailZoom(', 'function wsDetailZoomBar(']) {
+      assert.ok(src.includes(fn), '缺少 ' + fn);
+    }
+    // ③ 挂在 .dat-ws 根节点上：挂抽屉里会被它的 transform 夹住宽度（那正是要逃出去的东西）。
+    assert.ok(src.includes('const host = state.root'), '放大面板没挂在 .dat-ws 根节点上');
+    // ④ 工具条插在展开层**开头**：.dzb 是 sticky 的，排在后面就钉不住上沿。
+    assert.ok(src.includes('box.insertBefore(wsDetailZoomBar(state, row, parts), box.firstChild)'),
+      '「放大查看」工具条没插在展开层开头');
+    // ⑤ 点击必须拦冒泡：不拦的话同一次点击顺带把那一行收起，面板一闪就没。
+    const barAt = src.indexOf('function wsDetailZoomBar(');
+    assert.ok(barAt >= 0 && src.slice(barAt, barAt + 1400).includes('event.stopPropagation()'),
+      '工具条没拦 stopPropagation（点开会被所在行的折叠逻辑关掉）');
+    // ⑥ 关闭路径：Esc **先**关面板再关抽屉；关抽屉顺手关面板。顺序错了就是留残骸。
+    const keyAt = src.indexOf('const onKey = (event) =>');
+    const keyBlock = keyAt < 0 ? '' : src.slice(keyAt, keyAt + 700);
+    assert.ok(keyBlock.includes('wsCloseDetailZoom(state)')
+      && keyBlock.indexOf('wsCloseDetailZoom') < keyBlock.indexOf('state.drawer.classList.contains'),
+      'Esc 没优先关放大面板（先关抽屉会把它孤零零留在画布上）');
+    const closeAt = src.indexOf('function wsCloseDrawer(state) {');
+    assert.ok(closeAt >= 0 && src.slice(closeAt, closeAt + 400).includes('wsCloseDetailZoom(state)'),
+      '关抽屉没顺手关掉放大面板');
   });
 
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {

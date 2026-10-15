@@ -1080,6 +1080,73 @@ async function main() {
     });
   }
 
+  // ── 10) 布局结构：三个下拉必须是同级（2026-10-15 用户报「总控页面空白太多」）────
+  //
+  // 上面 §9 的定位全是 findAll（**后代**搜索），所以「预设那一格被套进强度格里面」它照样
+  // 找得到 —— React 对嵌套 label 一句不报，坏掉的只有版面：flex 容器里只剩两格，左边
+  // 空出一整块、中间空出一整块。这类 bug 只能靠**直接子节点**判据抓到，故本节点用
+  // node.props.children（替身把 children 平铺成数组，同级关系就是数组元素，嵌套的在更深层）。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { scout: { preset: 'standard' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+    });
+    const tree = page.tree();
+    /** 某个 dat-field 里那一格的列标题。 */
+    const fieldLabel = (field) => {
+      const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+      return head === undefined ? '' : textOf(head);
+    };
+    const isField = (node) => node.type === 'label' && node.props.className === 'dat-field';
+
+    check('全局：没有任何 dat-field 套在另一个 dat-field 里面（同级判据）', () => {
+      const nested = [];
+      const walk = (node, insideField) => {
+        if (node === null || node === undefined || typeof node !== 'object') return;
+        if (Array.isArray(node)) { for (const item of node) walk(item, insideField); return; }
+        const nowField = isField(node);
+        if (nowField && insideField !== undefined) nested.push(fieldLabel(node) || '(无标题)');
+        walk(node.props === undefined ? undefined : node.props.children, nowField ? node : insideField);
+      };
+      walk(tree.props.children, undefined);
+      if (nested.length > 0) return '这些下拉被嵌进了别的下拉里（同级才会并排）：' + nested.join(' | ');
+      return true;
+    });
+
+    check('统一选择块：模型 / 思考强度 / agent 预设 三格都是 dat-bulk-ctl 的直接子节点', () => {
+      const ctl = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-bulk-ctl')[0];
+      if (ctl === undefined) return '找不到 dat-bulk-ctl';
+      const direct = (ctl.props.children || []).filter(isField).map(fieldLabel);
+      const want = ['模型（应用到全部角色）', '思考强度（应用到全部角色）', 'agent 预设（应用到全部角色）'];
+      const missing = want.filter((label) => !direct.includes(label));
+      if (missing.length > 0) return '直接子节点只有 [' + direct.join(' | ') + ']，缺 ' + missing.join(' | ');
+      return true;
+    });
+
+    check('角色行：模型与 agent 预设同为 dat-ctl 的直接子节点（逐行那一列也不许套娃）', () => {
+      const row = findAll(tree, (node) => {
+        if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+        const code = findAll(node, (inner) => inner.type === 'code')[0];
+        return code !== undefined && textOf(code) === 'scout';
+      })[0];
+      if (row === undefined) return '找不到 scout 行';
+      const ctl = findAll(row, (node) => node.type === 'div' && node.props.className === 'dat-ctl')[0];
+      if (ctl === undefined) return 'scout 行里没有 dat-ctl';
+      const direct = (ctl.props.children || []).filter(isField).map(fieldLabel);
+      for (const label of ['模型', 'agent 预设']) {
+        if (!direct.includes(label)) return 'dat-ctl 的直接子节点是 [' + direct.join(' | ') + ']，缺「' + label + '」';
+      }
+      return true;
+    });
+  }
+
   // ── 7) 加载失败路径 ───────────────────────────────────────────────────────
   {
     const page = await mount({
