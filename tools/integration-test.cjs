@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:472-482），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:537），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -516,10 +516,11 @@ async function main() {
     });
 
     check('系统提示词前缀规模在预算内（这段前缀每次请求都要付钱）', () => {
-      // 上限与 selftest 的预算表同步（2026-10-09 上调：新增 PTC 借鉴纪律 + 修回误删细节）。
+      // 上限与 selftest 的预算表 / INTERFACES §2.1 同步（2026-10-14 上调 5000→5150、1650→1800：
+      // 唯一来源是任务板闭环那条新纪律，依据与「先删再加」的记账见 INTERFACES §2.1 注记）。
       // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
-      if (ownLead > 5000) return `Lead 侧自有段落 ${ownLead} 字符 > 5000`;
-      if (ownMate > 1650) return `队员侧自有段落 ${ownMate} 字符 > 1650`;
+      if (ownLead > 5150) return `Lead 侧自有段落 ${ownLead} 字符 > 5150`;
+      if (ownMate > 1800) return `队员侧自有段落 ${ownMate} 字符 > 1800`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
       if (scoutPrompt.length < playbook.TEAMMATE_CARD.length) return '渲染结果比队员卡还短（卡没注册上？）';
@@ -619,8 +620,8 @@ async function main() {
   // 复现 2026-09-28 用户截到的「宿主诊断（配置文件可能有问题）」假警报：
   //   ① 信息性记录（DSH 主目录 / 配置文件）与真故障共用一条通道，页面在**一切正常**时
   //      也渲染成红色告警；
-  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()`（lib/index.js:282）与
-  //      `writeStatusFile()`（lib/index.js:336 → :369 `getConfigPath`）都是 fire-and-forget，
+  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()`（lib/index.js:250）与
+  //      `writeStatusFile()`（lib/index.js:593 → :742 定义，内部 :762 `getConfigPath`）都是 fire-and-forget，
   //      而旧实现把「已算过」的检查放在 `await settings.prepareDocument()` **之前**、
   //      赋值放在 await **之后**，于是第二个调用者从同一个窗口挤进来又算了一遍。
   // 这里用**全新的模块实例**（带 query 的 URL = 新的 ESM 记录），否则会被上面 §7 已缓存的 state 影响。
@@ -1813,6 +1814,232 @@ async function main() {
   })();
 
 
+
+  // ── 7.6) 任务板闭环（复现 session-dfd6c62d，2026-10-14）─────────────────────────
+  // 现场事实（逐条从会话日志核出来，不是推测）：
+  //   * 14:13:09 Lead 用 team_task_create 建了四条（seq 81/84/87/90，全 pending、无 owner、rev 1），
+  //     18:54:48 turn/end（seq 1697）—— 中间**再没有一条** team/task 记录；
+  //   * Lead 的 329 次 tool/call 里 team_task_update / _list / _get 各 0 次；
+  //   * 7 个队员会话的 tool/call 里 team_task_* **总计 0 次**，而它们的工具目录里确实有
+  //     team_task_update（每个队员 72 个工具，从各自 request/header 里数出来的）；
+  //   * 7 个队员全部交了 report_result（status 全 completed，verify-final 中途一次 blocked）。
+  // 内核侧（dsh-experimental-agent-team/lib/types/task-board.js）：状态只在 create/update 里写，
+  //   :145-149 complete 只接受 in_progress；:110-117 claim 把 owner 钉成**调用者自己**。
+  // 所以这不是显示 bug：面板如实投影了账本（client-ui-agent-team/lib/client.js:239 + :55-63）。
+  // 缺的是「把报告与任务板对齐」这一层，下面钉住它。
+  console.log('');
+  console.log('任务板闭环（report_result / spawn_teammate / list_agents / wait_agent）');
+
+  await (async () => {
+    const execSignal = () => new AbortController().signal;
+    /** 现场形状：4 条 pending、无 owner，Lead 建完就没回看。 */
+    const openBoard = () => ([
+      { id: 'task-1', revision: 1, subject: 's1', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/a'], ready: true, writeScopeWarnings: [] },
+      { id: 'task-2', revision: 1, subject: 's2', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/b'], ready: true, writeScopeWarnings: [] },
+      { id: 'task-3', revision: 1, subject: 's3', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/c'], ready: true, writeScopeWarnings: [] },
+      { id: 'task-4', revision: 1, subject: 's4', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/d'], ready: true, writeScopeWarnings: [] },
+    ]);
+    let closureBoard = openBoard();
+    const closureCalls = [];
+    const closureTeams = {
+      tryMembership: (agent) => membershipById.get(agent && agent.id),
+      listMembers: () => ([
+        { id: 'lead-agent', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+        { id: 'scout-agent', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+        // builder 恒 running：让 wait_agent 走「有活着的对端」那条正常路径，而不是 no-active-peer 短路。
+        { id: 'builder-agent', name: 'builder', role: 'teammate', status: 'running', diagnostics: [] },
+      ]),
+      listTasks: () => { closureCalls.push({ method: 'listTasks' }); return closureBoard.map((task) => ({ ...task })); },
+      getTask: (caller, taskId) => {
+        closureCalls.push({ method: 'getTask', taskId });
+        return closureBoard.find((task) => task.id === taskId);
+      },
+      updateTask: (caller, request) => {
+        closureCalls.push({ method: 'updateTask', request });
+        const task = closureBoard.find((row) => row.id === request.taskId);
+        if (task === undefined) throw new Error('TEAM_TASK_NOT_FOUND');
+        if (request.expectedRevision !== task.revision) throw new Error('TEAM_TASK_STALE_REVISION');
+        task.revision += 1;
+        if (request.action === 'reassign') { task.status = 'in_progress'; task.ownerName = request.owner; }
+        if (request.action === 'complete') task.status = 'completed';
+        if (request.action === 'release') { task.status = 'pending'; task.ownerName = undefined; }
+        return { ...task };
+      },
+      sendMessage: () => ({ messageId: 'm-closure', status: 'accepted' }),
+      waitForChange: () => ({ timedOut: true }),
+      spawnTeammate: async (caller, request) => ({
+        member: {
+          id: 'agent-' + String(request.name),
+          name: request.name,
+          role: 'teammate',
+          status: 'inactive',
+          description: request.description,
+          context: 'fresh',
+          provider: 'spawn',
+          diagnostics: [],
+        },
+      }),
+    };
+    const closureMemberDefs = new Map(toolsModule.teamToolDefinitions({
+      runtime: reportRuntime, agentTeams: closureTeams, include: roster.MEMBER_TEAM_TOOL_NAMES,
+    }).map((definition) => [definition.name, definition]));
+    const closureLeadDefs = new Map(toolsModule.teamToolDefinitions({
+      runtime: reportRuntime, agentTeams: closureTeams, include: roster.LEAD_TEAM_TOOL_NAMES,
+    }).map((definition) => [definition.name, definition]));
+    const closureReport = closureMemberDefs.get(roster.REPORT_TOOL_NAME);
+    const closureSpawn = closureLeadDefs.get('spawn_teammate');
+    const closureList = closureLeadDefs.get('list_agents');
+    const closureListByMember = closureMemberDefs.get('list_agents');
+    const closureWait = closureLeadDefs.get('wait_agent');
+    const closureWaitByMember = closureMemberDefs.get('wait_agent');
+    const argsOf = (over) => Object.assign({
+      summary: '改完并跑过验收', evidence: ['node tools/e2e.mjs -> 0 failed'], acceptance: '同上', unresolved: [], changed_files: ['src/a.js'],
+    }, over);
+
+    // ① 现场形状：队员没被挂上任何条目 -> 不报错，也不往队员上下文里灌任务板噪音。
+    closureBoard = openBoard();
+    closureCalls.length = 0;
+    const unbound = await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() });
+    check('report_result：队员没有 claim 任何条目时**不报错也不唠叨**任务板（现场正是 4 条 pending 无人认领）', () => {
+      if (unbound.ok !== true || unbound.delivered !== true) return JSON.stringify(unbound);
+      if ((unbound.diagnostics ?? []).some((note) => note.includes('任务板'))) return JSON.stringify(unbound.diagnostics);
+      return true;
+    });
+
+    // ② 队员 claim 了条目、报了 completed -> 必须点名让它 complete。
+    closureBoard = openBoard();
+    closureBoard[0] = Object.assign({}, closureBoard[0], { status: 'in_progress', ownerName: 'scout', revision: 2 });
+    const ownCompleted = await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() });
+    check('report_result：completed 而自己 claim 的条目还挂在 in_progress -> diagnostics 点名条目 + complete + 当前 revision', () => {
+      const note = (ownCompleted.diagnostics ?? []).find((item) => item.includes('task-1'));
+      if (note === undefined) return '没有点名 task-1：' + JSON.stringify(ownCompleted.diagnostics);
+      if (!note.includes('complete')) return '没指 complete：' + note;
+      if (!note.includes('2')) return '没给 CAS 要用的当前 revision：' + note;
+      return true;
+    });
+    check('report_result：只点自己名下那条（task-2/3/4 与本次报告无关，不许混进来）', () => {
+      const notes = (ownCompleted.diagnostics ?? []).join(' ');
+      for (const other of ['task-2', 'task-3', 'task-4']) if (notes.includes(other)) return '串了：' + notes;
+      return true;
+    });
+
+    // ③ 报 blocked -> 指路 release，别占着 in_progress。
+    const ownBlocked = await closureReport.execute(
+      { status: 'blocked', summary: '卡在契约上', evidence: [], acceptance: '未跑', unresolved: ['需要 Lead 定 §3.1'], changed_files: [] },
+      { agent: scoutAgent, signal: execSignal() },
+    );
+    check('report_result：blocked / needs_decision -> 指路 release（条目不该被占着）', () => {
+      const note = (ownBlocked.diagnostics ?? []).find((item) => item.includes('task-1'));
+      if (note === undefined || !note.includes('release')) return JSON.stringify(ownBlocked.diagnostics);
+      return true;
+    });
+
+    // ④ spawn 时把条目绑给新队员：走 reassign（claim 会把 owner 钉成调用者 = Lead）。
+    closureBoard = openBoard();
+    closureCalls.length = 0;
+    const bound = await closureSpawn.execute(
+      { role: 'builder', name: 'builder-x', description: 'x', prompt: 'y', task_id: 'task-1' },
+      { agent: leadAgent, signal: execSignal() },
+    );
+    const reassigns = closureCalls.filter((call) => call.method === 'updateTask').map((call) => call.request);
+    check('spawn_teammate：给了 task_id -> 创建后 reassign 给这个队员（pending 到 in_progress + owner），并回显新 revision', () => {
+      if (reassigns.length !== 1) return 'updateTask 调了 ' + reassigns.length + ' 次：' + JSON.stringify(reassigns);
+      const request = reassigns[0];
+      if (request.action !== 'reassign' || request.taskId !== 'task-1' || request.owner !== 'builder-x') return JSON.stringify(request);
+      if (request.expectedRevision !== 1) return 'expected_revision 不是 getTask 读来的当前值：' + JSON.stringify(request);
+      if (closureBoard[0].status !== 'in_progress' || closureBoard[0].ownerName !== 'builder-x') return '假域服务没被真的改到（用例自身失效）';
+      const notes = (bound.diagnostics ?? []).join(' ');
+      if (!notes.includes('task-1') || !notes.includes('builder-x')) return '回执没说绑定：' + notes;
+      if (!notes.includes('2')) return '回执没给绑定后的 revision（Lead 接着要用它做 CAS）：' + notes;
+      return true;
+    });
+    check('spawn_teammate：绑定用 reassign 而不是 claim（task-board.js:117 claim 把 owner 钉成调用者=Lead）', () => (
+      reassigns.some((request) => request.action === 'claim') ? '用了 claim：条目会归到 Lead 名下' : true
+    ));
+    check('spawn_teammate：绑定前先读一次 getTask（不读拿不到 revision，CAS 必失败）', () => {
+      const order = closureCalls.map((call) => call.method);
+      if (!order.includes('getTask')) return '没读 getTask：' + JSON.stringify(order);
+      if (order.indexOf('getTask') > order.indexOf('updateTask')) return '先写后读：' + JSON.stringify(order);
+      return true;
+    });
+
+    // ⑤ 不给 task_id -> 完全不碰任务板（不替 Lead 猜归属）。
+    closureCalls.length = 0;
+    await closureSpawn.execute({ role: 'builder', name: 'builder-y', description: 'x', prompt: 'y' }, { agent: leadAgent, signal: execSignal() });
+    check('spawn_teammate：不给 task_id 时**不碰**任务板', () => (
+      closureCalls.some((call) => call.method === 'updateTask' || call.method === 'getTask')
+        ? JSON.stringify(closureCalls.map((call) => call.method))
+        : true
+    ));
+
+    // ⑥ 绑定失败不许毁掉 spawn（队员已经创建出来了）。
+    closureBoard = openBoard();
+    const bindFailed = await closureSpawn.execute(
+      { role: 'builder', name: 'builder-z', description: 'x', prompt: 'y', task_id: 'task-404' },
+      { agent: leadAgent, signal: execSignal() },
+    );
+    check('spawn_teammate：任务板绑定失败**不毁掉 spawn**，失败原因进 diagnostics（含下一步动作）', () => {
+      if (bindFailed?.member?.target !== 'builder-z') return '队员没创建出来：' + JSON.stringify(bindFailed);
+      const notes = (bindFailed.diagnostics ?? []).join(' ');
+      if (!notes.includes('task-404')) return '没点名失败的条目：' + notes;
+      if (!notes.includes('team_task_list') && !notes.includes('team_task_update')) return '没给下一步动作：' + notes;
+      return true;
+    });
+
+    // ⑦ Lead 侧的收尾闸门：list_agents 与 wait_agent 都要带上未闭环条数。
+    closureBoard = openBoard();
+    const leadRows = await closureList.execute({}, { agent: leadAgent, signal: execSignal() });
+    check('list_agents：Lead 的行带「任务板未闭环 4 条」并点名条目（现场：Lead 全程没回看任务板）', () => {
+      const row = leadRows.find((item) => item.target === 'lead');
+      if (row === undefined) return JSON.stringify(leadRows.map((item) => item.target));
+      const note = (row.diagnostics ?? []).join(' ');
+      if (!note.includes('任务板未闭环 4 条')) return JSON.stringify(row.diagnostics);
+      if (!note.includes('task-1')) return '没点名条目：' + note;
+      return true;
+    });
+    const memberRows = await closureListByMember.execute({}, { agent: scoutAgent, signal: execSignal() });
+    check('list_agents：队员调用时不带这份提示（收尾是 Lead 的责任，不灌进队员上下文）', () => {
+      const notes = memberRows.map((row) => (row.diagnostics ?? []).join(' ')).join(' | ');
+      return notes.includes('任务板') ? notes : true;
+    });
+    const waitLead = await closureWait.execute({}, { agent: leadAgent, signal: execSignal() });
+    check('wait_agent：Lead 每次等待都看到同一份未闭环提示（Lead 收尾前一定会调它）', () => {
+      if (waitLead.timedOut !== true) return JSON.stringify(waitLead);
+      if (!String((waitLead.diagnostics ?? []).join(' ')).includes('任务板未闭环 4 条')) return JSON.stringify(waitLead);
+      return true;
+    });
+    const waitMember = await closureWaitByMember.execute({}, { agent: scoutAgent, signal: execSignal() });
+    check('wait_agent：队员调用时不附加该提示', () => (waitMember.diagnostics === undefined ? true : JSON.stringify(waitMember)));
+
+    // ⑧ 全闭环后不许继续唠叨。
+    closureBoard = openBoard().map((task) => Object.assign({}, task, { status: 'completed', ownerName: 'builder-x' }));
+    const closedRows = await closureList.execute({}, { agent: leadAgent, signal: execSignal() });
+    const closedWait = await closureWait.execute({}, { agent: leadAgent, signal: execSignal() });
+    check('list_agents / wait_agent：任务板全完成后闭环节消失（长期噪音 = 会被模型忽略）', () => {
+      const rowNote = ((closedRows.find((item) => item.target === 'lead').diagnostics) ?? []).join(' ');
+      if (rowNote.includes('任务板')) return 'list_agents 还在唠叨：' + rowNote;
+      if ((closedWait.diagnostics ?? []).join(' ').includes('任务板')) return 'wait_agent 还在唠叨：' + JSON.stringify(closedWait.diagnostics);
+      return true;
+    });
+
+    // ⑨ 形状闸门：官方用 output.schema 校验工具返回值（dsh-tools/lib/index.js:3541-3544），
+    //    additionalProperties:false 意味着漏声明的新字段在模型侧变成 ToolOutputError。
+    closureBoard = openBoard();
+    const shapeValues = [
+      ['list_agents', closureList, await closureList.execute({}, { agent: leadAgent, signal: execSignal() })],
+      ['wait_agent', closureWait, await closureWait.execute({}, { agent: leadAgent, signal: execSignal() })],
+      ['report_result', closureReport, await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() })],
+      ['spawn_teammate', closureSpawn, await closureSpawn.execute({ role: 'builder', name: 'builder-s', description: 'x', prompt: 'y' }, { agent: leadAgent, signal: execSignal() })],
+    ];
+    const violations = [];
+    for (const [label, definition, value] of shapeValues) {
+      if (definition === undefined) { violations.push(label + ' 没拿到定义'); continue; }
+      violations.push(...dshTools.validateJsonSchemaValue(definition.output.schema, value, label));
+    }
+    check('闭环改动后的四个返回值都过官方 output schema（新字段必须进 schema）', () => (violations.length === 0 ? true : JSON.stringify(violations)));
+  })();
+
+
   // ── 8) 2026-10-01 修复的三件事：/team 的显示、宿主重启后团队工具被移除、队员唤醒 ─────────
   // 现场证据（两份真实会话日志，tools/session-probe.cjs --tools 可复现）：
   //   seq=360 request/header reason=resume series 工具 72 个 -[spawn_teammate, team_task_create, …]
@@ -2094,10 +2321,13 @@ async function main() {
       if (!names.includes('scout') || !names.includes('builder')) return `两个队员没都画出来：${names.join(',')}`;
       const notes = graphOnLead.notes ?? [];
       // 无活体（graph-ghost-1）+ 无 sessionPersistence → 必须记降级 note；有活体的 graph-member-1 不该记。
-      if (!notes.some((line) => line.includes('graph-ghost-1') && line.includes('sessionPersistence'))) {
+      // 2026-10-15：note 是结构化 {code, params}（句子由浏览器按语言拼），所以这里断
+      // code + params.sessionId —— 原来断的是中文字面上的 'sessionPersistence'，
+      // 那是拿文案当断言：改一个字这条就红，而行为没变。
+      if (!notes.some((note) => note.code === 'noLiveAgent' && note.params?.sessionId === 'graph-ghost-1')) {
         return `没记降级 note（读不到持久化必须说明，不能显示成 0）：${JSON.stringify(notes)}`;
       }
-      if (notes.some((line) => line.includes('graph-member-1'))) return `有活体的队员不该被记成降级：${JSON.stringify(notes)}`;
+      if (notes.some((note) => note.params?.sessionId === 'graph-member-1')) return `有活体的队员不该被记成降级：${JSON.stringify(notes)}`;
       return true;
     });
 
@@ -2115,6 +2345,158 @@ async function main() {
       return true;
     });
 
+    // ── 官方标签表：下发、指纹、按需省略（本轮新增，先于下面几条 check）──
+    // graphOnLead 就是第一次采集（上面 :2316），复用而不是再调一次：
+    // teamGraph 里 statsForSession 有缓存，多调一次虽无害，但语义上「第一次」应当只有一个。
+    const labelsFirst = graphOnLead;
+    const labelsFirstAgain = await restarted.teamGraph(root, 'graph-session-1');
+    // ── 官方标签表的下发与「不逐轮重发」（2026-10-15）───────────────────────
+    // ① 抓到一个真 bug：collectGraph 算了 toolLabels、runtime 原样透传，但
+    //    **lib/index.js 的 respond 里从来没有这个字段**（git show HEAD:lib/index.js
+    //    里 toolLabels 出现 0 次）。客户端 :4772 一直在读它 → 真机上 state.toolLabels
+    //    恒为 null：流式覆盖层的工具行退成泛泛「工具调用」，上一轮我做的
+    //    「英文界面按语言挑标签」在真机上**完全没生效**。
+    //    探针当时是绿的，因为它的手工 fixture 里塞了 toolLabels —— fixture 比真实路由
+    //    大方，这就是「探针给假绿灯」的成因。所以这里既测数据层，也钉路由转发。
+    const slim = await restarted.teamGraph(root, 'graph-session-1', labelsFirst.toolLabelsHash);
+    const stale = await restarted.teamGraph(root, 'graph-session-1', 'stale0000000000000000');
+    check('teamGraph：随图下发**双语**官方标签表 + 内容指纹', () => {
+      if (labelsFirst.ok !== true) return JSON.stringify(labelsFirst);
+      const labels = labelsFirst.toolLabels;
+      if (labels === undefined) return '没有 toolLabels（客户端拿不到官方标签，工具行只能显示中文/泛称）';
+      if (!labels.titles || !labels.titlesEn) return 'toolLabels 缺双语任一份：' + JSON.stringify(Object.keys(labels));
+      if (labels.titles.read !== '读取' || labels.titlesEn.read !== 'Read') {
+        return '表内容不对：read=' + labels.titles.read + '/' + labels.titlesEn.read;
+      }
+      if (labels.titles.grep !== '搜索文件内容' || labels.titlesEn.grep !== 'Grep') {
+        return 'grep 两侧不对：' + labels.titles.grep + '/' + labels.titlesEn.grep;
+      }
+      if (typeof labelsFirst.toolLabelsHash !== 'string' || labelsFirst.toolLabelsHash.length < 16) {
+        return '没有随表下发 toolLabelsHash（省掉每轮重发所依据的令牌）：' + JSON.stringify(labelsFirst.toolLabelsHash);
+      }
+      return true;
+    });
+
+    check('teamGraph：同一张表两次采集的指纹相同（否则「没变」永远判不出来）', () => {
+      // ⚠️ 先确认两边都是非空字符串再比：上一版直接比 !=，两侧都是 undefined 时
+      // 反而「相等」而绿 —— 那是空洞通过（本仓库抓到过好几次这类假绿灯）。
+      if (typeof labelsFirst.toolLabelsHash !== 'string' || labelsFirst.toolLabelsHash === '') {
+        return '第一次采集没有指纹：' + JSON.stringify(labelsFirst.toolLabelsHash);
+      }
+      if (typeof labelsFirstAgain.toolLabelsHash !== 'string' || labelsFirstAgain.toolLabelsHash === '') {
+        return '第二次采集没有指纹：' + JSON.stringify(labelsFirstAgain.toolLabelsHash);
+      }
+      if (labelsFirstAgain.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '同一份表两次算出不同 hash（' + labelsFirst.toolLabelsHash + ' vs ' + labelsFirstAgain.toolLabelsHash
+          + '）—— 拿进程时间/对象遍历顺序这类会变的值当指纹是错的';
+      }
+      return true;
+    });
+
+    check('teamGraph：客户端带上次的 hash 时省略表本体（每轮少发约 7KB）', () => {
+      // 用户 2026-10-15 的原话：「再把那张表的每轮重发省掉」。
+      // 实测代价：整张双语表 7,286 字节，同一次回包 graph 本体 30,656 字节 → 约 19% 白送。
+      if (slim.toolLabels !== undefined) return 'hash 对上了还重发表：' + JSON.stringify(slim.toolLabelsHash);
+      if (slim.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '省略时没回同一个 hash（客户端会误判成变了、下轮又全量要一次）：' + JSON.stringify(slim.toolLabelsHash);
+      }
+      if (!Array.isArray(slim.graph?.nodes)) return '省略表的同时把 graph 也弄丢了：' + JSON.stringify(Object.keys(slim));
+      const fullBytes = JSON.stringify(labelsFirst).length;
+      const slimBytes = JSON.stringify(slim).length;
+      const tableBytes = JSON.stringify(labelsFirst.toolLabels).length;
+      if (fullBytes - slimBytes < tableBytes - 200) {
+        return '省掉的字节不对（full=' + fullBytes + ' slim=' + slimBytes + ' 表=' + tableBytes + '）';
+      }
+      return true;
+    });
+
+    check('teamGraph：hash 过期/错误必须回全量表（否则升级过一次的浏览器永久停在旧文案）', () => {
+      if (stale.toolLabels === undefined) return '带了过期 hash 却没重发表（客户端缓存会停在旧文案）';
+      if (stale.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '重发表时 hash 反而变了：' + JSON.stringify(stale.toolLabelsHash);
+      }
+      return true;
+    });
+
+    check('lib/index.js 的 team-graph 必须把 toolLabels 与 hash 一起 respond（漏的就是这一步）', () => {
+      // 钉的是「算了但没发」这一整类：数据层算出的字段，回包层必须对得上。
+      const idxText = fs.readFileSync(path.join(PLUGIN_DIR, 'lib', 'index.js'), 'utf8');
+      const at = idxText.indexOf("case 'team-graph'");
+      if (at < 0) return '找不到 team-graph 分支（改名了？同步这条闸门）';
+      const block = idxText.slice(at, idxText.indexOf("case 'team-conversation'", at));
+      if (!block.includes('toolLabels')) return 'team-graph 的 respond 里没有 toolLabels（客户端永远拿不到官方标签表）';
+      if (!block.includes('toolLabelsHash')) return 'team-graph 的 respond 里没有 toolLabelsHash（省略机制无从比对）';
+      if (!/args\.toolLabelsHash/.test(block)) return '没读客户端传来的 args.toolLabelsHash（省略就无从触发）';
+      return true;
+    });
+
+    check('客户端：轮询要把上次的 hash 发回去，且省略时不清空已缓存的表', () => {
+      const cliText = fs.readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+      if (!/apiCall\('team-graph', \{ sessionId: state\.sessionId, toolLabelsHash:/.test(cliText)) {
+        return 'team-graph 轮询没带 hash 上去（服务端永远发全量，等于没省）';
+      }
+      // 断的是**行为**而不是花括号写法（上一版断的是 `…) {`，那等于规定必须换行写块）：
+      // 收表那一行必须被 undefined/null 守卫，否则省略那一轮会把缓存的表清掉。
+      if (!/if \(result\.toolLabels !== undefined && result\.toolLabels !== null\)[\s\S]{0,4}state\.toolLabels = result\.toolLabels/.test(cliText)) {
+        return '收表处没有被 undefined/null 守卫（省略那一轮会把缓存的官方标签表清空）';
+      }
+      if (!/if \(typeof result\.toolLabelsHash === 'string'\) state\.toolLabelsHash = result\.toolLabelsHash/.test(cliText)) {
+        return '客户端没把响应里的 hash 记下来（下一轮无从带上，省略永远不触发）';
+      }
+      return true;
+    });
+
+    // ── 真路由回包（上一轮漏的就是这一层）─────────────────────────────────
+    // 探针实测：路由 handler 用的是**顶层 runtime 实例**的记账，那里只有 resume-session-1
+    // 开着团（上面 :2248 的 runtime.enable(root, resumeOld)）；graph-session-1 是 restarted
+    // 那个新实例开的，走路由会被 isEnabled 挡成 notEnabled —— 不是 bug，是「模块实例 = 一份
+    // 独立记账」的正常表现（本文件重启那组就是这么设计的）。所以回包用 resume-session-1 验，
+    // 数据层用 graph-session-1 验（上面那几条）。
+    const routeFull = await callApi('POST', GATE, { op: 'team-graph', args: { sessionId: 'resume-session-1' } });
+    const routeFullBody = JSON.stringify(routeFull.payload);
+    const routeSlim = await callApi('POST', GATE, { op: 'team-graph',
+      args: { sessionId: 'resume-session-1', toolLabelsHash: routeFull.payload?.toolLabelsHash } });
+    const routeSlimBody = JSON.stringify(routeSlim.payload);
+    const routeStale = await callApi('POST', GATE, { op: 'team-graph',
+      args: { sessionId: 'resume-session-1', toolLabelsHash: 'stale0000000000000000' } });
+
+    check('真路由 team-graph：首次回包**带着**双语标签表与指纹（漏的那一层就在这）', () => {
+      if (routeFull.payload?.ok !== true) return '路由没出图：' + JSON.stringify(routeFull.payload);
+      const keys = Object.keys(routeFull.payload);
+      if (!keys.includes('toolLabels')) return '回包里没有 toolLabels（客户端永远拿不到官方标签表 → 工具行只能显示中文/泛称）';
+      if (!keys.includes('toolLabelsHash')) return '回包里没有 toolLabelsHash（省略机制无从比对）：' + keys.join(',');
+      if (!routeFull.payload.toolLabels.titlesEn) return '回包的表缺英文侧（英文界面挑不到）：' + JSON.stringify(Object.keys(routeFull.payload.toolLabels));
+      if (routeFull.payload.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '路由回的指纹与数据层不一致（省略永远对不上）：' + routeFull.payload.toolLabelsHash + ' vs ' + labelsFirst.toolLabelsHash;
+      }
+      return true;
+    });
+
+    check('真路由 team-graph：带 hash 的第二轮回包**不含**表本体，graph 与 notes 照旧', () => {
+      // 这条是「每轮重发省掉」的端到端证据：不是我以为省了，是回包字节里真的没有。
+      const parsed = JSON.parse(routeSlimBody);
+      if (parsed.toolLabels !== undefined) return '第二轮回包仍带着整张表（省不掉）：' + Object.keys(parsed).join(',');
+      if (parsed.toolLabelsHash !== routeFull.payload.toolLabelsHash) return '省略时回的指纹变了：' + parsed.toolLabelsHash;
+      if (!Array.isArray(parsed.graph?.nodes)) return '省略表时把 graph 也弄丢了：' + Object.keys(parsed).join(',');
+      if (!Array.isArray(parsed.notes)) return 'notes 通道被省略逻辑误伤：' + Object.keys(parsed).join(',');
+      // ⚠️ 用**字节**而不是字符串长度：正文里大量中文，UTF-8 一个字 3 字节，
+      // 拿 .length 当字节数会系统性低估（首轮 6966 字符 ≠ 6966 字节）。
+      const saved = Buffer.byteLength(routeFullBody, 'utf8') - Buffer.byteLength(routeSlimBody, 'utf8');
+      const table = Buffer.byteLength(JSON.stringify(routeFull.payload.toolLabels), 'utf8');
+      if (saved < table - 60) {
+        return '实际省下的字节远小于表体积（full=' + Buffer.byteLength(routeFullBody, 'utf8')
+          + ' slim=' + Buffer.byteLength(routeSlimBody, 'utf8') + ' 表=' + table + '，全部按字节）';
+      }
+      console.log('    team-graph 回包（字节）：首轮 ' + Buffer.byteLength(routeFullBody, 'utf8')
+        + ' B → 省略轮 ' + Buffer.byteLength(routeSlimBody, 'utf8') + ' B（省 ' + saved + ' B，表本体 ' + table + ' B）');
+      return true;
+    });
+
+    check('真路由 team-graph：过期 hash 时回包重新带表（浏览器升级后不会停在旧文案）', () => {
+      if (routeStale.payload?.toolLabels === undefined) return '过期 hash 却没回表：' + Object.keys(routeStale.payload ?? {}).join(',');
+      if (routeStale.payload.toolLabelsHash !== routeFull.payload.toolLabelsHash) return '回表时指纹反而变了';
+      return true;
+    });
     const graphNotEnabled = await restarted.teamGraph(root, 'fresh-session-1');
     check('teamGraph：没开团的会话 → notEnabled（页面据此提示先 /team，而不是画一张空图）', () => {
       if (graphNotEnabled.ok !== false) return JSON.stringify(graphNotEnabled);
@@ -2145,6 +2527,39 @@ async function main() {
     const convoPrefixed = await restarted.teamConversation(root, 'graph-session-1', 'session-graph-session-1');
     check('teamConversation：带 session- 前缀的合法 id 不被误拒（归一化两侧都做）', () => {
       if (convoPrefixed.ok !== true) return `被误拒了：${JSON.stringify(convoPrefixed)}`;
+      return true;
+    });
+    // ── 浮窗展开层：teamDetail（2026-10-14，工具行/正文行的「输入/输出」取数）──────
+    // 授权必须与 teamConversation **同一条白名单**：这个 op 读的是会话事件正文，
+    // 放开了就等于能翻任意会话的全部工具输出。共用 teamAllowedSessions 的判据由下面
+    // 两条越权用例守住（前缀与裸 id 各一条）。
+    const detailForeign = await restarted.teamDetail(root, 'graph-session-1', 'someone-elses-session', 'call:c1');
+    check('teamDetail：越权 targetId 被拒（与 teamConversation 同一条白名单）', () => {
+      if (detailForeign.ok !== false) return JSON.stringify(detailForeign);
+      if (!String(detailForeign.error).includes('本团队')) return String(detailForeign.error);
+      return true;
+    });
+    const detailForeignPrefixed = await restarted.teamDetail(root, 'graph-session-1', 'session-someone-elses-session', 'call:c1');
+    check('teamDetail：带前缀的越权 id 仍被拒（前缀不能绕过白名单）', () => {
+      if (detailForeignPrefixed.ok !== false) return '越权成功了：' + JSON.stringify(detailForeignPrefixed);
+      return true;
+    });
+    const detailMissingKey = await restarted.teamDetail(root, 'graph-session-1', 'graph-session-1', '');
+    check('teamDetail：缺 key 如实失败（不返回半份数据）', () => {
+      if (detailMissingKey.ok !== false) return JSON.stringify(detailMissingKey);
+      return true;
+    });
+    const detailSelf = await restarted.teamDetail(root, 'graph-session-1', 'graph-session-1', 'call:c1');
+    check('teamDetail：合法 target 不报越权；事件读不到时如实失败并给出原因', () => {
+      // 与 teamConversation **故意不同**的一条契约（2026-10-14 写这条时先跑了一次才知道会分叉，
+      // 于是把理由钉在这儿）：teamConversation 在同样情形下回 ok:true + rows:[] + note，
+      // 因为对话区必须**有东西可画**（空态里显示那句 note，不能让抽屉一片空白）。
+      // teamDetail 没有可降级的内容 —— 用户点开的就是这一份正文，取不到就是取不到，
+      // 报 ok:false + 原因才是真话；硬包装成 ok:true 会让浮窗显示一个空框，
+      // 看起来像「这次调用没有输出」，而那与「读不到」是两件不同的事。
+      if (String(detailSelf.error ?? '').includes('本团队')) return '合法 target 被判越权：' + JSON.stringify(detailSelf);
+      if (detailSelf.ok !== false) return '没有活体 agent 又没有持久化时必须如实失败：' + JSON.stringify(detailSelf);
+      if (!String(detailSelf.error).includes('读不到')) return '失败原因不可读：' + detailSelf.error;
       return true;
     });
     const convoForeignPrefixed = await restarted.teamConversation(root, 'graph-session-1', 'session-someone-elses-session');
@@ -2236,6 +2651,51 @@ async function main() {
         return true;
       });
     }
+    // ── teamSendImages 的分流（2026-10-14 审查 P1-2：这块此前**零覆盖**，
+    //   所以 Lead 分支写死的 mode:'queue' / 队员分支写死的 delivery:'queue' 一直没被发现）──
+    // 与 teamSend 必须同一条判据：官方判决式 dsh-api-session-controller/lib/index.js:882-883
+    // `request.mode === 'steer' ? agent.steer(message) : agent.followup(message)`，
+    // dsh-subagent/lib/index.js:1264 `parent.status === 'idle' ? 'queue' : 'steer'`。
+    // 不同步的后果：同一个人**带图**发消息只能排队，**不带图**就能插话 —— 用户 2026-10-13
+    // 报的就是「回复是排队不是插话」，那次只修了 teamSend 这一条路。
+    // 把 Lead 与一个队员切成 running —— 判据读的就是 agent.status，
+    // 不翻转状态的话两边都会得到 'queue'，那条断言就成了**永真**的空壳。
+    graphLead.status = 'running';
+    const runningMember = agents.find((a) => a.id === memberId);
+    if (runningMember !== undefined) runningMember.status = 'running';
+    const imagesLead = await restarted.teamSendImages(chatCtx, 'graph-session-1', 'graph-session-1', '看图',
+      [{ data: Buffer.from('fake').toString('base64'), mediaType: 'image/png', name: 'a.png' }]);
+    check('teamSendImages：Lead 在跑时带图消息也走 steer（与 teamSend 同判据，不许写死 queue）', () => {
+      if (imagesLead.ok !== true) return JSON.stringify(imagesLead);
+      const req = sentPrompts[sentPrompts.length - 1];
+      if (req.mode !== 'steer') return 'Lead 在跑时带图消息应插话（steer），实际 mode=' + req.mode + '（写死 queue 就是这里）';
+      return true;
+    });
+    // 图片本身要成 image 块（文字在前，与官方 hasPromptContent 一致）
+    check('teamSendImages：content = 文字块 + image 块（base64/mediaType 原样给官方落盘）', () => {
+      const req = sentPrompts[sentPrompts.length - 1];
+      if (req.content[0]?.type !== 'text' || req.content[0]?.text !== '看图') return JSON.stringify(req.content[0]);
+      if (req.content[1]?.type !== 'image') return '第二个块不是 image：' + JSON.stringify(req.content[1]?.type);
+      if (typeof req.content[1]?.data !== 'string' || req.content[1].data === '') return '缺 base64 data';
+      if (req.content[1]?.mediaType !== 'image/png') return 'mediaType 没透传';
+      if (typeof req.requestId !== 'string' || req.requestId === '') return '缺 requestId';
+      return true;
+    });
+    const imagesMember = memberId === undefined ? null : await restarted.teamSendImages(chatCtx, 'graph-session-1', memberId, '看图',
+      [{ data: Buffer.from('fake').toString('base64'), mediaType: 'image/png' }]);
+    if (imagesMember !== null) {
+      check('teamSendImages：队员分支同样不写死 queue（delivery 跟着 running 走）', () => {
+        if (imagesMember.ok !== true) return JSON.stringify(imagesMember);
+        const req = sentSubagents[sentSubagents.length - 1];
+        if (req.mode !== 'continuable') return 'mode 应该仍是 continuable：' + req.mode;
+        if (runningMember !== undefined && req.delivery !== 'steer') return '队员在跑却排了队：delivery=' + req.delivery;
+        if (!Array.isArray(req.content) || req.content[1]?.type !== 'image') return 'image 块没构造出来';
+        return true;
+      });
+    }
+
+    graphLead.status = 'active';
+    if (runningMember !== undefined) runningMember.status = 'inactive';
     // check() 是同步的，所以先把异步结果取出来再断言。
     const emptyBefore = sentPrompts.length;
     const emptySend = await restarted.teamSend(chatCtx, 'graph-session-1', 'graph-session-1', '   ');
