@@ -337,6 +337,21 @@ function functionBodyOf(source, needle) {
     return true;
   });
 
+  await check('统一选择那一排的 CSS：顶对齐 + 恒定提示槽 + 勾选格与下拉格等高', () => {
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
+    // 版面 bug 的另一半在 CSS 里，结构闸门看不见（把 align-items 改回 flex-end，67 条冒烟全绿），
+    // 所以这里钉住三条**决定对齐**的声明。改布局的人要同时改这里，改不动就说明对齐被破坏了。
+    if (cli.includes('.dat-bulk-ctl{display:flex;gap:8px 14px;flex-wrap:wrap;align-items:flex-start}')) {
+      // 现状
+    } else if (cli.includes('align-items:flex-end')) {
+      return '.dat-bulk-ctl 又回到底对齐了：带提示语的那一格会把整排顶歪（2026-10-15 用户第二次报版面）';
+    } else {
+      return '.dat-bulk-ctl 的声明形状变了，本条判据要按新 CSS 重写';
+    }
+    if (!cli.includes('.dat-hintslot{display:block;min-height:16px')) return '提示槽的恒定行高没了（没话时那一格会矮一截）';
+    if (!cli.includes('.dat-checkline{display:flex;align-items:center;gap:7px;height:24px')) return '勾选格不再与下拉格等高（24px 那条）';
+    return true;
+  });
   await check('批量调用档（roster 层）：默认开，只有显式 false 才关，非布尔不猜意图', () => {
     const logs = [];
     const log = (line) => logs.push(line);

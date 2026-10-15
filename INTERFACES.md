@@ -868,10 +868,17 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
    默认打勾（`batch` 缺省 = 开，只有显式 `false` 才关，所以「关」才落键、配置不会越长越脏）；
    统一那一格的判据是「**全部角色都开才打勾**」，不一致时旁边写一句原因（可以不准，不许静默）。
    闸门：`tools/client-smoke-test.cjs` §11 七条（读回来=显示、同级、开关往返、脏标记回得去）。
+ - **统一选择那一排的四格必须等高骨架**（2026-10-15 用户第二次报版面：「选择框不在一行，有些不美观」）：
+   `.dat-bulk-ctl` 是 **`align-items:flex-start`**（顶对齐），每格恒定三个孩子 —— `span.dat-label` /
+   控件 / `span.dat-hintslot`。**提示槽永远存在**，没话要说时也是空串而不是 `null`：一旦某格
+   只在"有提示"时才有第三个孩子，那格就比别人高一行，底对齐的旧 CSS 会把它的下拉整个顶上去
+   （截图里「agent 预设」高出半截就是这么来的）。勾选格的 `.dat-checkline` 固定 `height:24px`
+   并带同款描边，与 `select` 同高。判据两半：结构在 `client-smoke` §12（含"全一致时也必须有空槽"
+   那份配置 —— 第一版只测了"有话时三个孩子"，变异「没话时省掉槽」完全不红，是空转闸门），
+   CSS 在 `selftest` 那条（把 `flex-start` 改回 `flex-end`，67 条冒烟全绿，只有这条会红）。
  - **草稿行只有一个构造口 `makeRow(key, effort, preset, batch)`**：加第四维时把原先散在 14 处的
    对象字面量全部收进来。selftest 那条闸门因此从「禁两字段形状」升级成「禁任何绕过 makeRow 的
    行字面量」—— 判据是十几条**字面文本**而不是正则（正则的转义在多层 here-string 里被吃掉过）。
-
 - **绝对不要**：写 `context.mutate` 之外的通道、注入本包没声明的服务、import 本包没声明的模块。
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
