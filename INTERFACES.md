@@ -490,6 +490,49 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 断言队员与 Lead 都拿到目录、`disable-model-invocation` 的技能被过滤掉，并有负对照
 （显式 `deny: ['skill']` 后工具与目录**同时**消失）。
 
+### 3.6 队员的 agent 预设（2026-10-15，用户功能）
+
+**一句话**：Lead 用调度模式，但 12 个队员可以各自跑 PTC / 标准 / 极简灰度中的任一份组合。
+
+**为什么必须插件自己做**：官方子代理的组合是硬编码继承父的实时 preset，
+`dsh-subagent/lib/types/child-agent.js:157-158` 的 `applyChildComposition` 第一行就是
+`composeFrom(childCtx, parent.ctx)`，而 `composeFrom(ctx, parent)`（官方
+`dsh-agent-preset-registry/lib/index.js:708-718`）**没有 preset 参数**。
+官方给的口子是**换挂载**：`select(agent, id)` → `recompose` → `bind` →
+`binding.parent.rebind(新代际.key)`（同文件 `:661-674`）。生效机制是**读时**的：
+`dsh-tools/lib/index.js:2959-2984` 的 `view(scope)` 每次都走 `layers.chainLayers(scope)`
+→ `scopeChainOf(key)`（`dsh-scope/lib/index.js:162-169`），所以换父 = 换继承面；
+队员 **own 层**（我们注册的队员卡段与团队工具）按自己的 key 存，不受影响 —— `view()`
+的注释原话：restrict 只过滤继承面，「and never what its OWN layer registers」。
+
+**落点**：`lib/runtime.js` 的 `rebindMemberPreset(ctx, agent, role, notes)`，由
+`installMember` 在**最前面**发起（不 await；句柄存进 `state.installed` 的 `rebind` 字段）。
+三条规则，按顺序判：
+
+| 情况 | 判据 | 动作 | 依据 |
+|---|---|---|---|
+| 重启后恢复的老队员 | 会话投影 `agentPreset` ≠ 活体 `composedPreset` | `mount(agent.ctx, 投影值)` 对齐回**日志** | 官方 `dsh-agent-preset-registry/lib/index.js:31-58`：重建读投影不读 header |
+| 新队员且配了预设 | 投影 == 活体（都还是 Lead 的）且 `want` 非空 | `select(agent, want)`：换挂载 + 落 `agent-preset/selected` | 官方同文件 `:753-771` |
+| 已开播却改了配置 | `select` 抛 `agent-preset/locked` | **不绕**：记一条「面板改动只对之后新派的队员生效」 | 官方同文件 `:739-745` 的 turnBoundary 锁 |
+
+任何失败（服务缺席 / id 没装 / 那份组合 broken）都只记诊断，队员保持跟随 Lead —— 与
+`restrictTeammateTools` 同一套「逐个 try/catch，绝不打掉 spawn」的纪律。
+
+**配置形状**：`roles.<id>.preset`（白名单见 `TEAMMATE_PRESET_IDS`：`ptc` / `standard` /
+`minimal-grayscale`，用户 2026-10-15 定案只放这三个）。空 / 缺省 = 跟随 Lead = 不重绑。
+`sanitizeConfig` 允许**只配预设不配模型**（旧写法在 provider/model 不配对时 `continue`
+会把整行丢掉）；路由层 `validateRoles` 对白名单外**直接拒绝** —— 表单输入被静默丢掉等于骗用户。
+
+**代价（必须告诉用户）**：队员的系统提示词前缀过去是「全队一份」，现在按
+**（preset, 模型）分组**共享。混用多种预设会把前缀切成几份，跨组不再命中缓存。
+默认「跟随 Lead」= 零变化，这条只在你主动选之后成立。
+
+**测试覆盖**：`integration-test` §7.9 用**真的** `dsh-scope` 父子链 + 真的 `dsh-tools.view()`
+（不是替身）：每份组合各注册一个独占工具与一句 persona，断言换预设后**工具集与 persona 同时变**、
+own 层团队工具不受伤、会话日志落了 `agent-preset/selected` 且投影被推进、已开播的不绕锁、
+id 没装时降级并留诊断。路由层另有 5 条（只配预设能落盘 / 读回来一致 / 可用性表形状 /
+白名单外拒绝 / `roles` 整表替换语义）。`drift-check` 8 条钉住上面引用的每一处官方实现。
+
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
 九个工具的**蓝本是官方 0.1.7 源码**（照抄，不要自创）：
@@ -746,6 +789,13 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
   `wsDrawerRelations` / `wsDrawerNoRel` / `wsDrawerTasks` / `wsDrawerNoTask`（2026-10-08 删区块时忘了删文案）、
   `cacheModeDefault`（zh+en，模式下拉只有 auto/on/off）、`wsCacheRead`（卡片用的是硬编码的 `cache` 微标签）、
   `wsStateProvisioning`（`wsStateOf` 把 provisioning 归进 running）、`wsQSentAsMsg`（被 `wsQNotSettled` 取代）。
+- **队员 agent 预设这一列（2026-10-15）**：宿主只发事实 —— `agentPresets: {presets:[{id,name,available,reason,detail?}], notes:[]}`
+  （'`reason`' 只有 `not-registered` / `broken` / 空 三种），句子由页面拼；显示名照官方
+  `presetDisplayText` 的次序：注册表发布的 `name` → 官方 locale 的内置名（绑 `settings.agentPreset`
+  命名空间读 `presetStandardName` 等键，**不复制第二份中文**）→ 本文件字典 → id。
+  不可用的 id **留着并禁用 + 括号写原因**，不藏（藏起来只会让人以为功能坏了）；宿主没带这张表时整列
+  禁用并给出唯一原因。草稿行是 `{key, effort, preset}` 三字段对象，被 8 处重新构造 ——
+  **任何一处漏带一个字段就是静默丢配置**，所以 `tools/selftest.cjs` 直接禁掉两字段形状。
 - **绝对不要**：写 `context.mutate` 之外的通道、注入本包没声明的服务、import 本包没声明的模块。
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
@@ -832,6 +882,20 @@ URL 级事实：**必须**用 `key: '@zws/dsh-dispatch-agent-team'`；`view: 'su
   里必须出现该符号），勘误表整行（日期化历史）与官方包路径（全路径尾巴 / 跨行折断 /
   句中点了 mcp-manager、dsh-xxx 的速记）都跳过，宁少判不误判。
 
+- **报告器契约要写清「怎么算失败」，否则闸门会静默空转**（2026-10-15 实修）：
+  `tools/selftest.cjs` 的 `check()` 过去只看「有没有抛错」，**返回值里的原因字符串被当成 PASS**；
+  而 `tools/drift-check.cjs` 的 `check()` 是「返回非空字符串 = FAIL」。两套并存的结果是：照
+  drift-check 的写法给 selftest 加闸门，**从诞生起就是绿的**，改坏被检代码也不报。现在 selftest
+  与 drift-check 同契约（返回非空字符串一律 FAIL），既有 107 条无一受影响（它们都用 `assert` 抛错）。
+  教训：**新加一条闸门时必须做一次变异测试** —— 把它保护的那段代码改坏，看它咬不咬；不咬的闸门比没有更坏，
+  因为它给出的是「已经覆盖了」的假证据。本轮两条预设闸门正是靠变异测试现形的。
+- **测试之间不许泄漏共享状态**：`integration-test` §7.9 的「预设没装」负例把 fake 注册表里的一项
+  `stands.delete(...)` 了没还原，后面路由层读注册表的那条闸门就假失败（第一版就是这样）。
+  负例要**当场还原**，并且把「为什么必须还原」写在删除处。
+- **引用官方文件必须拼全包名**（同一天踩到）：注释里写裸 `lib/index.js:708` 指官方注册表，
+  而**本仓库也有** `lib/index.js` —— 行号闸门按本仓库解释，于是把我引到「符号对得上但指的是
+  另一处同名调用」的错上（`apply()` 的 `loadConfig` 预热在 :490，我引的 :250 是路由里另一处）。
+  规矩：官方的一律写 `dsh-xxx/lib/index.js:NNN`；本仓库的才允许裸路径。
 - 只写自己名下的文件；**不要**动别人名下的文件，也不要动本文件与已冻结文件。
 - 每个 JS 文件写完后跑 `node --check <file>`（`lib/client.js` 会被 `node --check` 当作 CJS，
   它用了 `window`——用 `node --check` 仍可语法校验，若要更稳可只跑语法检查不看运行）。
