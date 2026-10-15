@@ -1823,6 +1823,116 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
+  // ── 队员 agent 预设重绑所依赖的官方实现（2026-10-15 新增）──────────────────
+  // 「让 12 个队员各选一份预设」不是我们自己的机制：它完全建立在官方注册表的
+  // mount/select/bind/rebind + 作用域链读时求值之上。官方任何一处改版，本功能会
+  // **静默退化**成「队员还是调度模式」，所以逐条钉住。
+  check('官方 agentPresets 仍给 list / composedPreset / mount / select 四个方法', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    for (const needle of ['async list() {', 'composedPreset(ctx) {', 'async mount(ctx, id) {', 'async select(agent, agentPreset) {']) {
+      if (!reg.includes(needle)) return '官方注册表少了 ' + needle + ' —— 配置页的预设表/重绑的依据要重读';
+    }
+    return true;
+  });
+
+  check('重绑的落点：bind() 仍用 binding.parent.rebind(新代际.key) 换父', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    if (!reg.includes('binding.parent.rebind(generation.key)')) {
+      return 'bind() 不再走 rebind 换父 —— 换预设的机制变了，lib/runtime.js 的 rebindMemberPreset 要重读（可能已不需要，也可能根本做不到）';
+    }
+    if (!reg.includes('this.join(ctx, key, generation)')) return 'join() 的调用形状变了';
+    return true;
+  });
+
+  check('dsh-scope：rebind 仍是一等能力，且父链是**读时**遍历（换父立刻生效）', () => {
+    const scope = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
+    if (scope === '') return '读不到 dsh-scope/lib/index.js';
+    if (!scope.includes('return { rebind(next) {')) return 'bindScopeParent 不再返回 rebind 句柄 —— 换父这条路没了';
+    if (!scope.includes('for (const key of scopeChainOf(scope).reverse())')) {
+      return 'chainLayers 不再每次读时走 scopeChainOf —— 换父后工具/提示词可能不重算，队员预设会「改了没反应」';
+    }
+    const tools = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
+    if (tools === '') return '读不到 dsh-tools/lib/index.js';
+    if (!tools.includes('const layers = this.layers.chainLayers(scope);')) {
+      return 'tools.view() 不再用 chainLayers(scope) —— 继承面算法变了，本插件对「换 preset = 换工具」的判断要重读';
+    }
+    // own 层豁免也是前提：我们注册的团队工具/队员卡必须不受重绑影响。
+    if (!/and never what its OWN layer registers/.test(tools)) return 'restrict/view 的 own 层豁免注释变了 —— 重读「重绑不伤 own 层」这条断言的依据';
+    return true;
+  });
+
+  check('子代理仍**硬编码**继承父的实时 preset（所以必须我们重绑，官方没给参数）', () => {
+    const child = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/types/child-agent.js') || '';
+    if (child === '') return '读不到 dsh-subagent/lib/types/child-agent.js';
+    if (!child.includes("childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)")) {
+      return 'applyChildComposition 的继承写法变了 —— 若官方哪天给了 per-child preset 参数，'
+        + 'lib/runtime.js 的重绑就该换成官方入口（我们这套是绕不过去时才需要的）';
+    }
+    if (!child.includes("const agentPreset = parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)")) {
+      return 'childSessionMeta 不再把父的 preset 写进子的 header —— 恢复分支（以日志为准对齐）的依据要重读';
+    }
+    return true;
+  });
+
+  check('会话重建读 agentPreset **投影**（header + selected 事件），所以我们落的事件有效', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    if (!reg.includes('key: "agentPreset"')) return 'agentPreset 投影的键变了（lib/runtime.js 读 sessionProjections 的那个键要跟着改）';
+    if (!reg.includes('init: (header) => header.agentPreset ?? null')) return '投影初值不再取自 header —— 恢复分支的判断要重读';
+    if (!reg.includes('event.type === "agent-preset/selected"')) return '投影不再由 selected 事件推进 —— 我们落盘那条就白写了';
+    return true;
+  });
+
+  check('官方 select() 仍用 turnBoundary 锁住已开播的会话（我们不绕这条）', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    if (!reg.includes('boundary.openTurnStartSeq !== null || boundary.lastTurn > 0')) {
+      return 'select() 的锁定判据变了 —— 插件里「已开播就记下次派活生效」那条分支要按新判据重写';
+    }
+    if (!reg.includes('"agent-preset/locked"')) return '锁定错误码改名：lib/runtime.js 的 /locked|already started/ 匹配要更新';
+    return true;
+  });
+
+  check('内置组合的显示名仍由官方 locale 出（我们抄的是键名表，不是文案）', () => {
+    const cli = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-agent-preset/lib/client.js') || '';
+    if (cli === '') return '读不到 dsh-client-ui-agent-preset/lib/client.js';
+    if (!cli.includes('const BUILT_IN_PRESET_KEYS = {')) return '官方那张 id→键名 表改名/重构 —— presetLabel 的退路要重读';
+    for (const needle of ['presetStandardName', 'presetPtcName', 'presetMinimalName', 'presetCordisName']) {
+      if (!cli.includes(needle)) return '官方 locale 键 ' + needle + ' 不在了（本文件 BUILT_IN_PRESET_NAME_KEYS 与字典里的 presetName* 要跟着改）';
+    }
+    // 我们那份映射必须与官方那张逐字一致，否则内置组合在页面上会退回显示裸 id。
+    const client = readFileOr(path.join(PLUGIN_DIR, 'lib', 'client.js'));
+    for (const pair of [["standard: 'presetStandardName'", "ptc: 'presetPtcName'"], ["minimal: 'presetMinimalName'", "cordis: 'presetCordisName'"]]) {
+      for (const needle of pair) {
+        if (!client.includes(needle)) return 'lib/client.js 的 BUILT_IN_PRESET_NAME_KEYS 少了 ' + needle + '（与官方那张表不再逐字一致）';
+      }
+    }
+    return true;
+  });
+
+  check('白名单三个 id 在本机真的注册着（standard/ptc 来自官方 bundle，极简灰度来自 profile patch）', () => {
+    const roster = readFileOr(path.join(PLUGIN_DIR, 'lib', 'roster.js'));
+    const ids = ['ptc', 'standard', 'minimal-grayscale'];
+    for (const id of ids) {
+      if (!roster.includes("'" + id + "'")) return 'TEAMMATE_PRESET_IDS 里不再有 ' + id + ' —— 本闸门的判据要按新名单重写';
+    }
+    for (const [id, file] of [['standard', 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml'], ['ptc', 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/ptc.patch.yml']]) {
+      const text = asar.read(file) || '';
+      if (text === '') return '读不到 ' + file + '（内置组合的声明位置变了？）';
+      // 不用 \b（在字符串字面量里它会被解析成退格符，正则永远匹配不上）：直接要求 id 后面
+      // 不能再是标识符字符或短横线，等价于「整段 id 精确匹配」。
+      if (!new RegExp('id: ' + id + '[^\wA-Za-z0-9_-]').test(text + ' ')) return
+    }
+    const profile = readFileOr(path.join(PROFILE_DIR, 'cordis.patch.yml'));
+    if (!profile.includes('preset-minimal-grayscale')) {
+      return 'profile patch 里没有 preset-minimal-grayscale：白名单第三项在这台机器上不存在。'
+        + '配置页会把它标成「本机没装」（这是正确降级），但用户点名要的三个模式少了一个 —— 要么改名单，要么把那份预设装回来';
+    }
+    return true;
+  });
+
   // ── 输出 ───────────────────────────────────────────────────────────────────
   let failed = 0;
   let skipped = 0;

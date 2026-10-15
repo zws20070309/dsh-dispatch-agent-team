@@ -36,7 +36,11 @@ let envSkipped = 0;
 
 async function check(name, fn) {
   try {
-    await fn();
+    const outcome = await fn();
+    // 返回**非空字符串**也算失败（与 tools/drift-check.cjs 的报告器同一契约）。
+    // 旧写法只看「有没有抛错」，于是用 return 原因字符串 表达的断言**永远绿** —— 2026-10-15
+    // 新加的两条预设闸门就是这么空转了一轮，靠变异测试（把被检代码改坏、看闸门咬不咬）才抓出来。
+    if (typeof outcome === 'string' && outcome !== '') throw new Error(outcome);
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (error) {
@@ -275,6 +279,56 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.resolveRoleRoute({ roles: {} }, 'not-a-role'), undefined);
     const withEffort = roster.sanitizeConfig({ roles: { builder: { provider: 'p', model: 'm', reasoningEffort: 'low' } } });
     assert.equal(roster.resolveRoleRoute(withEffort, 'builder').reasoningEffort, 'low');
+  });
+
+  await check('角色预设配置：sanitizeConfig 允许「只配预设不配模型」，resolveRolePreset 只认白名单', () => {
+    const logs = [];
+    const log = (message) => logs.push(message);
+    const onlyPreset = roster.sanitizeConfig({ version: 1, roles: { scout: { preset: 'standard' } } }, log);
+    if (onlyPreset.roles.scout === undefined) return '只配预设的角色被整条丢掉了（旧实现 provider/model 不配对就 continue）：' + JSON.stringify(onlyPreset.roles);
+    if (onlyPreset.roles.scout.preset !== 'standard') return 'preset 没被留下：' + JSON.stringify(onlyPreset.roles.scout);
+    if (roster.resolveRolePreset(onlyPreset, 'scout') !== 'standard') return 'resolveRolePreset 读不回 standard';
+    // 白名单外：丢字段 + 记一条诊断，绝不静默接受（也不抛错）。
+    const bogus = roster.sanitizeConfig({ version: 1, roles: { scout: { preset: 'cordis' } } }, log);
+    if (bogus.roles.scout !== undefined) return '白名单外的预设竟然留下了：' + JSON.stringify(bogus.roles.scout);
+    if (!logs.some((line) => /cordis/.test(line))) return '丢掉白名单外的预设时没留下任何诊断：' + logs.join(' | ');
+    // 空串 = 跟随 Lead：不落键（这样「取消某角色的预设」与「从没配过」在磁盘上是同一个形状）。
+    const cleared = roster.sanitizeConfig({ version: 1, roles: { scout: { preset: '' } } }, log);
+    if (cleared.roles.scout !== undefined) return '空串预设应该等于跟随 Lead（不落键）：' + JSON.stringify(cleared.roles.scout);
+    if (roster.resolveRolePreset(cleared, 'scout') !== undefined) return 'resolveRolePreset 对未配置的角色必须回 undefined';
+    // 未净化的对象也不能被信任（防调用方把 raw 传进来）。
+    if (roster.resolveRolePreset({ roles: { scout: { preset: 'evil' } } }, 'scout') !== undefined) return 'resolveRolePreset 没再挡一次白名单';
+    // 三个 id 是用户点名要的那三个，顺序即下拉顺序；改动会同时影响配置页与运行时。
+    if (JSON.stringify(roster.TEAMMATE_PRESET_IDS) !== JSON.stringify(['ptc', 'standard', 'minimal-grayscale'])) {
+      return 'TEAMMATE_PRESET_IDS 与用户定案的名单不一致：' + roster.TEAMMATE_PRESET_IDS.join(', ');
+    }
+    return true;
+  });
+
+  await check('草稿管道每个构造函数都必须带 preset 维度（漏一个字段 = 保存时静默丢配置）', () => {
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
+    // 这一条是 2026-10-15 加预设列时踩出来的：草稿行是 {key, effort, preset} 三字段对象，
+    // 而它被 8 处重新构造（cloneDraft / trimDraft / sanitizeDraftAgainstCatalog /
+    // changeModel / changeAllModels / changeEffort / changeAllEfforts / renderRow 默认值）。
+    // 任何一处写回两字段，用户改另一列时这一列就被悄悄抹掉 —— 页面显示正常、保存回执正常，
+    // 只有下次载入才发现。所以直接禁掉「两字段形状」。
+    const twoField = [
+      '{ key: row.key, effort: row.effort }',
+      "{ key: '', effort: '' } : draft[role.id]",
+    ];
+    const hits = [];
+    for (const needle of twoField) {
+      if (cli.includes(needle)) hits.push(needle);
+    }
+    // changeModel 里「清掉模型」的分支也必须保住 preset。这里用字面量而不是正则：上一版写成正则，转义在多层 here-string 里被吃掉，闸门空转了一整轮才由变异测试抓出来。
+    if (cli.includes("if (key === '') delete next[roleId]")) {
+      hits.push('changeModel 清模型时连带删掉整行');
+    }
+    if (hits.length > 0) return '这些草稿构造漏了 preset 维度：' + hits.join(' ; ');
+    for (const needle of ['changePreset', 'changeAllPresets', 'renderPreset', 'normalizePresets']) {
+      if (!cli.includes(needle)) return '客户端少了 ' + needle + '（预设列被删了？）';
+    }
+    return true;
   });
 
   await check('configuredRoleCount：数被覆盖的角色', () => {
