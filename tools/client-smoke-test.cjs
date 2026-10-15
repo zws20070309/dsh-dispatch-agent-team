@@ -1312,6 +1312,103 @@ async function main() {
       return true;
     });
   }
+  // ── 12) 统一选择那一排的**等高骨架**（2026-10-15 用户第二次报版面：四格不在一条线上）──
+  //
+  // 现象：「agent 预设」整格比旁边高出一截。根因是 .dat-bulk-ctl 底对齐 + **只有那一格**
+  // 多了第三个孩子（提示语）：格子变高，底对齐就把它的 select 往上推。
+  // 所以判据不是「有没有提示语」，而是**每格的孩子数与形状必须一致**：标题 / 控件 / 提示槽。
+  // 提示槽恒定存在（没话也说空串），四格才永远等高，提示出现/消失时版面也不跳。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { scout: { preset: 'ptc', batch: false }, builder: { preset: 'standard' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }, { id: 'standard', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'bbb:2', diagnostics: [] },
+    });
+    const ctl = findAll(page.tree(), (node) => node.type === 'div' && node.props.className === 'dat-bulk-ctl')[0];
+
+    check('统一选择：四格都是「标题 + 控件 + 提示槽」三件套（等高骨架，谁也不会被顶上去）', () => {
+      if (ctl === undefined) return '找不到 dat-bulk-ctl';
+      const cells = (ctl.props.children || []).filter((node) => node.type === 'label' && node.props.className === 'dat-field');
+      if (cells.length !== 4) return '统一块里应有 4 格，实得 ' + cells.length;
+      const bad = [];
+      for (const cell of cells) {
+        const kids = (cell.props.children || []);
+        const head = kids[0];
+        const slot = kids[kids.length - 1];
+        const title = head === undefined || head.props === undefined ? '' : textOf(head);
+        if (kids.length !== 3) { bad.push(title + '（' + kids.length + ' 个孩子）'); continue; }
+        if (head.props.className !== 'dat-label') bad.push(title + '（第一个孩子不是 dat-label）');
+        else if (slot === undefined || slot.props === undefined || slot.props.className !== 'dat-hintslot') bad.push(title + '（末尾没有恒定的 dat-hintslot）');
+      }
+      if (bad.length > 0) return '这些格不符合三件套：' + bad.join(' | ');
+      return true;
+    });
+
+    check('提示槽恒定占位：没话的格是空串（不是 null），有话的格把原因写在自己槽里', () => {
+      const cells = (ctl.props.children || []).filter((node) => node.type === 'label' && node.props.className === 'dat-field');
+      const slotTextOf = (wantLabel) => {
+        for (const cell of cells) {
+          const kids = cell.props.children || [];
+          if (kids.length === 0 || kids[0].props === undefined || textOf(kids[0]) !== wantLabel) continue;
+          const slot = kids[kids.length - 1];
+          if (slot === undefined || slot.props === undefined || slot.props.className !== 'dat-hintslot') return '(那格没有提示槽)';
+          return textOf(slot);
+        }
+        return '(找不到那一格)';
+      };
+      // 这份配置：预设三行不一致（ptc / standard / 空）、批量也不一致（scout 关着），模型与强度一致或没得说。
+      const problems = [];
+      if (slotTextOf('模型（应用到全部角色）') !== '') problems.push('模型格本该是空槽');
+      if (slotTextOf('思考强度（应用到全部角色）') !== '') problems.push('强度格本该是空槽（长原因由下面的 dat-note 承担）');
+      if (!slotTextOf('agent 预设（应用到全部角色）').includes('不一致')) problems.push('预设格的不一致原因没写进自己槽里：' + slotTextOf('agent 预设（应用到全部角色）'));
+      if (!slotTextOf('批量调用（应用到全部角色）').includes('不一致')) problems.push('批量格的不一致原因没写进自己槽里：' + slotTextOf('批量调用（应用到全部角色）'));
+      return problems.length === 0 ? true : problems.join(' | ');
+    });
+  }
+
+  {
+    // 上面那份配置里**每一格都有话要说**（预设/批量都不一致），所以「有提示时是三个孩子」
+    // 那种断言抓不到真正的病：**没话要说时**把提示槽写成 null，格子就矮一截，底对齐的
+    // 老 CSS 会把旁边整排顶歪。第一版闸门就是这个空转的（变异「presetHint 为空时不渲染槽」
+    // 完全没红），这里补一份「全一致」的配置专门盯空槽。
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { researcher: { preset: 'ptc' }, scout: { preset: 'ptc' }, builder: { preset: 'ptc' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'bbb:2', diagnostics: [] },
+    });
+
+    check('四格全一致时（没话要说）提示槽仍然必须存在且为空串 —— 不许写成 null', () => {
+      const ctl = findAll(page.tree(), (node) => node.type === 'div' && node.props.className === 'dat-bulk-ctl')[0];
+      if (ctl === undefined) return '找不到 dat-bulk-ctl';
+      const cells = (ctl.props.children || []).filter((node) => node.type === 'label' && node.props.className === 'dat-field');
+      if (cells.length !== 4) return '应有 4 格，实得 ' + cells.length;
+      const bad = [];
+      for (const cell of cells) {
+        const kids = cell.props.children || [];
+        const title = kids.length === 0 || kids[0].props === undefined ? '(无标题)' : textOf(kids[0]);
+        const slot = kids.length === 0 ? undefined : kids[kids.length - 1];
+        if (kids.length !== 3) { bad.push(title + '（' + kids.length + ' 个孩子：没话时槽被省掉了）'); continue; }
+        if (slot === undefined || slot.props === undefined || slot.props.className !== 'dat-hintslot') { bad.push(title + '（末尾不是 dat-hintslot）'); continue; }
+        if (textOf(slot) !== '') bad.push(title + '（本该空槽，实得 ' + textOf(slot) + '）');
+      }
+      return bad.length === 0 ? true : '这些格在「没话要说」时破坏了等高骨架：' + bad.join(' | ');
+    });
+  }
+
   // ── 7) 加载失败路径 ───────────────────────────────────────────────────────
   {
     const page = await mount({
