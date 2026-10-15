@@ -305,32 +305,57 @@ function functionBodyOf(source, needle) {
     return true;
   });
 
-  await check('草稿管道每个构造函数都必须带 preset 维度（漏一个字段 = 保存时静默丢配置）', () => {
+  await check('草稿行只有一个构造口 makeRow，四个维度（模型/强度/预设/批量）都在里面', () => {
     const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
-    // 这一条是 2026-10-15 加预设列时踩出来的：草稿行是 {key, effort, preset} 三字段对象，
-    // 而它被 8 处重新构造（cloneDraft / trimDraft / sanitizeDraftAgainstCatalog /
-    // changeModel / changeAllModels / changeEffort / changeAllEfforts / renderRow 默认值）。
-    // 任何一处写回两字段，用户改另一列时这一列就被悄悄抹掉 —— 页面显示正常、保存回执正常，
-    // 只有下次载入才发现。所以直接禁掉「两字段形状」。
-    const twoField = [
+    // 2026-10-15 加预设列时踩过「十几处各自写字面量、漏一处就静默丢配置」；同日加第四维（batch）
+    // 时把构造口收成一个 makeRow。所以这条闸门从「禁两字段形状」升级成**禁任何绕过 makeRow 的
+    // 行字面量** —— 判据用真实文本，不用正则（上一版写正则，转义在多层 here-string 里被吃掉，
+    // 闸门空转了一整轮才由变异测试抓出来）。
+    if (!cli.includes('function makeRow(key, effort, preset, batch)')) return 'makeRow 构造口没了（回到十几处字面量 = 老坑复发）';
+    if (!cli.includes('batch: batch !== false,')) return 'makeRow 不再把 batch 归一成布尔（默认开 = 只有显式 false 才关）';
+    const forbidden = [
       '{ key: row.key, effort: row.effort }',
       "{ key: '', effort: '' } : draft[role.id]",
+      '{ key: row.key, effort: row.effort, preset:',
+      '{ key: row.key, effort, preset:',
+      '{ key, effort, preset }',
+      "{ key: '', effort: '', preset }",
+      "{ key: '', effort: '', preset: keep }",
+      'out[roleId] = { key: row.key',
+      'next[roleId] = { key',
+      'draft[roleId] = { key',
     ];
-    const hits = [];
-    for (const needle of twoField) {
-      if (cli.includes(needle)) hits.push(needle);
+    const hits = forbidden.filter((needle) => cli.includes(needle));
+    if (hits.length > 0) return '这些草稿行绕过了 makeRow：' + hits.join(' ; ');
+    if (cli.includes("if (key === '') delete next[roleId]")) return 'changeModel 清模型时连带删掉整行';
+    for (const needle of ['changePreset', 'changeAllPresets', 'renderPreset', 'normalizePresets',
+      'changeBatch', 'changeAllBatch', 'entry.batch = false', 'rowIsEmpty(nextRow)']) {
+      if (!cli.includes(needle)) return '客户端少了 ' + needle + '（批量调用那一维被删了？）';
     }
-    // changeModel 里「清掉模型」的分支也必须保住 preset。这里用字面量而不是正则：上一版写成正则，转义在多层 here-string 里被吃掉，闸门空转了一整轮才由变异测试抓出来。
-    if (cli.includes("if (key === '') delete next[roleId]")) {
-      hits.push('changeModel 清模型时连带删掉整行');
-    }
-    if (hits.length > 0) return '这些草稿构造漏了 preset 维度：' + hits.join(' ; ');
-    for (const needle of ['changePreset', 'changeAllPresets', 'renderPreset', 'normalizePresets']) {
-      if (!cli.includes(needle)) return '客户端少了 ' + needle + '（预设列被删了？）';
-    }
+    // 第四维必须进指纹：否则「只拨开关」永远不算未保存改动，用户以为保存过了。
+    if (!cli.includes("row.batch === false ? '0' : '1'")) return 'draftSignature 没带上 batch 维度';
     return true;
   });
 
+  await check('批量调用档（roster 层）：默认开，只有显式 false 才关，非布尔不猜意图', () => {
+    const logs = [];
+    const log = (line) => logs.push(line);
+    assert.equal(roster.roleBatchOn(roster.defaultConfig(), 'scout'), true, '空配置默认应为开');
+    assert.equal(roster.roleBatchOn(void 0, 'scout'), true, '连配置都没有时也应为开');
+    assert.equal(roster.roleBatchOn({ roles: { scout: { batch: false } } }, 'scout'), false, '显式 false 应为关');
+    assert.equal(roster.roleBatchOn({ roles: { scout: { batch: true } } }, 'scout'), true, '显式 true 应为开');
+    assert.equal(roster.roleBatchOn({ roles: { builder: { batch: false } } }, 'scout'), true, '别的角色关掉不该牵连 scout');
+    const only = roster.sanitizeConfig({ roles: { scout: { batch: false } } }, log);
+    assert.deepEqual(only.roles.scout, { batch: false }, '只配 batch:false 的行被整条丢掉了（等于关不掉）');
+    const on = roster.sanitizeConfig({ roles: { scout: { batch: true, preset: 'ptc' } } }, log);
+    assert.deepEqual(on.roles.scout, { preset: 'ptc' }, 'batch:true 与不写等价，不该落键：' + JSON.stringify(on.roles.scout));
+    logs.length = 0;
+    const junk = roster.sanitizeConfig({ roles: { scout: { batch: 'no' } } }, log);
+    assert.equal(junk.roles.scout, void 0, '非布尔 batch 不该落盘：' + JSON.stringify(junk.roles));
+    assert.equal(logs.length, 1, '非布尔 batch 必须留下一条诊断：' + JSON.stringify(logs));
+    const pair = roster.sanitizeConfig({ roles: { scout: { provider: 'p', model: 'm', batch: false } } }, log);
+    assert.deepEqual(pair.roles.scout, { provider: 'p', model: 'm', batch: false }, '模型与 batch 互相挤掉了：' + JSON.stringify(pair.roles.scout));
+  });
   await check('configuredRoleCount：数被覆盖的角色', () => {
     assert.equal(roster.configuredRoleCount(roster.defaultConfig()), 0);
     assert.equal(
@@ -445,7 +470,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2465）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2574）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
