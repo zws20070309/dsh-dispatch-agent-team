@@ -139,6 +139,11 @@ export function resolveRoleRoute(config, role); // {provider,model,reasoningEffo
 export function resolveRolePreset(config, role); // -> preset id | undefined（undefined = 跟随 Lead，不重绑）。
                                           //    与 resolveRoleRoute 的关键差别：模型/强度每请求实时读，preset **只在派队员那一刻读一次**
                                           //    （官方 select() 在会话已开播时抛 agent-preset/locked）。
+export function roleBatchOn(config, role); // -> boolean（**默认 true**：只有显式 batch:false 才关）
+                                           //    = 这名队员要不要在**自己的作用域**上声明官方第三档呈现 both
+                                           //    （原生工具照常直调 + 另加 run_code 程序内批量调用）。声明口
+                                           //    ctx.tools.presentAs(mode)（dsh-tools/lib/index.js:2810）；解析口 modeFor
+                                           //    :2767-2774「最近的一层赢」；守卫：没有 ptcRuntime 就不声明（:2863-2865 装配期会抛）。
 export function resolveMemberRoute(explicitRoute, roleRoute, explicitEffort);
     // -> {provider,model,reasoningEffort?}|undefined；2026-10-01 修复的优先级：显式参数 >
     //    角色配置 > 两者都无(=undefined=跟随 Lead)。钉子**只**由显式参数产生（lib/runtime.js），
