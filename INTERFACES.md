@@ -208,7 +208,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2176`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2421`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。

@@ -912,6 +912,174 @@ async function main() {
     });
   }
 
+  // ── 9) 队员 agent 预设这一列（2026-10-15）──────────────────────────────────
+  // 这一列最容易出的错不是「不显示」，而是**静默丢数据**：草稿管道里任何一个构造函数
+  // 少带一个 preset，用户保存后那一半配置就没了。所以断言全部围绕「读回来 = 显示 = 存回去」。
+  // 定位一律**按列标题文字**，不按「第几个 select」：思考强度那一格在某些目录形状下会
+  // 整个不渲染，位置索引会指错列（这条我自己踩过）。
+  {
+    const PRESET_TABLE = {
+      presets: [
+        { id: 'ptc', name: '', available: true, reason: '', detail: '' },
+        { id: 'standard', name: '', available: true, reason: '', detail: '' },
+        { id: 'minimal-grayscale', name: '极简灰度模式', available: true, reason: '', detail: '' },
+        { id: 'liangshen', name: '梁神模式', available: false, reason: 'not-registered', detail: '' },
+      ],
+      notes: [],
+    };
+    const optionItems = (node) => {
+      const out = [];
+      const walk = (x) => {
+        if (Array.isArray(x)) { for (const item of x) walk(item); return }
+        if (x === null || x === undefined || typeof x !== 'object') return
+        if (x.type === 'option') out.push({ value: String(x.props.value), disabled: x.props.disabled === true })
+        walk(x.props === undefined ? undefined : x.props.children)
+      };
+      walk(node === undefined || node === null ? undefined : node.props.children);
+      return out;
+    };
+    /** 角色行按**角色 id** 找（dat-row 这个类名缓存保活的覆盖行也在用，位置索引会指错；行顺序也不归测试说了算）。 */
+    const roleRow = (root, roleId) => findAll(root, (node) => {
+      if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+      const code = findAll(node, (inner) => inner.type === 'code')[0];
+      return code !== undefined && textOf(code) === roleId;
+    })[0];
+    /** 某个角色行里，标题为 label 的那一格下拉。 */
+    const selectInRow = (root, roleId, label) => {
+      const row = roleRow(root, roleId);
+      if (row === undefined) return undefined;
+      for (const field of findAll(row, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== label) continue;
+        const sel = findAll(field, (node) => node.type === 'select')[0];
+        if (sel !== undefined) return sel;
+      }
+      return undefined;
+    };
+    /** 「统一选择」那一块里标题为 label 的下拉（整页只有一处用这些标题）。 */
+    const bulkSelect = (root, label) => {
+      const bulk = findAll(root, (node) => node.type === 'div' && node.props.className === 'dat-bulk')[0];
+      if (bulk === undefined) return undefined;
+      for (const field of findAll(bulk, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== label) continue;
+        const sel = findAll(field, (node) => node.type === 'select')[0];
+        if (sel !== undefined) return sel;
+      }
+      return undefined;
+    };
+    const PRESET_COL = 'agent 预设';
+    const BULK_PRESET_COL = 'agent 预设（应用到全部角色）';
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { scout: { preset: 'standard' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: PRESET_TABLE,
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+      // 保存成功后组件**以宿主回传的净化结果为准**重建草稿（onSave 里那条），所以这里必须
+      // 如实回它保存的那一份，否则后面几条断言测的是「fixture 骗人」。
+      set: { ok: true, config: { version: 1, roles: { scout: { preset: 'ptc' } } }, revision: 'bbb:2', diagnostics: [] },
+    });
+
+    check('每行有「agent 预设」下拉，且已保存的预设显示成它自己（读回来 = 显示）', () => {
+      const sel = selectInRow(page.tree(), 'scout', PRESET_COL);
+      if (sel === undefined) return '第一行里没有标题为「' + PRESET_COL + '」的下拉：' + textOf(page.tree()).slice(0, 160);
+      if (sel.props.value !== 'standard') return '预设下拉显示的是 ' + JSON.stringify(sel.props.value) + '，不是已保存的 standard';
+      return true;
+    });
+
+    check('预设选项：跟随 Lead 与三个 id 都在，注册表里没有的那项在但禁用（不藏）', () => {
+      const items = optionItems(selectInRow(page.tree(), 'scout', PRESET_COL));
+      const values = items.map((item) => item.value);
+      for (const want of ['', 'ptc', 'standard', 'minimal-grayscale']) {
+        if (!values.includes(want)) return '选项不全：' + values.join(' | ');
+      }
+      const stale = items.find((item) => item.value === 'liangshen');
+      if (stale === undefined) return '不可用的预设被藏起来了（用户会以为功能坏了）';
+      if (stale.disabled !== true) return '不可用的预设竟然可选（选了保存会被宿主拒掉）';
+      return true;
+    });
+
+    selectInRow(page.tree(), 'scout', PRESET_COL).props.onChange({ target: { value: 'ptc' } });
+    findAll(page.repaint(), (node) => node.type === 'button' && textOf(node).includes('保存'))[0].props.onClick();
+    await page.settle();
+    await page.settle();
+    const onlyPreset = page.sent().filter((entry) => entry.op === 'set').pop();
+    check('只改预设：set 里该角色只带 preset，没有 provider/model（不猜路由）', () => {
+      const scout = onlyPreset === undefined ? undefined : onlyPreset.args.roles.scout;
+      if (scout === undefined) return 'set 里没有 scout：' + JSON.stringify(onlyPreset === undefined ? null : onlyPreset.args.roles);
+      if (scout.preset !== 'ptc') return 'preset=' + JSON.stringify(scout.preset);
+      if (scout.provider !== undefined || scout.model !== undefined) return '不该带上模型：' + JSON.stringify(scout);
+      return true;
+    });
+
+    check('改模型不许顺手清掉预设（草稿管道少带一个字段 = 静默丢配置）', () => {
+      const before = selectInRow(page.tree(), 'scout', PRESET_COL);
+      if (before === undefined || before.props.value !== 'ptc') return '改模型前预设已经不是 ptc 了';
+      selectInRow(page.tree(), 'scout', '模型').props.onChange({ target: { value: 'p1\u0000m1' } });
+      const after = selectInRow(page.repaint(), 'scout', PRESET_COL);
+      if (after === undefined || after.props.value !== 'ptc') return '改模型把预设清成了 ' + JSON.stringify(after === undefined ? null : after.props.value);
+      return true;
+    });
+
+    check('清掉模型后预设仍留在行里（两个维度各自独立）', () => {
+      selectInRow(page.tree(), 'scout', '模型').props.onChange({ target: { value: '' } });
+      const after = selectInRow(page.repaint(), 'scout', PRESET_COL);
+      if (after === undefined || after.props.value !== 'ptc') return '清模型后预设变成 ' + JSON.stringify(after === undefined ? null : after.props.value);
+      return true;
+    });
+
+    check('统一选择预设：一次改完全部 12 个角色', () => {
+      const bulk = bulkSelect(page.tree(), BULK_PRESET_COL);
+      if (bulk === undefined) return '统一块里没有「' + BULK_PRESET_COL + '」这一格';
+      bulk.props.onChange({ target: { value: 'minimal-grayscale' } });
+      const after = page.repaint();
+      const values = [];
+      for (const role of ROLES) {
+        const sel = selectInRow(after, role.id, PRESET_COL);
+        values.push(sel === undefined ? '(缺行)' + role.id : String(sel.props.value));
+      }
+      if (values.some((value) => value !== 'minimal-grayscale')) return '统一后：' + values.join(' | ');
+      return true;
+    });
+
+    check('统一预设不动模型与强度（三列各管各的）', () => {
+      const model = selectInRow(page.tree(), 'builder', '模型');
+      if (model === undefined) return '第 4 行找不到模型下拉';
+      if (model.props.value !== '') return '统一预设把模型也改了：' + model.props.value;
+      return true;
+    });
+  }
+
+  // 旧宿主 / agentPresets 服务缺席：这一列必须禁用并说明原因，而不是空下拉或崩掉。
+  {
+    const page = await mount({
+      get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: 'aaa:1', diagnostics: [] },
+      'list-models': { ok: true, groups: [], failures: [] },
+    });
+    const tree = page.tree();
+    const rows = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-row');
+    let sel;
+    for (const field of findAll(rows[0], (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+      const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+      if (head !== undefined && textOf(head) === 'agent 预设') sel = findAll(field, (node) => node.type === 'select')[0];
+    }
+    check('宿主没带预设表：这一列仍渲染但禁用（用户看得见「读不到」，不是少了功能）', () => {
+      if (sel === undefined) return '预设下拉没渲染出来';
+      if (sel.props.disabled !== true) return '读不到注册表却仍可点（选了会被宿主拒）';
+      return true;
+    });
+    check('宿主没带预设表：统一那一列给出唯一原因', () => {
+      const text = textOf(tree);
+      if (!text.includes('读不到')) return '没有说明原因：' + text.slice(-240);
+      return true;
+    });
+  }
+
   // ── 7) 加载失败路径 ───────────────────────────────────────────────────────
   {
     const page = await mount({
