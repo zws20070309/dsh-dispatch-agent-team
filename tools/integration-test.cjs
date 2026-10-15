@@ -1106,6 +1106,10 @@ async function main() {
   });
 
   // 注册表里没有这一份组合（换台机器、或用户卸了这个预设）：报一条诊断，队员退回跟随 Lead。
+  // 负例：注册表里没有这一份组合（换台机器、或用户把它卸了）。
+  // 注意**必须还原**：stands 这张表是共享的 fake 注册表，后面的路由层断言还要读它
+  // （第一版没还原，直接把后面那条 get 闸门弄成假失败 —— 测试之间的状态泄漏）。
+  const removedStand = stands.get('minimal-grayscale');
   stands.delete('minimal-grayscale');
   const mateDKey = { name: 'stand-member-d' };
   const mateDScope = createScope(root, mateDKey);
@@ -1126,6 +1130,9 @@ async function main() {
     if (!/stand-verify/.test(tail) || !/minimal-grayscale/.test(tail)) return '诊断里点不出「哪个队员、哪个预设」：' + tail.slice(-260);
     return true;
   });
+
+  // 还原 stand：负例只在这一个检查点里要求它缺席。
+  if (removedStand !== undefined) stands.set('minimal-grayscale', removedStand);
 
   /** 造一个最小的 req/res，然后走真实路由 handler。 */
   async function callApi(method, headers, payload) {
@@ -1233,6 +1240,70 @@ async function main() {
     if (Object.keys(reset.payload.config.roles).length !== 0) return JSON.stringify(reset.payload.config);
     return true;
   });
+
+  // ── 队员预设：路由层的形状与白名单（2026-10-15）────────────────────────────
+  const presetSaved = await callApi('POST', GATE, {
+    op: 'set',
+    args: { roles: { scout: { preset: 'standard' } }, revision: (await callApi('POST', GATE, { op: 'get' })).payload.revision },
+  });
+  check('set 接受「只配预设不配模型」，并原样落盘', () => {
+    if (presetSaved.payload === undefined || presetSaved.payload.ok !== true) return JSON.stringify(presetSaved.payload);
+    const scout = presetSaved.payload.config.roles.scout;
+    if (scout === undefined || scout.preset !== 'standard') return '落盘结果里没有 scout.preset=standard：' + JSON.stringify(scout);
+    if (scout.provider !== undefined || scout.model !== undefined) return '不该凭空补模型：' + JSON.stringify(scout);
+    return true;
+  });
+
+  const presetBack = await callApi('POST', GATE, { op: 'get' });
+  check('get 读回来是同一份（存进去 = 读回来，面板不会显示成「跟随 Lead」的假象）', () => {
+    const scout = presetBack.payload.config.roles.scout;
+    if (scout === undefined || scout.preset !== 'standard') return '读回：' + JSON.stringify(presetBack.payload.config.roles);
+    return true;
+  });
+
+  check('get 回包带 agentPresets 可用性表：三个白名单 id 齐全，available 是真布尔', () => {
+    const table = presetBack.payload.agentPresets;
+    if (table === undefined || !Array.isArray(table.presets)) return '回包里没有 agentPresets.presets：' + JSON.stringify(Object.keys(presetBack.payload));
+    const byId = new Map(table.presets.map((row) => [row.id, row]));
+    for (const id of roster.TEAMMATE_PRESET_IDS) {
+      const row = byId.get(id);
+      if (row === undefined) return '白名单里的 ' + id + ' 没出现在可用性表中';
+      if (typeof row.available !== 'boolean') return id + ' 的 available 不是布尔：' + JSON.stringify(row);
+      if (row.available !== true) return id + ' 在本机不可用（' + row.reason + '）—— 白名单该改，或把那份预设装回来';
+    }
+    return true;
+  });
+
+  const presetBogus = await callApi('POST', GATE, {
+    op: 'set',
+    args: { roles: { scout: { preset: 'cordis' } }, revision: presetSaved.payload.revision },
+  });
+  check('白名单外的预设：路由层直接拒绝并列出可选项（不静默丢掉，那会显示成「保存成功」）', () => {
+    if (presetBogus.payload === undefined || presetBogus.payload.ok !== false) return '竟然保存成功：' + JSON.stringify(presetBogus.payload);
+    const error = String(presetBogus.payload.error);
+    if (!error.includes('cordis')) return '错误里没点出问题的那个 id：' + error;
+    for (const id of roster.TEAMMATE_PRESET_IDS) {
+      if (!error.includes(id)) return '错误里没列出可选清单（缺 ' + id + '）：' + error;
+    }
+    return true;
+  });
+
+  const presetUnknownRole = await callApi('POST', GATE, {
+    op: 'set',
+    args: { roles: { researcher: { preset: 'ptc' } }, revision: presetSaved.payload.revision },
+  });
+  check('roles 是**整表替换**（不是逐角色合并）：钉住这条语义，客户端必须每次提交全部 12 行', () => {
+    if (presetUnknownRole.payload === undefined || presetUnknownRole.payload.ok !== true) return JSON.stringify(presetUnknownRole.payload);
+    const roles = presetUnknownRole.payload.config.roles;
+    if (roles.researcher === undefined || roles.researcher.preset !== 'ptc') return 'researcher 没落上：' + JSON.stringify(roles.researcher);
+    // 这是**真语义**，不是缺陷：lib/index.js 的 set 用 checked.roles 整个替换 roles 段（合并只发生在
+    // roles 与 cache 两个字段组之间）。配置页因此必须每次带上全部角色（rolesFromDraft 就是遍历 roleIds），
+    // 否则用户改一行会抹掉其余十一行。这条断言防的是「以后有人以为可以只发一行」。
+    if (roles.scout !== undefined) return '宿主竟然做了逐角色合并 —— 与 lib/index.js 的 set 语义不符，客户端的提交方式要重写：' + JSON.stringify(roles.scout);
+    return true;
+  });
+
+  await callApi('POST', GATE, { op: 'reset' });
 
   const unknownOp = await callApi('POST', GATE, { op: 'no-such-op' });
   check('未知 op → {ok:false} 而不是挂住连接', () => (unknownOp.payload !== undefined && unknownOp.payload.ok === false ? true : JSON.stringify(unknownOp.payload)));
