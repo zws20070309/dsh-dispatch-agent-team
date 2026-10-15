@@ -901,6 +901,232 @@ async function main() {
     });
   }
 
+  // ── 7.9) 队员 agent 预设重绑（2026-10-15 用户需求：12 个队员各自可选 PTC / 标准 / 极简灰度）──
+  //
+  // 这一节**不拿替身验证机制**。官方重绑的全部实质就是「把队员作用域的父链接换到另一份
+  // preset 的 standing mount」（registry 的 bind → bindScopeParent(...).rebind），而 dsh-tools
+  // 的 view() 每次调用都重走 scopeChainOf（dsh-scope 的 chainLayers）。所以这里用**真的 dsh-scope**：
+  // 换完之后队员能看见的工具集与继承到的提示词段**真的**变了 —— 这才是本功能成立与否的判据，
+  // 不是「我调了个函数」。
+  const STAND_KEYS = {
+    'dispatch-mode': { name: 'stand-dispatch-mode' },
+    standard: { name: 'stand-standard' },
+    ptc: { name: 'stand-ptc' },
+    'minimal-grayscale': { name: 'stand-minimal-grayscale' },
+  };
+  const stands = new Map();
+  for (const [id, key] of Object.entries(STAND_KEYS)) {
+    const standScope = createScope(root, key);
+    const standTools = standScope.ctx.get('tools');
+    const standPrompt = standScope.ctx.get('systemPrompt');
+    standTools.register(syntheticTool('stand_tool__' + id.split('-').join('_')));
+    // 每份组合都有自己的 persona：persona 是**继承面**贡献，installMember 从不覆盖它，
+    // 所以「装配出来的提示词里是哪一句 persona」能证明换的是整份组合，不只是工具表。
+    standPrompt.section({
+      name: 'deployment:persona-prefix',
+      order: standPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
+      text: 'STAND PERSONA :: ' + id,
+    });
+    stands.set(id, { key, scope: standScope });
+  }
+  /** scopeKey → {binding, id}。官方 registry 的 bindings 就是这个形状（join() 里存 binding）。 */
+  const joins = new Map();
+  const keyOfCtx = (ctx) => scopePkg.scopeOf(ctx);
+  const idOfCtx = (ctx) => {
+    const parent = scopePkg.scopeParentOf(keyOfCtx(ctx));
+    for (const [id, stand] of stands) if (stand.key === parent) return id;
+    return presetIdByScope.get(keyOfCtx(ctx));
+  };
+  const joinOrRebind = (ctx, id) => {
+    const key = keyOfCtx(ctx);
+    const stand = stands.get(id);
+    if (stand === undefined) {
+      const error = new Error('Unknown agent preset: ' + id);
+      error.code = 'agent-preset/not-found';
+      throw error;
+    }
+    const existing = joins.get(key);
+    if (existing === undefined) joins.set(key, { binding: scopePkg.bindScopeParent(key, stand.key), id });
+    else { existing.binding.rebind(stand.key); existing.id = id; }
+    return id;
+  };
+  Object.assign(fakeAgentPresets, {
+    async list() {
+      return [...stands.keys()].map((id) => (id === 'dispatch-mode' ? { id, name: '调度模式' } : { id }));
+    },
+    composedPreset: idOfCtx,
+    composeFrom(childCtx, parentCtx) { return joinOrRebind(childCtx, idOfCtx(parentCtx)); },
+    async mount(ctx, id) { return { id: joinOrRebind(ctx, id) }; },
+    async select(agent, id) {
+      const boundary = root.get('sessionProjections').stateOf(agent.session, 'turnBoundary');
+      if (boundary !== undefined && (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)) {
+        const error = new Error('This session has already started');
+        error.code = 'agent-preset/locked';
+        throw error;
+      }
+      const bound = joinOrRebind(agent.ctx, id);
+      agent.session.append('agent-preset/selected', { agentPreset: bound });
+      return bound;
+    },
+  });
+  /** 会话投影：官方 agentPreset 投影 = header 起步、被 agent-preset/selected 推进。这里如实复刻。 */
+  const projections = new Map();
+  root.plugin({
+    name: 'fake-session-projections',
+    apply(ctx) {
+      ctx.provide('sessionProjections', {
+        stateOf(session, key) {
+          const row = session === undefined || session === null ? undefined : projections.get(session.id);
+          if (row === undefined) return void 0;
+          if (key === 'agentPreset') return row.agentPreset;
+          if (key === 'turnBoundary') return row.turnBoundary;
+          return void 0;
+        },
+      });
+    },
+  });
+  await tick();
+  const makeStandSession = (id, presetId, started) => {
+    const log = [];
+    projections.set(id, {
+      agentPreset: presetId,
+      turnBoundary: started === true ? { openTurnStartSeq: null, lastTurn: 2 } : void 0,
+    });
+    return {
+      id,
+      header: { id, cwd: tempHome, agentPreset: presetId },
+      log,
+      append(type, data) {
+        log.push({ type, data });
+        if (type === 'agent-preset/selected') projections.get(id).agentPreset = data.agentPreset;
+        return { seq: log.length };
+      },
+    };
+  };
+  const selectedOf = (session) => session.log.filter((row) => row.type === 'agent-preset/selected');
+  /** 派一名队员：作用域**不带父**创建（与生产同形：agent scope 由注册表 join），再复刻 composeFrom。 */
+  const spawnStandMember = (scopeName, sessionId, memberName, lead, inheritId) => {
+    const key = { name: scopeName };
+    const scope = createScope(root, key);
+    const session = makeStandSession(sessionId, inheritId, false);
+    const agent = { id: sessionId, ctx: agentCtx(scope.ctx), options: {}, session };
+    agents.push(agent);
+    membershipById.set(agent.id, { root: lead, id: agent.id, role: 'teammate', name: memberName });
+    joinOrRebind(agent.ctx, inheritId);
+    return { key, agent, session };
+  };
+
+  const standLeadScope = createScope(root, { name: 'stand-lead-scope' });
+  const standLeadSession = makeStandSession('stand-lead', 'dispatch-mode', false);
+  const standLead = { id: 'stand-lead', ctx: agentCtx(standLeadScope.ctx), options: {}, session: standLeadSession };
+  agents.push(standLead);
+  membershipById.set(standLead.id, { root: standLead, id: standLead.id, role: 'lead', name: 'lead' });
+  joinOrRebind(standLead.ctx, 'dispatch-mode');
+  await runtime.enable(root, standLead, { source: 'integration-test' });
+
+  const mateA = spawnStandMember('stand-member-a', 'stand-scout', 'scout', standLead, 'dispatch-mode');
+  const mateB = spawnStandMember('stand-member-b', 'stand-builder', 'builder', standLead, 'dispatch-mode');
+
+  check('现状基线：不配预设的队员继承 Lead 的调度模式（用户截图里那个现象）', () => {
+    if (idOfCtx(mateA.agent.ctx) !== 'dispatch-mode') return '队员 preset 不是 dispatch-mode：' + idOfCtx(mateA.agent.ctx);
+    if (!visibleNames(mateA.key).includes('stand_tool__dispatch_mode')) return '调度模式那份组合的工具没被继承（父子链搭错了）';
+    if (visibleNames(mateA.key).includes('stand_tool__standard')) return '还没换预设就已经看得到标准组合的工具';
+    return true;
+  });
+
+  const notesBefore = runtime.notes().length;
+  await runtime.saveConfig(root, {
+    version: roster.CONFIG_VERSION,
+    roles: { scout: { preset: 'standard' }, tester: { preset: 'ptc' }, verify: { preset: 'minimal-grayscale' } },
+  });
+  root.emit('agent/created', { agent: mateA.agent });
+  await tick();
+  await tick();
+  await tick();
+  const promptA = await promptOf(mateA.key);
+
+  check('角色配了预设：队员作用域真的换到那一份组合（继承面工具跟着变）', () => {
+    const after = visibleNames(mateA.key);
+    if (idOfCtx(mateA.agent.ctx) !== 'standard') return '队员 preset 仍是 ' + idOfCtx(mateA.agent.ctx) + '（重绑没发生）';
+    if (!after.includes('stand_tool__standard')) return '换过去了却看不到标准组合的工具：' + after.join(', ');
+    if (after.includes('stand_tool__dispatch_mode')) return '调度模式组合的工具还看得到（父链接没换掉）';
+    return true;
+  });
+
+  check('换的是整份组合：persona 也换成新预设那一句（不是只改了工具表）', () => {
+    if (!promptA.includes('STAND PERSONA :: standard')) return '提示词里没有标准组合的 persona：' + promptA.slice(0, 160);
+    if (promptA.includes('STAND PERSONA :: dispatch-mode')) return '调度模式的 persona 还在提示词里（继承面没换掉）';
+    return true;
+  });
+
+  check('重绑不伤 own 层：团队工具与队员卡仍在（它们注册在队员自己那一层）', () => {
+    const after = visibleNames(mateA.key);
+    for (const name of [roster.REPORT_TOOL_NAME, 'send_message', 'list_agents']) {
+      if (!after.includes(name)) return '重绑后队员丢了自有团队工具 ' + name + '；现在：' + after.join(', ');
+    }
+    if (!promptA.includes(playbook.TEAMMATE_CARD.slice(0, 40))) return '队员卡（own 层段）在重绑后消失了';
+    return true;
+  });
+
+  check('重绑必须落盘：会话日志有 agent-preset/selected，投影被推进（冷读与角标才不撒谎）', () => {
+    const rows = selectedOf(mateA.session);
+    if (rows.length !== 1) return '期望 1 条 agent-preset/selected，实得 ' + rows.length;
+    if (rows[0].data.agentPreset !== 'standard') return '事件里的 preset 不是 standard：' + JSON.stringify(rows[0].data);
+    if (projections.get('stand-scout').agentPreset !== 'standard') return '投影没被推进（官方重建读的是投影，不是 header）';
+    return true;
+  });
+
+  check('没配预设的角色不受影响（builder 仍跟随 Lead），Lead 自己更不会被换', () => {
+    if (idOfCtx(mateB.agent.ctx) !== 'dispatch-mode') return 'builder 队员被换了：' + idOfCtx(mateB.agent.ctx);
+    if (selectedOf(mateB.session).length !== 0) return 'builder 队员竟然被写了预设切换事件';
+    if (idOfCtx(standLead.ctx) !== 'dispatch-mode') return 'Lead 的 preset 被改了：' + idOfCtx(standLead.ctx);
+    return true;
+  });
+
+  // 已开播的队员（宿主重启后恢复的那一类）：官方 select() 会抛 agent-preset/locked，
+  // 我们**不许**绕过它去改历史会话的记录 —— 只把活体作用域对齐到日志说的那一份。
+  const mateCKey = { name: 'stand-member-c' };
+  const mateCScope = createScope(root, mateCKey);
+  const mateCSession = makeStandSession('stand-tester', 'dispatch-mode', true);
+  const mateC = { id: 'stand-tester', ctx: agentCtx(mateCScope.ctx), options: {}, session: mateCSession };
+  agents.push(mateC);
+  membershipById.set(mateC.id, { root: standLead, id: mateC.id, role: 'teammate', name: 'tester' });
+  joinOrRebind(mateC.ctx, 'dispatch-mode');
+  root.emit('agent/created', { agent: mateC });
+  await tick();
+  await tick();
+  await tick();
+
+  check('已开播的队员不许被改：官方锁定就保持原样，并记下原因（下次派活才生效）', () => {
+    if (idOfCtx(mateC.ctx) !== 'dispatch-mode') return '已开播的队员被强行换到 ' + idOfCtx(mateC.ctx) + '（绕过官方 locked 闸门）';
+    if (selectedOf(mateCSession).length !== 0) return '给已开播的会话补写了 agent-preset/selected（历史被改写）';
+    const tail = runtime.notes().slice(notesBefore).join(' | ');
+    if (!/stand-tester/.test(tail) || !/ptc/.test(tail)) return '没有一条说明「哪个队员、哪个预设、为什么没生效」的记录：' + tail.slice(-260);
+    return true;
+  });
+
+  // 注册表里没有这一份组合（换台机器、或用户卸了这个预设）：报一条诊断，队员退回跟随 Lead。
+  stands.delete('minimal-grayscale');
+  const mateDKey = { name: 'stand-member-d' };
+  const mateDScope = createScope(root, mateDKey);
+  const mateDSession = makeStandSession('stand-verify', 'dispatch-mode', false);
+  const mateD = { id: 'stand-verify', ctx: agentCtx(mateDScope.ctx), options: {}, session: mateDSession };
+  agents.push(mateD);
+  membershipById.set(mateD.id, { root: standLead, id: mateD.id, role: 'teammate', name: 'verify' });
+  joinOrRebind(mateD.ctx, 'dispatch-mode');
+  root.emit('agent/created', { agent: mateD });
+  await tick();
+  await tick();
+  await tick();
+
+  check('预设不在注册表里时不炸：记一条能照着办的诊断，队员保持跟随 Lead', () => {
+    if (idOfCtx(mateD.ctx) !== 'dispatch-mode') return '拿不到预设却被换到了 ' + idOfCtx(mateD.ctx);
+    if (selectedOf(mateDSession).length !== 0) return '重绑失败还给会话写了切换事件';
+    const tail = runtime.notes().slice(notesBefore).join(' | ');
+    if (!/stand-verify/.test(tail) || !/minimal-grayscale/.test(tail)) return '诊断里点不出「哪个队员、哪个预设」：' + tail.slice(-260);
+    return true;
+  });
+
   /** 造一个最小的 req/res，然后走真实路由 handler。 */
   async function callApi(method, headers, payload) {
     const req = new EventEmitter();
