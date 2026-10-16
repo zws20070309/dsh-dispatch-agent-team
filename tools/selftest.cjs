@@ -977,6 +977,78 @@ function functionBodyOf(source, needle) {
     assert.deepEqual(offenders, [], '这些段的 text 不是标识符/字面量（实时状态进 system = 每轮翻面）：' + offenders.join(' | '));
   });
 
+  await check('cache-prefix-audit 的实测口径必须真的能算：喂真形状事件，命中率算得对（行为门）', () => {
+    // 为什么是行为门而不是扫源码：第一版我写的是文本门（"源码里有没有出现 cacheReadTokens"），
+    // 然后把被保护的那句 `const u = usageOf(event)` 改成 `const u = undefined` —— 文本门照样绿。
+    // 那条变异把「读了但没用」这种假绿暴露了出来，所以这里改成**直接调用导出的纯函数**。
+    // 背景：脚本第一版只有「前缀是否逐字节相同」的推算模型，我据此在会话里对用户说过「会话日志里
+    // 没有 usage 字段，拿不到实测命中率，只能做理论分析」—— 那是**假话**：assistant/message.data.usage
+    // 一直带 cacheReadTokens（本机 143 个队员会话 8603 条 assistant/message 全部带 usage、8041 条带
+    // cacheReadTokens），本包 lib/graph.js:168 与 lib/cache.js:240 也一直在读它。
+    const audit = require(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'));
+    assert.equal(typeof audit.usageOf, 'function', '脚本不再导出 usageOf：实测口径又变成不可断言的了');
+    assert.equal(typeof audit.summarizeSession, 'function', '脚本不再导出 summarizeSession');
+    // ① usageOf：字段读对，缺字段按 0，没有 usage 时 undefined。
+    assert.deepEqual(audit.usageOf({ data: { usage: { cacheReadTokens: 900, inputTokens: 100 } } }), { hit: 900, miss: 100 });
+    assert.deepEqual(audit.usageOf({ data: { usage: { inputTokens: 50 } } }), { hit: 0, miss: 50 }, '没有 cacheReadTokens 时要按 0，不是 NaN');
+    assert.equal(audit.usageOf({ data: {} }), undefined, '没有 usage 必须回 undefined（不能编一个 0 命中）');
+    assert.equal(audit.usageOf({}), undefined);
+    // ② hitRateOf：与 lib/cache.js:262-264 同式，分母 0 时 null。
+    assert.equal(audit.hitRateOf({ hit: 900, miss: 100 }), 90);
+    assert.equal(audit.hitRateOf({ hit: 0, miss: 0 }), null, '分母为 0 时必须回 null（渲染成「—」），不许编 0%');
+    // ③ 端到端：一个两请求的会话 —— 第 1 次 system 变了、第 2 次没变，两档要分得开。
+    const events = [
+      { type: 'system/message', seq: 1, data: { message: { content: [{ type: 'text', text: 'AAA' }] } } },
+      { type: 'user/message', seq: 2, data: { message: { content: [{ type: 'text', text: 'hi' }] } } },
+      { type: 'request/header', seq: 3, data: { reason: 'initial', header: { config: { model: 'm' }, tools: [{ name: 'a' }] } } },
+      { type: 'assistant/message', seq: 4, data: { usage: { cacheReadTokens: 100, inputTokens: 900 } } },
+      { type: 'system/message', seq: 5, data: { message: { content: [{ type: 'text', text: 'BBB' }] } } },
+      { type: 'request/header', seq: 6, data: { reason: 'change', header: { config: { model: 'm' }, tools: [{ name: 'a' }] } } },
+      { type: 'assistant/message', seq: 7, data: { usage: { cacheReadTokens: 0, inputTokens: 1000 } } },
+      { type: 'assistant/message', seq: 8, data: { usage: { cacheReadTokens: 800, inputTokens: 200 } } },
+    ];
+    const s = audit.summarizeSession(events);
+    assert.equal(s.requests.length, 3, '三次带 usage 的 assistant/message 要折成三条请求，实得 ' + s.requests.length);
+    assert.equal(s.headers.length, 2, '两次 request/header 要折成两条装配，实得 ' + s.headers.length);
+    assert.equal(s.requests[0].afterSystemChange, true, '第一条请求前面有 system 快照，要标成「前缀变了」');
+    assert.equal(s.requests[1].afterSystemChange, true, '第二条请求前面 system 变过，要标成「前缀变了」');
+    assert.equal(s.requests[2].afterSystemChange, false, '第三条请求前 system 没变，要标成「前缀没变」');
+    assert.equal(s.requests[0].hit, 100);
+    assert.equal(s.requests[0].miss, 900);
+    assert.equal(s.requests[1].hit, 0, '翻面那一次必须如实记 0 命中（这是本门要保的事实）');
+    assert.equal(s.requests[2].hit, 800);
+    // ④ 公式与 lib/cache.js 同式（那边是 cacheReadTokens / (cacheReadTokens + uncachedInputTokens)）。
+    const cacheSrc = readFileSync(path.join(LIB, 'cache.js'), 'utf8');
+    assert.ok(/stats\.cacheReadTokens \+ stats\.uncachedInputTokens/.test(cacheSrc),
+      'lib/cache.js 的命中率公式变了：本脚本的公式要跟着重读（两者必须同式）');
+    // ⑤ 两个口径在输出里必须分开命名（读的人会把推算模型当现状 —— 这正是我犯的错）。
+    const src = readFileSync(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'), 'utf8');
+    assert.ok(src.includes('实测命中率'), '脚本输出里没有「实测命中率」这个口径名：读的人会把推算模型当现状');
+    assert.ok(src.includes('装配对') && src.includes('不是命中率'),
+      '脚本没有把「装配对模型」与「命中率」分开标注');
+    // ⑥ 而且 `usageOf` 真的被扫描路径用上了（不是导出给人看、内部却不用）。
+    // 判据必须带**解构前缀**：第一版写成 /summarizeSession\(events\)/，结果匹配到的是
+    // `function summarizeSession(events) {` 这个**定义头** —— 把调用整行删掉它照样绿（M33-e 咬出来的）。
+    assert.ok(/const \{ requests, headers \} = summarizeSession\(events\);/.test(src),
+      '扫描路径没有调用 summarizeSession 折表：实测口径又空了');
+  });
+
+  await check('文档必须写明**实测**命中率，不许退回「日志没有 usage / 只能理论分析」那套陈述', () => {
+    // 这是上一条的文档侧：代码报得对、文档还写着旧结论，等于没改。
+    // 判据取正向（必须出现实测口径与那个数），不用反向禁词 —— 因为**更正的文字里会引用旧错话**，
+    // 反向禁词会把更正本身判红（第一版就这么咬过自己）。
+    const interfaces = readFileSync(path.join(PLUGIN_DIR, 'INTERFACES.md'), 'utf8');
+    assert.ok(interfaces.includes('实测命中率'),
+      'INTERFACES.md 里没有「实测命中率」：缓存这一节又只剩推算模型了');
+    assert.ok(interfaces.includes('96.8%') && interfaces.includes('95.0%'),
+      'INTERFACES.md 没有写明实测数字（最近 40 个会话 96.8% / 全部 143 个 95.0%）');
+    assert.ok(/cacheReadTokens/.test(interfaces),
+      'INTERFACES.md 没写实测命中率的来源字段 cacheReadTokens：读者无法复核');
+    const readme = readFileSync(path.join(PLUGIN_DIR, 'README.md'), 'utf8');
+    assert.ok(readme.includes('cache-prefix-audit.cjs'),
+      'README 的探针清单里没有 cache-prefix-audit.cjs：用户不知道有这个核对命令');
+  });
+
   await check('路由账本写入点：脏值不进账本、空对象不进、读口返回副本（宁缺毋滥）', async () => {
     // 为什么单独测写入点：annotateMemberModels 自己也会拦脏 model（纵深防御的第二道），
     // 于是「noteAppliedRoute 不校验 model 空串」这种变异会被下游吸收、集成测试照样绿 ——

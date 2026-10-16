@@ -923,7 +923,8 @@ async function main() {
     // 每份组合都有自己的 persona：persona 是**继承面**贡献，所以「装配出来的提示词里是哪一句
     // persona」能证明换的是整份组合，不只是工具表。**2026-10-16 起注意**：真的换继承面时
     // installMember 会在队员自己那层钉一句 persona（遮蔽继承面那句 —— 最近的一层赢），
-    // 因为 persona 排在第一屏，让它翻面就等于把这名队员的整段前缀缓存打掉。见 §7.9b。
+    // 因为 persona 排在第一屏，让它翻面就等于把从它往后的整段前缀缓存打掉（不是「整段前缀」——它前面
+  // 那 60 字节身份行仍可复用）。见 §7.9b。
     standPrompt.section({
       name: 'deployment:persona-prefix',
       order: standPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
@@ -1114,11 +1115,19 @@ async function main() {
   // ── 7.9b) persona 翻面的那笔账（2026-10-16 缓存前缀断裂修复的机制证明）───────────
   //
   // 真机数字（读 ~/.dsh/sessions 里 143 个插件队员会话的 session.v4.jsonl.zstd）：队员第一次
-  // 请求渲染「跟随 Lead」的 persona，异步重绑落地后第二次换成角色预设那一份 —— 两版 system
-  // 只有第一屏那一行不同，**最长公共前缀因此只有 60 字节**，后面 68,016~75,892 字节的 system、
-  // 2,126~59,492 字节的工具清单和已经跑出来的整段历史全部不计入缓存（DeepSeek 只认「完整匹配
-  // 一个已落盘的缓存前缀单元」）。这里用**真的 dsh-scope + 真的 dsh-system-prompt**把同一件事
-  // 做到最小：同一条作用域链，换一次父，看装配出来的提示词从哪儿开始分叉。
+  // 请求渲染「跟随 Lead」的 persona，异步重绑落地后第二次换成角色预设那一份 —— persona 是**第一处**
+  // 分叉，最长公共前缀因此只有 60 字节（官方 harness:identity 那一句）。
+  //
+  // **这份夹具的边界（2026-10-17 更正，别把它当整机事实）**：这里只注册了 persona 一个段，所以
+  // 「钉住 → 换父后逐字节相同」在**本夹具内**成立。真机上两版 system 在 persona 之后还差在**工具
+  // 文档段**：实测 0e572d03 两版工具数都是 1，system 却是 68,016 → 75,511 字节，hunk 级差分 17 处；
+  // 把 persona 那一行中性化后逐对实测公共前缀只有 1,442 ~ 3,033 字节。所以钉住 persona 的真实收益是
+  // 「把第一处分叉从第 60 字节抬到第一处工具文档差异」，**不是**整段复用。
+  // 另外：`request/header` 不是每请求一条，而是**装配变化时**才记 —— 083f416b 有 7 次请求（7 条带
+  // usage 的 assistant/message）却只有 2 条 header。夹具里的一条 header 对应一次装配，别拿它当请求数。
+  //
+  // 这里用**真的 dsh-scope + 真的 dsh-system-prompt**把同一件事做到最小：同一条作用域链，换一次父，
+  // 看装配出来的提示词从哪儿开始分叉。
   const lcpOf = (a, b) => {
     const n = Math.min(a.length, b.length);
     let i = 0;
@@ -1165,7 +1174,7 @@ async function main() {
     return true;
   });
 
-  check('钉住（本包的修法）：同一份作用域链换父，装配出来的 system 逐字节相同', () => {
+  check('钉住（本包的修法）：同一份作用域链换父，本夹具内装配结果逐字节相同（夹具只有 persona 段，真机还会在工具文档段分叉）', () => {
     if (!flipOn.beforeSwap.includes(roster.MEMBER_PERSONA_PIN)) return '本层钉的那句没出现在换父之前：' + flipOn.beforeSwap.slice(0, 160);
     if (flipOn.beforeSwap !== flipOn.afterSwap) {
       return '换父后 system 变了（公共前缀 ' + lcpOf(flipOn.beforeSwap, flipOn.afterSwap)
