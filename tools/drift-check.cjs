@@ -515,39 +515,73 @@ check('硬前置：官方 agent-team-profile 仍被 profile 选中', () => {
   return true;
 });
 
-// 10f) dsh-ops 组件合并（2026-10-11）：本包的 ops-file 行与 dsh-ops 自带的 dsh-ops-file 行
-// 挂同一个实现包；两行同时活会把同一套 ops_* 工具注册两次 → "already registered"，
-// file 组件挂掉。bundle 层顺序不可靠（dsh-ops 在本包之后时它的行还会覆盖同 id 行），
-// 唯一顺序无关的落点是 profile 层 —— 这里验证三件事：
-//   ① profile patch 把 dsh-ops-file 钉成 disabled（关掉重复行，不是关掉功能）；
-//   ② 本包 cordis.patch.yml 的 ops-file 行仍然存在（功能来源）；
-//   ③ dsh-ops 已安装时（profile node_modules 可解析），双行状态由状态文件的
-//      opsIntegration 记录（那半是运行时事实，这里只做静态可判的两条）。
-check('dsh-ops 合并：profile 层钉住 dsh-ops-file disabled + 本包 ops-file 行在位', () => {
-  const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
-  if (!fs.existsSync(profilePatchPath)) {
-    return `读不到 ${profilePatchPath}：dsh-ops-file 的重复注册防护没有落点`;
-  }
-  const profileText = fs.readFileSync(profilePatchPath, 'utf8');
-  // `- id: dsh-ops-file` 后到下一行级条目之前的块里必须有 disabled: true。
-  const at = profileText.search(/^-\s*id:\s*dsh-ops-file\s*$/m);
-  if (at < 0) {
-    return 'profile 的 cordis.patch.yml 没有 `- id: dsh-ops-file / disabled: true`：'
-      + '本包 ops-file 行与 dsh-ops 自带行会重复注册 ops_* 工具（already registered）。'
-      + '修法：在 profile patch 的 dsh-ops 块加两行（见本仓库 cordis.patch.yml 2026-10-11 段的说明）。';
-  }
-  const tail = profileText.slice(at).split(/\n-\s*(?:id|insert):/)[0];
-  if (!/^\s*disabled:\s*true\s*$/m.test(tail)) {
-    return 'profile 层的 dsh-ops-file 行没有 disabled: true —— 重复注册风险未解除';
-  }
+// 10f) dsh-ops 原生链接（2026-10-15 改版：不再内嵌，两插件各自启用）。
+// 本包侧的静态事实（cordis.patch.yml 不得再有自带 ops 行）+ profile 侧的挂载事实
+// （四行 disabled:false）+ 装机 dsh-ops 侧的实现事实（工具前缀/注册点/PTC 门已放宽）。
+// bundle 层顺序不可靠（谁在前取决于用户启用顺序），profile 层是唯一顺序无关的落点。
+check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:false', () => {
   const oursPatch = fs.readFileSync(path.join(PLUGIN_DIR, 'cordis.patch.yml'), 'utf8');
-  // ops-file 行在 `- insert:` 块内（4 空格缩进），正则必须允许行首空白。
-  if (!/^\s*-\s*id:\s*ops-file\s*$/m.test(oursPatch)) {
-    return '本包 cordis.patch.yml 的 ops-file 行消失了：第四组件（Rust 文件检索）失效';
+  if (/^\s*-\s*id:\s*ops-file\s*$/m.test(oursPatch)) {
+    return '本包 cordis.patch.yml 又出现了自带的 ops-file 行：2026-10-15 已按用户要求删除内嵌，' +
+          + 'ops_* 的唯一来源是独立 dsh-ops 插件（留着这行会与它的 dsh-ops-file 行重复注册 ops_*）。';
   }
+  const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
+  if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
+  const profileText = fs.readFileSync(profilePatchPath, 'utf8');
+  for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
+    const at = profileText.search(new RegExp('^-\\s*id:\\s*' + id + '\\s*$', 'm'));
+    if (at < 0) return `profile 的 cordis.patch.yml 没有 - id: ${id} 行：交付要求四个组件全开，这一行没人钉住（依赖 dsh-ops 自己的默认值，background/ptc 默认是关的）`;
+    const tail = profileText.slice(at).split(/\n-\s*(?:id|insert):/)[0];
+    if (!/^\s*disabled:\s*false\s*$/m.test(tail)) return `profile 层的 ${id} 行没有 disabled: false：组件不会挂载（交付要求四组件全开）`;
+  }
+  // 本包不得再依赖 vendor：目录与 exports 子路径都必须不存在。
+  if (fs.existsSync(path.join(PLUGIN_DIR, 'vendor'))) return 'vendor/ 目录又出现了：内嵌 ops 已按用户要求删除';
+  const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'));
+  if (pkg.exports?.['./ops-file'] !== undefined) return 'package.json 又出现了 ./ops-file 导出（vendor 入口）';
   return true;
 });
 
+// 10g) 装机 dsh-ops 的实现事实：工具前缀与注册点没改名 + PTC 门已放宽到 ptc+both。
+// 这一条把「别人下载本插件后能不能用 ops」的前提钉住：ops 一旦升级，判据可能变化。
+check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖面）', () => {
+  const { createRequire } = require('node:module');
+  let pkgJson;
+  try {
+    pkgJson = createRequire(path.join(PROFILE_DIR, 'package.json')).resolve('dsh-ops/package.json');
+  } catch {
+    return true; // 没装 dsh-ops：本包不依赖它，适配层自动静默，无需报失败。
+  }
+  const root = path.dirname(pkgJson);
+  const version = JSON.parse(fs.readFileSync(pkgJson, 'utf8')).version ?? '?';
+  const policy = fs.readFileSync(path.join(root, 'lib', 'policy.js'), 'utf8');
+  if (!/export const TOOL_PREFIX = 'ops_'/.test(policy)) return `dsh-ops ${version} 的 TOOL_PREFIX 变了：lib/ops-adapter.js 的 OPS_TOOL_NAMES 需要逐名重核`;
+  for (const [needle, what] of [
+    ["FILE_TOOLS = Object.freeze(['inspect_local_file', 'grep', 'glob', 'replace'])", 'file 组件的四个工具名'],
+    ["BACKGROUND_TOOLS = Object.freeze(['run_background', 'job_output', 'job_list', 'job_kill'])", 'background 组件的四个工具名'],
+  ]) {
+    if (!policy.includes(needle)) return `dsh-ops ${version} 的 ${what} 与本包适配层的名单不一致（OPS_TOOL_NAMES 需要重核）`;
+  }
+  // PTC 组件的注册门：必须是本仓库 tools/ops-ptc-both.cjs 放宽后的形状（ptc + both）。
+  const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
+  if (!ptcIndex.includes('function ptcPresentation(assembly)')) {
+    return `dsh-ops ${version} 的 PTC 组件注册门仍是原版（只认纯 ptc）：调度模式的队员默认是批量调用档（both），` +
+      + '拿不到 ops_batch / ops_result。修法：node tools/ops-ptc-both.cjs 然后重启 DSH。';
+  }
+  if (!ptcIndex.includes("'tools:sdk'") || !ptcIndex.includes("'tools:ptc-only'")) {
+    return `dsh-ops ${version} 的 PTC 门不再只用公开装配段判定：适配层需要按新版重核（不许改用私有 modeFor/layers）`;
+  }
+  // 宿主侧的两条承重事实（放宽判据的依据）：both 的 wireSchemas 含全部工具 + run_code；
+  // tools:sdk 在 mode !== native 时注册、tools:ptc-only 只在 ptc 时非空。
+  const toolsSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
+  if (toolsSrc === '') return '读不到 app.asar 里的 dsh-tools：无法验证 both 档的装配事实（PTC 门的判据依据）';
+  if (!/knownNames:\s*\[\.\.\.view\.knownNames,\s*RUN_CODE_NAME\]/.test(toolsSrc)) {
+    return '宿主 dsh-tools 的 both 分支不再返回「全部已知工具 + run_code」：PTC 放宽补丁的判据需要重核';
+  }
+  if (!/name:\s*"tools:sdk"/.test(toolsSrc) || !/name:\s*"tools:ptc-only"/.test(toolsSrc)) {
+    return '宿主 dsh-tools 的两个装配段名变了（tools:sdk / tools:ptc-only）：PTC 放宽补丁的判据需要重核';
+  }
+  return true;
+});
 // 10e) 依赖解析接线：本包以 link: 安装时 Node 解析到真实路径，需要一个指向
 // <dshHome>/profiles/node_modules 的 junction，否则 @deepseek-ai/dsh-tools 在
 // **模块加载期**解析失败，host 行无法激活（首次安装实测就是这么失败的）。
