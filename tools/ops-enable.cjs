@@ -133,14 +133,38 @@ function detectBash(options) {
   return null;
 }
 
-/** background 行补 bashPath（放在 allowSystemShellFallback 之后，保持可读顺序）。 */
+/**
+ * 给 shell 与 background 两行补 bashPath（放在各自的锚点之后，保持可读顺序）。
+ *
+ * 为什么 shell 行也要（2026-10-16 真机 P0）：shell 行的 `publishBashTool: true` 只是「允许发布」，
+ * 真正决定发不发的是 `resolveShells` 能不能解析到 bash。本机 `@dsh-ops/bash-win32-x64` 没装
+ * （ops 的 bundledShell 拿不到），而 shell 行我们刻意写 `allowSystemShellFallback: false`
+ * （不想让 pwsh 也去吃 PATH 兜底），于是 `bash.available=false / source=disabled` →
+ * **ops_bash 从来没发布过**。装机实测：Lead 与两名队员的 wire 里都没有 ops_bash，
+ * 状态文件 visibleTools 也只有 file 四件套。而 ops-mount-check 的 D 段当时**自己传了** bashPath，
+ * 与生产配置不同形 → 那条 ✓ 是假绿灯（见该文件 D 段的注释与闸门）。
+ * 修法：shell 行同样带显式 bashPath（`bashPath` 在共享白名单里，dsh-ops `lib/config.js:151,196`
+ * 任何行都接受），fallback 保持 false —— pwsh 仍只用随包 PS7，不受影响（实测 pwsh 解析
+ * 仍是 bundled）。探测不到 bash 时不写这个键，行为回到「不发布 ops_bash」，与旧版一致。
+ * @param {{id:string, lines:string[]}} row - ROWS 里的一项。
+ * @param {string|null} bashPath - detectBash() 的结果。
+ * @returns {string[]} 该行的文本行。
+ */
 function rowLines(row, bashPath) {
-  if (row.id !== 'dsh-ops-background') return row.lines;
   if (typeof bashPath !== 'string' || bashPath === '') return row.lines;
+  const line = '    bashPath: ' + JSON.stringify(bashPath);
+  if (row.id === 'dsh-ops-shell') {
+    const at = row.lines.indexOf('    allowSystemShellFallback: false');
+    if (at < 0) return row.lines;
+    const next = row.lines.slice();
+    next.splice(at + 1, 0, line);
+    return next;
+  }
+  if (row.id !== 'dsh-ops-background') return row.lines;
   const at = row.lines.indexOf('    allowSystemShellFallback: true');
   if (at < 0) return row.lines;
   const next = row.lines.slice();
-  next.splice(at + 1, 0, '    bashPath: ' + JSON.stringify(bashPath));
+  next.splice(at + 1, 0, line);
   return next;
 }
 
@@ -169,6 +193,50 @@ function splitRows(lines) {
   return blocks;
 }
 
+/** 一行的缩进宽度（前导空白数）。 */
+function keyIndent(line) {
+  return line.length - line.replace(/^\s+/u, '').length;
+}
+
+/**
+ * 找出某个 `key: value` 行的**完整标量跨度**（含被宿主折行的续行）。
+ * 续行判据：缩进比本行更深、且在同一个块内（空行/更浅缩进 = 标量结束）。
+ * @param lines - 全文行数组。
+ * @param at - key 行的下标。
+ * @param blockEnd - 本行的最后一行下标。
+ * @returns {{start:number, end:number}}
+ */
+function scalarSpan(lines, at, blockEnd) {
+  const ind = keyIndent(lines[at]);
+  let end = at;
+  for (let i = at + 1; i <= blockEnd; i += 1) {
+    const line = lines[i];
+    if (line.trim() === '') break;
+    if (keyIndent(line) <= ind) break;
+    end = i;
+  }
+  return { start: at, end };
+}
+
+/** 取一个标量跨度的**值文本**（折行按 YAML 折叠语义用单空格接回去）。 */
+function scalarValue(lines, span) {
+  const parts = [];
+  for (let i = span.start; i <= span.end; i += 1) {
+    if (i === span.start) {
+      const m = /: (.*)$/u.exec(lines[i]);
+      parts.push(m === null ? '' : m[1]);
+    } else {
+      parts.push(lines[i].trim());
+    }
+  }
+  return parts.join(' ').replace(/\s+/gu, ' ').trim();
+}
+
+/** 把 ROWS 里期望的那一行拆成同样的"值文本"（与 scalarValue 同一套归一化）。 */
+function wantedValue(wantLine) {
+  const m = /: (.*)$/u.exec(wantLine);
+  return (m === null ? '' : m[1]).replace(/\s+/gu, ' ').trim();
+}
 /**
  * 计算目标文本与将要发生的动作。纯函数（不碰盘），便于被闸门直接复用。
  * @param {string} text - profile patch 全文。
@@ -211,7 +279,18 @@ function plan(text, options) {
       if (now === undefined) break;
       const at = working.findIndex((line, index) => index >= now.start && index <= now.end && keyOf(line) === key);
       if (at >= 0) {
-        if (working[at] !== want) { working[at] = want; changes.push(key); }
+        // **按值比较，不按整行文本比较**（2026-10-16 真机）。宿主 dsh-plugin-manager 保存 profile
+        // 时是用 YAML AST 重写的，会把长标量折行 —— 本机实测：extraGuidance 那句被折成 4 行
+        // （值逐字节不变，.probe-tmp/parse-profile.cjs 解析核对过）。旧写法 `working[at] !== want`
+        // 于是每次 --check 都报「需要处理：补齐键 dsh-ops-shell(extraGuidance)」，而它其实是对的；
+        // 更要紧的是它会**把折行改回单行**，与宿主互相改写。现在读值时把折叠的续行也吃进来，
+        // 归一化空白后比对：值相同就什么都不做（幂等），值真不同才重写（重写时顺手清掉续行）。
+        const span = scalarSpan(working, at, now.end);
+        const current = scalarValue(working, span);
+        if (current !== wantedValue(want)) {
+          working.splice(span.start, span.end - span.start + 1, want);
+          changes.push(key);
+        }
       } else {
         let insertAt = now.end;
         for (let i = now.end; i > now.start; i -= 1) {
