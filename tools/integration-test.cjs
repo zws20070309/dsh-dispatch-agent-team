@@ -1616,13 +1616,18 @@ async function main() {
     const realProfileDir2 = process.env.DSH_PROFILE_DIR;
     process.env.DSH_PROFILE_DIR = gateProfile;
     const rowsPtcOn = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: false }));
-    const detectWith = (toolNames, rows) => adapter.detectOpsComponents(fakeCtxWith(rows, toolNames), { id: 'gate' });
-    // ① PTC 挂着 + 该作用域看不到那两个工具 → missingPtcTools=true，且修法是改本插件配置
-    const nag = detectWith(['ops_grep'], rowsPtcOn);
-    // ② PTC 挂着 + 看得到（纯 PTC 档队员）→ 不催
-    const satisfied = detectWith(['ops_grep', 'ops_batch', 'ops_result'], rowsPtcOn);
+    // 第三个参数 = 该作用域是否纯 PTC 档（由调用方按实测呈现档给，2026-10-16 改版）
+    const detectWith = (toolNames, rows, purePtc) => adapter.detectOpsComponents(fakeCtxWith(rows, toolNames), { id: 'gate' }, purePtc);
+    // ① 纯 PTC 档 + PTC 挂着 + 看不到那两个工具 → missingPtcTools=true（ops 的门没放行）
+    const nag = detectWith(['ops_grep'], rowsPtcOn, true);
+    // ② 纯 PTC 档 + 看得到 → 不催
+    const satisfied = detectWith(['ops_grep', 'ops_batch', 'ops_result'], rowsPtcOn, true);
+    // ②b 非纯 PTC 档（Lead 原生档 / 批量档队员）+ 看不到 → **不许催**：那是 ops 的设计（dsh-ops/lib/ptc/index.js:16-22）
+    const leadView = detectWith(['ops_grep'], rowsPtcOn, false);
+    // ②c 判据省略（undefined）时同样不许催 —— 保守方向是"不报警"，不是"误报"
+    const omittedView = detectWith(['ops_grep'], rowsPtcOn);
     // ③ PTC 行被用户关掉 → 根本不该提这件事
-    const ptcOff = detectWith(['ops_grep'], rowsAll);
+    const ptcOff = detectWith(['ops_grep'], rowsAll, true);
     if (realProfileDir2 === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = realProfileDir2;
 
     check('检测如实报告批量工具缺席，给的修法是本插件的角色配置（不是改 ops）', () => {
@@ -1632,10 +1637,21 @@ async function main() {
         return 'summary 没给出「关批量档/改角色配置」这条本包侧修法：' + nag.summary;
       }
       if (String(nag.summary).indexOf('dsh-ops') < 0) return 'summary 丢了版本与在场组件：' + nag.summary;
+      // 纪律：修法的措辞只能落在"ops 的 ptc 组件是否启用/它的门"上，**绝不许**让用户去改 ops 源码。
+      for (const forbidden of ['补丁', 'patch', '改 ops 的', '源码']) {
+        if (String(nag.summary).indexOf(forbidden) >= 0) return 'summary 给出了改 ops 源码的修法（违令）：' + nag.summary;
+      }
       return true;
     });
 
-    check('两个负对照：拿得到批量工具时不催；PTC 组件被关掉时也不催', () => {
+    check('非纯 PTC 档（Lead / 批量档队员）看不到 ops_batch 时**不误报**（2026-10-16 修的设计缺陷）', () => {
+      if (leadView.missingPtcTools !== false) return 'Lead/both 档被误判成"需要处理"：' + JSON.stringify(leadView.visibleTools);
+      if (String(leadView.summary).indexOf('ops_batch') >= 0) return 'summary 里出现了不该有的缺席提示：' + leadView.summary;
+      if (omittedView.missingPtcTools !== false) return '省略 purePtc 时应当不报警，却报了：' + JSON.stringify(omittedView.visibleTools);
+      return true;
+    });
+
+    check('负对照：拿得到批量工具时不催；PTC 组件被关掉时也不催', () => {
       if (satisfied.missingPtcTools !== false) return '明明看得到 ops_batch/ops_result 却仍报缺席';
       if (String(satisfied.summary).indexOf('ops_batch') >= 0) return '不该出现批量工具缺席的提示：' + satisfied.summary;
       if (ptcOff.missingPtcTools !== false) return 'PTC 行 disabled 却仍算"该给批量工具"：' + JSON.stringify(ptcOff.mounted);
