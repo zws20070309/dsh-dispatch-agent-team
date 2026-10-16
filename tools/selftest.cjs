@@ -24,6 +24,7 @@
 
 const assert = require('node:assert/strict');
 const { readFileSync, existsSync, readdirSync } = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -2395,12 +2396,27 @@ function functionBodyOf(source, needle) {
 
     const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
     assert.ok(indexSrc.includes("from './ops-adapter.js'"), 'lib/index.js 必须 import ops-adapter');
-    assert.ok(indexSrc.includes('detectOpsComponents(ctx)'), 'lib/index.js 启动期必须做 ops 组件检测');
+    assert.ok(/detectOpsComponents\(ctx, void 0, false\)/.test(indexSrc), 'lib/index.js 启动期必须做 ops 组件检测（Lead 作用域 + purePtc=false）');
     assert.ok(!indexSrc.includes('healOpsCoexist'), 'lib/index.js 不得再调用 healOpsCoexist（旧共存自愈）');
-    assert.ok(indexSrc.includes('status.opsIntegration = detectOpsComponents(ctx)'), 'writeStatusFile 必须落盘 opsIntegration（状态文件是唯一真值来源）');
+    assert.ok(indexSrc.includes('status.opsIntegration = detectOpsComponents('), 'writeStatusFile 必须落盘 opsIntegration（状态文件是唯一真值来源）');
+    // 告警判据必须由**调用方按该作用域的呈现档**给，不许 detectOpsComponents 自己凭可见性猜：
+    // 猜了就会给 Lead（原生档）和 both 队员（批量档）误报「拿不到 ops_batch 需要处理」，而那是设计使然。
+    assert.ok(/purePtc === true && mounted\.includes\('ptc'\)/.test(adapterSrc),
+      'ops-adapter 的 missingPtc 必须以 purePtc === true 为前提（否则按可见性误报）');
+    assert.ok(/!purePtc && mounted\.includes\('ptc'\)/.test(adapterSrc) === false,
+      'ops-adapter 里不得出现引用未定义变量 mounted 的判据（linkOpsForMember 作用域只有 probe.mounted）');
+    assert.ok(/probe\.mounted\.includes\('ptc'\)/.test(adapterSrc),
+      'linkOpsForMember 的非纯 PTC 档记录必须走 probe.mounted（作用域内真值）');
     const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
-    assert.ok(runtimeSrc.includes('linkOpsForMember(ctx, scoped, agent, notes, disposers)'),
-      'installMember 必须给每名队员接 ops 链接（Lead 不接：那是用户主会话，ops 自己全局可见）');
+    assert.ok(runtimeSrc.includes('linkOpsForMember(ctx, scoped, agent, notes, disposers, purePtc)'),
+      'installMember 必须给每名队员接 ops 链接**并传实测呈现档**（Lead 不接：那是用户主会话，ops 自己全局可见）');
+    assert.ok(/const purePtc = !batchDeclared && resolveRolePreset\(peekConfig\(\), role\) === 'ptc';/.test(runtimeSrc),
+      'purePtc 必须由「本层没声明成 both」+「该角色预设是 ptc」两件事共同决定（不能只看预设：both 会压住 ptc 档）');
+    assert.ok(/const batchDeclared = applyMemberBatch\(ctx, agent, role, notes, disposers\) === true;/.test(runtimeSrc),
+      'applyMemberBatch 的返回值必须被接住（both 是否真声明成功是 purePtc 的前提）');
+    const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
+    assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes('return true;'),
+      'applyMemberBatch 成功路径必须 return true（purePtc 判据依赖这个返回值）');
 
     // ②a 纪律闸门（用户 2026-10-15 明令「别改 ops 的源码」）：本仓库不得再出现任何
     //     修改 dsh-ops 包内文件的工具、判据字面或备份痕迹。适配只能发生在本包这一侧。
@@ -2452,6 +2468,52 @@ function functionBodyOf(source, needle) {
       assert.ok(!listSrc.includes("'lib/ops-coexist.js'"), listFile + ' 不得再列已删除的 ops-coexist.js');
       assert.ok(listSrc.includes("'tools/ops-mount-check.mjs'"), listFile + ' 的文件清单必须含 ops-mount-check.mjs（离线验收工具要能随包分发）');
     }
+  });
+  await check('ops-adapter 的 profile 退回链必须有 .dsh 那一段（2026-10-16 真机 P1 回归闸门）', async () => {
+    // 真机抓出来的过程：状态文件里四个 dsh-ops 组件行都 phase:2 挂着，但 opsIntegration.package = null。
+    // 上一版 profileDirs()：`const home = process.env.DSH_HOME ?? homedir()` 然后 join(home,'profiles','desktop')
+    // —— 宿主 Electron 进程**没设 DSH_HOME**，于是 base = <home>，去看 <home>\profiles\desktop
+    // （不存在）→ 判成「没装 dsh-ops」→ linkOpsForMember 提前返回 → **每个队员都收不到 ops 指引段**。
+    // 规矩本身早就写在 tools/lib-dsh-home.cjs:34-53（2026-10-04 审查 P1-7，同一类 bug 在 tools 侧修过），
+    // 这次是 lib 侧另写一份、把它漂掉了。测试当时只用 DSH_PROFILE_DIR 注入假目录，从不走退回链 → 闸门全绿。
+    const mod = await load('ops-adapter.js');
+    const probeHome = path.join(process.platform === 'win32' ? 'C:\\' : '/', 'FakeHomeForGate');
+    const dirs = mod.profileDirs({}, probeHome);
+    assert.ok(dirs.includes(path.join(probeHome, '.dsh', 'profiles', 'desktop')),
+      '空 env 必须退回 <homedir>/.dsh/profiles/desktop（少 .dsh 就是真机那个 P1）：' + JSON.stringify(dirs));
+    assert.ok(dirs.includes(path.join(probeHome, '.dsh', 'profiles', 'web')), '也要覆盖 web profile：' + JSON.stringify(dirs));
+    assert.ok(!dirs.includes(path.join(probeHome, 'profiles', 'desktop')),
+      '又生成 <homedir>/profiles/desktop 了（P1 复发：少了 .dsh 段）：' + JSON.stringify(dirs));
+    assert.deepStrictEqual(mod.profileDirs({ DSH_HOME: 'D:\\altHome' }, probeHome),
+      [path.join('D:\\altHome', 'profiles', 'desktop'), path.join('D:\\altHome', 'profiles', 'web')],
+      'DSH_HOME 是**主目录本身**：不得再补 .dsh，也不得被 homedir 顶掉');
+    assert.strictEqual(mod.profileDirs({ DSH_PROFILE_DIR: '   ' }, probeHome)[0],
+      path.join(probeHome, '.dsh', 'profiles', 'desktop'), '空白 DSH_PROFILE_DIR 要当没给');
+    assert.strictEqual(mod.profileDirs({ DSH_PROFILE_DIR: 'X:\\p' }, probeHome)[0], 'X:\\p',
+      '显式 DSH_PROFILE_DIR 必须排第一');
+    // lib 与 tools 两侧必须是同一条规矩（这次漂的就是 lib 那份）
+    const dshHome = require(path.join(__dirname, 'lib-dsh-home.cjs'));
+    // 注意 lib-dsh-home.cjs:34/:47 的 homedir 形参是**主目录字符串**（默认值才是 os.homedir()），不是函数。
+    assert.strictEqual(dshHome.resolveProfileDir({ env: {}, homedir: probeHome }).profileDir,
+      path.join(probeHome, '.dsh', 'profiles', 'desktop'),
+      'tools/lib-dsh-home.cjs 的退回链与 profileDirs 不一致（同一台机器两套答案就是这次的 P1）');
+    // 真机事实（**按本机安装情况分流，别让没装 ops 的机器假红**）：清掉两个 env、只给真实主目录。
+    // 用户 2026-10-15 的前提是「别人下载本插件，有无 ops 都要能跑」，所以这条只能是条件断言：
+    //   装了 → 必须解析到（这正是宿主进程的真实条件，也是这次 P1 的现场）；
+    //   没装 → 必须返回 null（零影响的另一头）。
+    const realHome = os.homedir();
+    const installedSomewhere = ['desktop', 'web'].some((profile) => existsSync(
+      path.join(realHome, '.dsh', 'profiles', profile, 'node_modules', 'dsh-ops', 'package.json')));
+    const real = mod.resolveOpsPackage({}, realHome);
+    if (installedSomewhere) {
+      assert.ok(real !== null && real.installed === true && /^\d+\.\d+\.\d+/.test(String(real.version)),
+        '本机装了 dsh-ops，但空 env 的退回链没解析到它（就是 2026-10-16 那个 P1）：' + JSON.stringify(real));
+    } else {
+      assert.strictEqual(real, null, '本机没装 dsh-ops 却解析出了包（凭空捏造在场）：' + JSON.stringify(real));
+      envSkipped += 0; // 这一支照常通过：它就是「无 ops」那半边的正解
+    }
+    assert.strictEqual(mod.resolveOpsPackage({}, path.join(probeHome, 'NoSuchUserDir')), null,
+      '主目录不存在时必须如实返回 null（不许假装装着）');
   });
   await check('托管块结构（2026-10-10 P0）：块必须在文件开头，且切片重写不得吞掉哨兵区内的外来行', async () => {
     // 用户 2026-10-10 报障的根因（已用真实 profile 复现）：托管块原本 append 在**文件末尾**，
