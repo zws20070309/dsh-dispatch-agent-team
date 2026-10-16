@@ -5,12 +5,13 @@
 // 这个工具在**当前进程之外**复刻同一条装配路径（真 Context、真 register、真 presentAs、真 assemble、
 // 真 dsh-ops 组件代码），所以给的是实测结论，不是推理。
 //
-// 三段（各用**独立** Context —— 组件都监听 agent/created，共用一个 root 会互相抢注，
+// 四段（各用**独立** Context —— 组件都监听 agent/created，共用一个 root 会互相抢注，
 // 第一版就是这么把负对照搞失效的）：
 //   A = 交付态：file 四件套人人可见；纯 PTC 档队员（预设 ptc + 关批量档）拿到 ops_batch/ops_result
 //   B = 负对照：同一份原版组件，只差呈现档 —— ptc 档拿到 / both 档拿不到
 //             ⇒ 因果在**本包能配的那一项**上，不需要也不允许去改 ops
-//   C = background 组件真起 FastCtx 服务器，四个 job 工具确实发布
+//   C = background 组件真起 FastCtx 服务器，四个 job 工具确实发布，并真调一次 ops_run_background
+//   D = shell 组件：ops_bash 已发布 + ops 原文与本包 extraGuidance 同时进段
 //
 // 用法：node tools/ops-mount-check.mjs      退出码 0 = 通过（含「本机没装 dsh-ops」这种不适用）
 import fs from 'node:fs';
@@ -158,10 +159,40 @@ const fileOk = FILE_TOOLS.every((n) => aPtc.opsSeen.includes(n) && aBoth.opsSeen
 // 所以这里若拿 opsWire 判就永远不成立（第一版 A2 就是这么误判 ✗ 的）。
 const ptcOk = PTC_TOOLS.every((n) => aPtc.opsSeen.includes(n));
 const bothNo = PTC_TOOLS.every((n) => !aBoth.opsSeen.includes(n));
-const okA = fileOk && ptcOk;
+let okA = fileOk && ptcOk;
 say('  判定 A1（file 四件套人人可见）= ' + (fileOk ? '✓' : '✗'));
 say('  判定 A2（纯 PTC 档队员可见 ops_batch/ops_result，即可在 run_code 程序里调用）= ' + (ptcOk ? '✓ 本包的杠杆成立，且没动 ops 一行源码' : '✗ 没拿到'));
 say('  附带事实（批量档队员没有那两个工具，符合 ops 原版设计）= ' + (bothNo ? '✓' : '✗ 与预期不符'));
+
+// 可见 ≠ 可用（C 段对 job 工具立过这条规矩，这里对 PTC 工具同样办）：真调一次 ops_batch 的 plan。
+// plan 是**无副作用**的预检（dsh-ops lib/ptc/contract.js:37 原话 "action=plan requires operations
+// and creates a no-effect audit plan"），不碰磁盘；它的 execute 会**再查一遍** ptcOnly（装机
+// lib/ptc/index.js:53）—— 所以这一调同时验掉「呈现档在调用时仍然成立」，比看可见层强。
+let execA = '（未测）';
+if (ptcOk) {
+  try {
+    const def = rootA.get('tools').get('ops_batch', matePtc);
+    // root = 插件真实根（package.json 在那儿，源文件必须真存在，否则 plan 报的是前置条件不符，
+    // 测不到"工具能不能被这个作用域调用"）。目标是 .probe-tmp 里一个不存在的名字 —— plan 无副作用，
+    // 不会落盘；contract 明写 no overwrite，所以也绝不覆盖任何现有文件。
+    const plan = await def.execute({
+      root: fs.realpathSync(PLUGIN),
+      action: 'plan',
+      operations: [{ op: 'copy', path: 'package.json', to: '.probe-tmp/ops-batch-probe.json' }],
+    }, { agent: matePtc, signal: new AbortController().signal });
+    // 判据看**结构化字段**，不看 JSON 里有没有 "error" 这个子串（成功的 plan 里 error:null 也会命中子串）。
+    const failed = plan === null || typeof plan !== 'object'
+      || plan.status === 'failed' || (plan.error && plan.error.code)
+      || plan.failed > 0 || plan.unknown > 0;
+    const snapshot = JSON.stringify(plan).slice(0, 260);
+    execA = (failed ? '✗ 被拒/失败：' : '✓ 调用成功（无副作用 plan，且 execute 里二次校验了呈现档）：') + snapshot;
+    if (failed) okA = false;
+  } catch (error) {
+    execA = '✗ 调用抛错：' + (error && error.message ? error.message : String(error));
+    okA = false;
+  }
+}
+say('  真调一次 ops_batch(action=plan，无副作用) = ' + execA);
 say('');
 
 // ── B：负对照 —— 同一份原版组件，both 档 vs ptc 档只差在呈现档 ───────────────
