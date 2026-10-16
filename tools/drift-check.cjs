@@ -1298,7 +1298,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 12g) skill：队员必须保留它，且官方「工具可见性 ↔ 技能目录」的绑定必须仍然成立。
     //
     // 为什么要有这一组（2026-10-07）：`skill` 由 preset 行带来（presets/dispatch-mode.patch.yml:142-146），
-    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:660），所以队员天然能用 —— 这件事此前**零闸门**。
+    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:693），所以队员天然能用 —— 这件事此前**零闸门**。
     // 失效方式与 2026-10-07 修掉的「/team 静默拒收附件」同类：插件照常加载、/team 照常可用，
     // 只是全队再也不会用技能（目录不注入 = 模型不知道有哪些技能，工具还在也等于没用）。
     // 官方实现是**两处**共同决定的，所以这里分两条钉：判据（工具身份比较）+ 事件作用域（按 agent 过滤）。
@@ -2064,6 +2064,57 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       }
       return true;
     });
+
+  // ── persona 钉住（2026-10-16 缓存前缀断裂修复）所依赖的官方事实 ────────────────
+  check('官方 persona 槽位：段名与排序值仍是我们钉住用的那一对', () => {
+    const sp = asar.read('dsh/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js') || '';
+    if (sp === '') return '读不到 dsh-system-prompt/lib/index.js';
+    if (!sp.includes('DEPLOYMENT_PERSONA_PREFIX: 0')) return '官方 DEPLOYMENT_PERSONA_PREFIX 不再是 0：roster.js 的 MEMBER_PERSONA_ORDER 要跟着改';
+    if (!sp.includes('PERSONA_PREFIX_SECTION = "deployment:persona-prefix"')) return '官方 persona 槽位名变了：roster.js 的 MEMBER_PERSONA_SECTION 要跟着改';
+    return true;
+  });
+
+  check('官方自己就用「同名段覆盖 persona」（dsh-subagent 的 per-child persona）—— 我们的手法不是野路子', () => {
+    const sub = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '';
+    if (sub === '') return '读不到 dsh-subagent/lib/index.js';
+    if (!sub.includes('if (composition.persona !== void 0) childCtx.systemPrompt.section({')) {
+      return 'dsh-subagent 不再用 childCtx.systemPrompt.section 覆盖 per-child persona：本包 pinMemberPersona 的手法失去官方先例，要重读';
+    }
+    if (!sub.includes('name: "deployment:persona-prefix",')) return '它覆盖的段名变了（与我们钉的不再是同一个槽位）';
+    return true;
+  });
+
+  check('dsh-persona 仍是 scope-only：挂在全局会撞（本包 try/catch 的语义依据）', () => {
+    const pe = asar.read('dsh/node_modules/@deepseek-ai/dsh-persona/lib/index.js') || '';
+    if (pe === '') return '读不到 dsh-persona/lib/index.js';
+    if (!pe.includes('collides with the registry')) return 'dsh-persona 不再声明「与注册表同名会撞」：撞车时的降级形状要重读';
+    if (!pe.includes('name: PERSONA_PREFIX_SECTION')) return 'dsh-persona 注册段名的方式变了';
+    return true;
+  });
+
+  check('dsh-scope：最近的一层赢（merge 用 set），同层同名仍然抛错（钉住靠这两条成立）', () => {
+    const sc = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
+    if (sc === '') return '读不到 dsh-scope/lib/index.js';
+    if (!sc.includes('merged.set(name, value)')) return 'merge 不再是「按链由远及近 set」：own 层遮蔽继承面这件事不成立了';
+    if (!sc.includes('farthest ancestor first, so the nearest scope')) return 'chainLayers 的顺序注释变了（远→近）：最近一层赢的依据要重读';
+    if (!sc.includes('if (data.has(name)) throw this.duplicateError(name)')) return 'NamedEntries.insert 不再对同层同名抛错：pinMemberPersona 的 catch 分支形状要重读';
+    return true;
+  });
+
+  check('官方两份 persona 的文字确实不同，且 ptc 那份带模型名 —— 本包钉住与「不钉 Lead」两条决定都挂在这上面', () => {
+    const minimal = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/minimal.patch.yml') || '';
+    const ptc = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/ptc.patch.yml') || '';
+    const standard = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml') || '';
+    if (minimal === '' || ptc === '' || standard === '') return '读不到内置预设的 patch（预设文件位置变了）';
+    if (!minimal.includes('prefix: You are a helpful software engineer assistant.')) return 'minimal 那份 persona 变了：本包「不复用任何一份」的理由要重读';
+    if (!ptc.includes('prefix: You are a coding agent powered by the {{model}} model.')) return 'ptc 那份 persona 变了（模型名不在里面的话，换模型翻面这条依据要重读）';
+    if (!standard.includes('prefix: You are a coding agent powered by the {{model}} model.')) return 'standard 那份 persona 与 ptc 不再同文：队员之间「前缀只分两组」的依据要重读';
+    const profile = readFileOr(path.join(PROFILE_DIR, 'cordis.patch.yml'));
+    if (!profile.includes('prefix: You are a helpful software engineer assistant.')) {
+      return 'profile 里 minimal-grayscale 的 persona 变了：第一次请求渲染「灰度短版」这条真机依据（143/143）要重读';
+    }
+    return true;
+  });
 
   check('白名单三个 id 在本机真的注册着（standard/ptc 来自官方 bundle，极简灰度来自 profile patch）', () => {
     const roster = readFileOr(path.join(PLUGIN_DIR, 'lib', 'roster.js'));

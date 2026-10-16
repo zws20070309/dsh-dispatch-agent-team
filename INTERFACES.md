@@ -106,6 +106,10 @@ export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名�
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
 export const TEAMMATE_PRESET_IDS;         // 2026-10-15：可指派给队员的 agent preset id 白名单（用户定案：只放 ptc / standard / minimal-grayscale）。
                                           //    存 id 不存显示名（注册表只回 id，名字是官方客户端本地化的）；配置里空 = 跟随 Lead。详见 §6 末「队员预设」。
+// 2026-10-16 新增（缓存前缀断裂修复，见 §3.6 末「persona 钉住」）：
+export const MEMBER_PERSONA_SECTION;      // 'deployment:persona-prefix' —— 官方 persona 槽位名（本包不 import 宿主包，故在这里存字面量）
+export const MEMBER_PERSONA_ORDER;        // 0 = 官方 DEPLOYMENT_PERSONA_PREFIX 的排序值；drift-check 钉住官方那张表
+export const MEMBER_PERSONA_PIN;          // 钉给队员的那一句 persona：**常量**，不含 {{…}}、不含模型名、不按角色分叉
 // 以下 4 个是 2026-09-30 起的既有导出（工具名与 Lead 名单的真值都在这里）：
 export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
 export const REPORT_TOOL_NAME;            // 'report_result'（队员专用）
@@ -481,7 +485,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:660`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:693`）。
    注意 `lib/tools.js:671-675` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
@@ -542,15 +546,67 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 `sanitizeConfig` 允许**只配预设不配模型**（旧写法在 provider/model 不配对时 `continue`
 会把整行丢掉）；路由层 `validateRoles` 对白名单外**直接拒绝** —— 表单输入被静默丢掉等于骗用户。
 
-**代价（必须告诉用户）**：队员的系统提示词前缀过去是「全队一份」，现在按
-**（preset, 模型）分组**共享。混用多种预设会把前缀切成几份，跨组不再命中缓存。
+**代价（必须告诉用户）**：混用多种预设会把队员的**工具目录**切成几份，跨组不再命中缓存；
 默认「跟随 Lead」= 零变化，这条只在你主动选之后成立。
+2026-10-16 之前这条代价还要再乘一倍：换预设会连第一屏的 persona 一起换掉，于是**每一名**被重绑
+的队员第二次请求就从第 60 字节翻面（下面「persona 钉住」把它修掉了，剩下的分组代价只在工具面）。
 
 **测试覆盖**：`integration-test` §7.9 用**真的** `dsh-scope` 父子链 + 真的 `dsh-tools.view()`
-（不是替身）：每份组合各注册一个独占工具与一句 persona，断言换预设后**工具集与 persona 同时变**、
+（不是替身）：每份组合各注册一个独占工具与一句 persona，断言换预设后**工具集真的换了**、
 own 层团队工具不受伤、会话日志落了 `agent-preset/selected` 且投影被推进、已开播的不绕锁、
-id 没装时降级并留诊断。路由层另有 5 条（只配预设能落盘 / 读回来一致 / 可用性表形状 /
-白名单外拒绝 / `roles` 整表替换语义）。`drift-check` 8 条钉住上面引用的每一处官方实现。
+id 没装时降级并留诊断；第一屏的 persona 则断言**不再跟着换**（那是下面的「persona 钉住」）。
+§7.9b 再加三条物理断言（同一份作用域链换父：不钉 → 公共前缀落在 persona 那一行之内；
+钉了 → 装配结果逐字节相同；并把两者的差额钉成可算的量）。路由层另有 5 条（只配预设能落盘 /
+读回来一致 / 可用性表形状 / 白名单外拒绝 / `roles` 整表替换语义）。
+`drift-check` 钉住上面引用的每一处官方实现（含 persona 槽位、dsh-subagent 的同类覆盖、
+dsh-scope 的「最近一层赢 / 同层同名抛错」、以及官方两份 persona 文字确实不同这五组事实）。
+
+**persona 钉住（2026-10-16，缓存前缀断裂修复 P0）**
+
+真机的账（现算命令：`node tools/cache-prefix-audit.cjs`，读 `~/.dsh/sessions` 里的会话日志）：
+
+| 事实 | 数值 |
+|---|---|
+| 队员**第一次**请求渲染的 persona | 143 / 143 都是「跟随 Lead」那一份（灰度短版） |
+| 出现两版 system 的队员会话 | 15 / 143 —— 每一次都是「短版 → 角色预设那份」的翻面 |
+| 两版 system 的最长公共前缀 | **60 字节**（官方 harness:identity 那一句）。其余 68,016 ~ 75,892 字节 system、2,126 ~ 59,492 字节工具清单、以及已跑出来的整段历史**全部不计入命中** |
+| 最近 40 个队员会话 | 相邻请求对 21：完整复用 5（23.8%）、system 断裂 16（76.2%）、字节加权命中 **27.6%**、单次最大损失 152,576 字符 |
+| 全部 61 个 ≥2 请求的队员会话 | 完整复用 96/116（82.8%）、字节加权 93.6%。两个数不矛盾：长会话里一次断裂被后续大历史稀释；而队员普遍只有 2~4 次请求，所以真实体感是上面那个 27.6% |
+| 冷重启恢复的队员 | 4da2b02d 四次请求是 短(76 工具)→长(1)→短(76)→长(1)：**每次 resume 翻两次** |
+
+根因由三条官方事实拼成：persona 属于**继承面**贡献（`dsh-persona/lib/index.js:8-11` 的原话——挂在
+预设里就遮蔽部署级 persona，与 `dsh-subagent` 的 per-child persona 同一套路），而重绑换的正是继承面
+（`binding.parent.rebind`）；又因为 `rebindMemberPreset` 不 await（官方在 `agent/created` 之后没有
+可 await 的装配前钩子），翻面必然落在**第二次请求**。
+
+修法：在真的换继承面之前，于队员**自己那一层**注册同名段 `deployment:persona-prefix`——真值在
+`lib/roster.js` 的 `MEMBER_PERSONA_SECTION` / `MEMBER_PERSONA_ORDER` / `MEMBER_PERSONA_PIN`，落点在
+`lib/runtime.js` 的 `pinMemberPersona`。依据是 `dsh-scope/lib/index.js:177-181` 的 merge：「由远及近
+set，最近的一层赢」，所以本层一句就压得住部署级与预设级两份。注册写在两处 `await` **之前**，
+因此第一次装配就用得上，前后逐字节相同。
+
+三条边界，每条都有门：
+
+1. **只钉「真的要换继承面」的队员**。`memberSessionStarted` 逐字镜像官方 `select()` 的锁判据
+   （`dsh-agent-preset-registry/lib/index.js:755-759`）：官方必然拒绝的队员不钉——那种情况什么也
+   不会换，钉了等于凭空多造一次翻面。没配预设的角色也不钉（零行为改动）。两条负对照在
+   integration §7.9（builder / tester），并由变异 M32-a / M32-b 证明它们真会咬。
+   「本机没装这份组合」（`not-found`）预判不了，所以照旧钉：少钉的代价是整段前缀重算，
+   多钉的代价只是第一屏一句身份文字。
+2. **Lead 不钉**。量化过：本会话 23 次请求 8 次 system 断裂，其中 5 次最长公共前缀只有 89 字节——
+   触发条件是用户在 `loomy/qwen3.8-flash` 与 `qodercn/qfmodel` 之间来回切。**跨 provider 本来就是
+   两套缓存池**，钉住 persona 换不来命中，只会让用户主会话的身份行少一句模型名：收益≈0 而代价真实。
+   `pinMemberPersona` 只要出现在 Lead 的安装路径里，selftest 当场红。
+3. **第三处断裂源（compaction）判定为不可修**。依据：插件队员会话里 compaction 事件 **0 次**，
+   19 次 system 断裂没有一次落在 compaction 边界 ±8 seq 内；它是 Lead 长会话的宿主行为，重写历史
+   必然断一次前缀。本包能做的只有「不放大它」——已加一条反向门：全仓 `systemPrompt.section`
+   注册的 `text` 只允许标识符或字面量，谁把实时状态塞进段里（那会让**每一轮**都翻面）当场红
+   （变异 M30-k 验过它咬得住）。
+
+**代价（如实）**：队员不再从 persona 那一句读到「我用的是哪个模型」；模型信息不参与任何行为
+（工具目录、能力说明、任务边界都在后面的段里）。官方两份 persona 本来就不一致
+（`minimal.patch.yml:14` 与 `ptc.patch.yml:15`），所以钉的是第三句中性的文本，不是替某一方改口；
+Lead 与用户主会话一个字节都没改。
 
 ### 3.7 队员的批量调用档（both，2026-10-15 用户选路径 1）
 
@@ -590,7 +646,7 @@ PTC_ONLY_INSTRUCTION :2517 且 both 渲染为空（:2725 官方注释原话
 
 **代价（必须让用户看见）**：both 会注册 SDK 段（sdkSection :2745-2757，按作用域现生成）。
 真机实测同一名队员的系统提示词 7,821 字 → 45,874 字（session-94195680 的两名 ptc 队员）。
-这一段进缓存前缀，跨队员按 (预设, 模型) 分组共享。
+这一段进缓存前缀，跨队员按**预设**分组共享（2026-10-16 起模型名已从队员的 persona 里移除，见 §3.6「persona 钉住」；工具清单本身仍随预设与 ops 在场情况分叉）。
 
 **MCP 工具（用户 2026-10-15 点名要考虑）**：MCP 服务器的工具由
 @deepseek-ai/dsh-mcp-client/lib/index.js:153 的 ctx.tools.register(definition) 注册进**该行所在的作用域**；
@@ -701,7 +757,7 @@ purePtc 省略时**保守方向是不报警**。summary 点名缺什么，措辞
 本机实测）。两条闸门盯住：`drift-check` 10f 查 profile 三行的标记与 background 的 true；
 `integration` §7.11 用**装机的真 updatedConfig** 跑双向断言（带标记 = 逐字节原样；不带 = 必须被翻成
 false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提醒我们重核，M14 变异验证过）。
-**代价**：指引段每次改动都会变，所以这里**不写死数字** —— 量它跑 `node .probe-tmp/measure-text.mjs`（打印行数/字符数/UTF-8 字节/粗估 token）。与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
+**代价**：指引段每次改动都会变，所以这里**不写死数字** —— 要量就把 `OPS_LINK_TEXT` 现拼一遍看行数/字符数/UTF-8 字节（那是临时探针的活，本仓库不固化成工具）。它与队员无关、进共享前缀，按预设分组只冷读一次。
 `ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
 
 **验证**：`integration-test` §7.11 用真台架产出 native/ptc/both 三份**真实装配**（原版门的判据来源），
