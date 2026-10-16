@@ -625,10 +625,28 @@ shell 行拿到的 `runtime = undefined`（dsh-ops `lib/index.js:115`），只�
 ptc 档拿到、both 档拿不到 ⇒ 因果确实只在呈现档这一项上。§3.7 的 `batch:false` 语义
 （"完全沿用所选预设自己的档"）正是这条杠杆的前提。
 
-检测层如实报告，不假装可用：`detectOpsComponents` 在「PTC 组件挂着但该作用域看不到那两个工具」时
-把 `missingPtcTools` 置 true，summary 点名缺什么并给出**本插件**的修法（改角色配置），
-两个负对照钉住它 —— 拿得到时不催、PTC 组件被关掉时也不催（integration §7.11）。
+检测层如实报告，不假装可用，但**也不误报**（2026-10-16 修）：`missingPtcTools` 的前提是
+调用方告知「该作用域是纯 PTC 档」（`detectOpsComponents(ctx, scope, purePtc)` 第三参）。
+判据不能只看可见性 —— 那会把 Lead（原生档，无 run_code）和批量档队员（both）都误报成「拿不到
+ops_batch 需要处理」，而那两者都是 ops 的设计使然（`dsh-ops/lib/ptc/index.js:20` 的门要
+`assembly.tools.length === 1 && tools[0].name === 'run_code'`）。队员侧的真值由
+`runtime.js installMember` 算：`purePtc = !batchDeclared && resolveRolePreset(...) === 'ptc'`
+（预设 ptc 但本层被 `applyMemberBatch` 声明成 both 时，both 压住它 → 不是纯 PTC 档，所以
+两个条件缺一不可）；Lead 那侧 `index.js` 传 `false`（调度模式下 Lead 保持原生档，是设计）。
+purePtc 省略时**保守方向是不报警**。summary 点名缺什么，措辞只落在「ops 的 ptc 组件是否启用/它的门」，
+三条负对照钉住它 —— 拿得到时不催、PTC 组件被关掉时不催、非纯 PTC 档看不到也不催（integration §7.11）。
 
+**又一个真机 P1（2026-10-16，重启前的状态文件抓出来的）**：`profileDirs()` 的退回链漏了 `.dsh` 那一段。
+上一版是 `process.env.DSH_HOME ?? homedir()` 再 `join(home, 'profiles', 'desktop')` —— 宿主 Electron 进程
+**没有设 DSH_HOME**，于是 base = `C:\Users\ZWS`，去看 `C:\Users\ZWS\profiles\desktop`（不存在）→
+`resolveOpsPackage()` 返回 null → `linkOpsForMember` 提前返回 → **一个队员都收不到 ops 指引段**，
+而状态文件里四个 dsh-ops 组件行都 `phase: 2` 挂着（本机实测 `opsIntegration.package: null` + 四行全在）。
+同一条规矩本仓库早就立过：`tools/lib-dsh-home.cjs:34-53`（2026-10-04 审查 P1-7）—— `DSH_HOME` 是
+**主目录本身**，没给才是 `homedir()/.dsh`。这次是 lib 侧另写了一份、把它漂掉了；测试当时只用
+`DSH_PROFILE_DIR` 注入假目录，**从不走退回链**，所以闸门全绿、真机是坏的（教训：注入式隔离测不到
+默认路径，纯函数要可注入 env/home 才能测这条链）。现在 `profileDirs(env, home)` 与
+`resolveOpsPackage(env, home)` 都导出成可注入纯函数，`selftest` 有专门一组断言钉住（含
+`lib-dsh-home.cjs` 与 `profileDirs` 两侧必须同一条链、以及没装 ops 的机器必须得到 null 不许假红）。
 **profile 层的启用（本机交付）**：`profiles/desktop/package.json` 的 bundles 里加了 `dsh-ops`；
 `profiles/desktop/cordis.patch.yml` 用四行 `disabled: false` 覆盖它自带的关闭（`dsh-app-boot`
 `applyEntryPatches:104-107` 逐键赋值，profile 层在所有 bundle 层之后 → 唯一与启用顺序无关的落点）。
@@ -666,7 +684,8 @@ false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提�
 
 **验证**：`integration-test` §7.11 用真台架产出 native/ptc/both 三份**真实装配**（原版门的判据来源），
 并走真安装路径证明 `batch:false` 的角色不被本包覆盖成批量档（对照：开着批量档就被覆盖成 both）；
-检测层的 `missingPtcTools` 有两个负对照（拿得到时不催、PTC 关掉时也不催）。含两条负对照：
+检测层的 `missingPtcTools` 有三条负对照（拿得到时不催、PTC 关掉时不催、非纯 PTC 档看不到时不催 ——
+最后一条就是防 Lead/both 被误报的那道）。含另两条负对照：
 四行全 disabled 时 `mounted` 必须为空且不许注册指引段。9/9 变异验证（M1..M9）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
 队员分叉、名单混入 `ops_run`、摘掉 `installMember` 的链接调用、复活自带 ops-file 行、把 ptc 行改回
 disabled、把真 updatedConfig 改成恒等函数（模拟上游修掉陷阱）、摘掉迁移标记、把 fallback 改成 false、
