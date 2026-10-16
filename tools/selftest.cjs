@@ -2414,6 +2414,20 @@ function functionBodyOf(source, needle) {
       'purePtc 必须由「本层没声明成 both」+「该角色预设是 ptc」两件事共同决定（不能只看预设：both 会压住 ptc 档）');
     assert.ok(/const batchDeclared = applyMemberBatch\(ctx, agent, role, notes, disposers\) === true;/.test(runtimeSrc),
       'applyMemberBatch 的返回值必须被接住（both 是否真声明成功是 purePtc 的前提）');
+    // 2026-10-16 真机 P0（researcher-ops 白跑一轮 + 每步翻转）：预设 ptc + 关批量的队员，
+    // 必须在**自己那层同步** presentAs('ptc')。只靠异步预设重绑会带来两个后果：第一次请求跑在
+    // 继承来的 native 组合上；而且实测不是「晚一次」而是**每步翻转**（native→ptc→native→ptc）。
+    // 对照证据：scout-ops（批量开着，本包同步声明 both）逐请求是 both→both 稳定；
+    // researcher-ops（本包什么都没声明）是 native(76)→ptc(1)→native(76)→ptc(1)。
+    // 差别就在「自己那层有没有钉住」—— 所以这里钉住源码形状。
+    const dmAt = runtimeSrc.indexOf('function declareMemberMode');
+    assert.ok(dmAt >= 0, 'runtime.js 必须有 declareMemberMode（纯 PTC 档的同步声明口）');
+    const dmBody = runtimeSrc.slice(dmAt, dmAt + 2200);
+    assert.ok(/pick\(ctx, 'ptcRuntime'\) === undefined/.test(dmBody) && /presentAs\(mode\)/.test(dmBody),
+      'declareMemberMode 必须先探 ptcRuntime 再声明：modeFor 解析成 ptc 时装配会走 requirePtcRuntime（dsh-tools:2863-2865），拿不到就抛 —— 那会让这名队员每一次请求都失败');
+    const branchRe = /if \(resolveRolePreset\(peekConfig\(\), role\) === 'ptc'\) declareMemberMode\(ctx, agent, 'ptc', who, notes, disposers\);/;
+    assert.ok(branchRe.test(runtimeSrc),
+      'applyMemberBatch 关掉批量的那一支必须给预设 ptc 的队员同步声明 ptc 档（否则第一次请求跑在旧组合上 = 真机那个 P0）');
     const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
     assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes('return true;'),
       'applyMemberBatch 成功路径必须 return true（purePtc 判据依赖这个返回值）');

@@ -1363,6 +1363,44 @@ async function main() {
       return true;
     });
 
+    // 2026-10-16 真机 P0 的回归：预设 ptc + 关批量 = 纯 PTC 档，**第一次装配**就得是纯 PTC 形状。
+    // 上一版这一支什么都不做（"沿用预设自己的档"），档要等异步预设重绑才落地，于是第一次请求
+    // 用继承来的组合跑 —— 真机 researcher-ops 的 seq13 是 76 个工具、无 run_code、无 ops_batch，
+    // 它据此把「通路没通」报给 Lead，白跑一轮再自我更正。这里断言的就是**同步那一刻**。
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { preset: 'ptc', batch: false } },
+    });
+    const mateHKey = { name: 'stand-member-h' };
+    const mateHScope = createScope(root, mateHKey);
+    const mateHSession = makeStandSession('stand-researcher-h', 'dispatch-mode', false);
+    const mateH = { id: 'stand-researcher-h', ctx: agentCtx(mateHScope.ctx), options: {}, session: mateHSession };
+    agents.push(mateH);
+    membershipById.set(mateH.id, { root: standLead, id: mateH.id, role: 'teammate', name: 'researcher' });
+    joinOrRebind(mateH.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateH });
+    // **故意不 await tick()**：要判的就是「agent/created 同步返回之后」那一刻的装配形状。
+    check('纯 PTC 档队员：agent/created 同步返回后第一次装配就只有 run_code（不等异步重绑）', () => {
+      const names = wireOf(mateHKey).knownNames;
+      if (names.length !== 1 || names[0] !== 'run_code') {
+        return `同步声明没生效，第一次装配不是纯 PTC 形状（${names.length} 个）：` + names.slice(0, 12).join(", ");
+      }
+      return true;
+    });
+    await tick();
+    await tick();
+    await tick();
+    check('异步重绑落地后仍是纯 PTC 档（同步声明与重绑两种机制不打架，档不会被换回 native）', () => {
+      const names = wireOf(mateHKey).knownNames;
+      if (names.length !== 1 || names[0] !== 'run_code') return '重绑之后档被换掉了：' + names.join(', ');
+      return true;
+    });
+    const hNotes = runtime.notes().join('\n');
+    check('这一档的声明在安装记录里留了痕（用户/Lead 能看见队员本次是什么档）', () => {
+      if (!hNotes.includes('纯 PTC 档已在本层同步声明')) return '安装记录里没有那条声明回执：' + hNotes.slice(-300);
+      return true;
+    });
+
     // 这一节改过配置，后面的路由层断言要从干净状态起算。
     await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
 
@@ -1503,7 +1541,7 @@ async function main() {
     });
 
     // ops-enable.cjs 的 plan()：四组件启用的唯一真值（drift-check 复用它）。
-    const { plan: planEnable } = require('./ops-enable.cjs');
+    const { plan: planEnable, SHELL_OVERRIDE_TEXT } = require('./ops-enable.cjs');
     const sampleProfile = '- id: agent-team\n  config:\n    maxMembers: 48\n\n'
       + '- id: dsh-ops-shell\n  disabled: true\n\n- id: llm-deepseek\n  name: x\n';
     const pass1 = planEnable(sampleProfile);
@@ -1553,12 +1591,13 @@ async function main() {
 
     // 「预设 ptc + 关批量档 = 纯 PTC 档，于是原版 ops 给 ops_batch/ops_result」这条**合法杠杆**
     // （用户明令不改 ops 源码，所以适配只能在本包这一侧）分两半证明，各在能证的地方：
-    //   * 本包负责的那半：batch:false 时**不覆盖**预设自己的呈现档 —— §7.10 的 mateG 已断言
-    //     （关掉批量的角色，wire 里没有 run_code，也就没有被本包改成 both）。
+    //   * 本包负责的那半：batch:false 时**不覆盖成 both**。§7.10 的 mateG（预设 standard + 关批量）
+    //     断言 wire 里没有 run_code = 没被改成 both；下面 matePtc（预设 ptc + 关批量）断言 wire
+    //     恰好只剩 run_code = 纯 PTC 档本来的形状，两种预设下本包都没有强加 both。
     //   * 官方负责的那半：ptc 预设的作用域 wire 恰好只剩 run_code —— 那是
     //     dsh-agent-tool-presentation 的行为，本文件的 preset 组合是 mock 的（没有真挂那一行），
     //     所以**在这里证不了**；端到端证据在 tools/ops-mount-check.mjs（真挂原版 ops 的 PTC
-    //     组件，ptc 档拿到、both 档拿不到，两个独立 Context 各测一轮）。
+    //     组件，ptc 档拿到、both 档拿不到，四个独立 Context；A 段还真调一次 ops_batch 证明可调用）。
     // 这里只钉住台架能证的那半：两种角色配置下，本包对 wire 的影响符合预期。
     await runtime.saveConfig(root, {
       version: roster.CONFIG_VERSION,
@@ -1591,9 +1630,21 @@ async function main() {
     const ptcBatchWire = root.get('tools').wireSchemas(mateBothKey).knownNames;
     await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
 
-    check('关批量档的角色：本包不去覆盖它的呈现档（wire 里没有 run_code，团队工具照常）', () => {
-      if (ptcOnlyWire.includes('run_code')) return 'batch:false 的角色仍被本包声明成了批量档：' + JSON.stringify(ptcOnlyWire);
-      if (!ptcOnlyWire.includes(roster.REPORT_TOOL_NAME)) return '关掉批量档把团队工具也弄丢了：' + JSON.stringify(ptcOnlyWire);
+    // 判据（2026-10-16 改）：这一档的诚实语义是「本包**不**把它声明成 both」，而不是「wire 里没有
+    // run_code」。上一版拿「没有 run_code」当判据，恰好把真机那个 P0 写成了期望 —— 纯 PTC 档的
+    // wire 本来就该只剩 run_code（官方 wireSchemas 的 ptc 支，dsh-tools:2840-2843），
+    // 所以正确断言是：**恰好等于 ['run_code']**，一个不多一个不少；
+    // 团队工具仍在**它自己的层**里（SDK 面可见、在 run_code 程序内可调 —— 真机 researcher-ops
+    // 就是这样成功调用 report_result 的），只是不进送给模型的 schema。
+    check('关批量档 + 预设 ptc：本包不覆盖成 both，wire 恰好只剩 run_code（团队工具留在 SDK 面）', () => {
+      if (ptcOnlyWire.length !== 1 || ptcOnlyWire[0] !== 'run_code') {
+        return '纯 PTC 档的 wire 不是恰好 [run_code]（' + ptcOnlyWire.length + ' 个）：' + ptcOnlyWire.slice(0, 12).join(', ');
+      }
+      const visible = [...root.get('tools').view(matePtcKey).visible.keys()];
+      if (!visible.includes(roster.REPORT_TOOL_NAME)) {
+        return '团队工具连 SDK 面都没了（那 run_code 程序里也调不到 report_result）：' + visible.slice(0, 12).join(
+);
+      }
       return true;
     });
 
@@ -1672,6 +1723,38 @@ async function main() {
       return true;
     });
 
+    // 2026-10-16 真机：宿主 dsh-plugin-manager 保存 profile 是用 YAML AST **重写整个文件**，
+    // 会把长标量折行（本机实测 extraGuidance 那句被折成 4 行，值逐字节不变）。旧实现按
+    // 「整行文本」比对，于是每次 --check 都报「需要处理：补齐键 dsh-ops-shell(extraGuidance)」，
+    // 还会把折行改回单行 —— 与宿主互相改写、永不收敛。现在按**值**比对（scalarSpan/scalarValue）。
+    const LF3 = String.fromCharCode(10);
+    // 按**词边界**折成 3 段（YAML 折叠标量把换行接成一个空格，所以只能在空格处断，
+    // 在单词中间断会造出一个与原文不同的值，那就不是在测"宿主折行"而是在测"值变了"）。
+    const foldWords = (text, groups) => {
+      const words = text.split(' ');
+      const per = Math.ceil(words.length / groups);
+      const out = [];
+      for (let i = 0; i < words.length; i += per) out.push(words.slice(i, i + per).join(' '));
+      return out;
+    };
+    const foldedChunks = foldWords(SHELL_OVERRIDE_TEXT, 3);
+    const foldedRow = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
+      '    publishBashTool: true', '    shellPolicy: advise', '    allowSystemShellFallback: false',
+      '    configUpdateVersion: 1',
+      '    extraGuidance: "' + foldedChunks[0],
+      '      ' + foldedChunks[1],
+      '      ' + foldedChunks[2] + '"',
+      '    bashPath: "C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe"'].join(LF3);
+    check('宿主把 extraGuidance 折行后：--check 不许误报，值真改了仍要报（2026-10-16 真机）', () => {
+      if (foldedOnce.patched.length !== 0) return '折行被当成缺键（每次启动都要重写 profile = 与宿主互相改写）：' + JSON.stringify(foldedOnce.patched);
+      const wrong = planEnable(foldedRow.replace('OPS-TEAM OVERRIDE:', 'SOMETHING ELSE:'), { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      if (!wrong.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '值真的不同却没报（折行容差不许吞掉真问题）：' + JSON.stringify(wrong.patched);
+      const clipped = planEnable(foldedRow.replace(/ as bash\."$/u, ' bash."'), { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      if (!clipped.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '折行里被截词却没报：' + JSON.stringify(clipped.patched);
+      const again = planEnable(wrong.text, { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      if (again.patched.length !== 0) return '修完第二遍仍在改 = 不幂等：' + JSON.stringify(again.patched);
+      return true;
+    });
     check('ops-enable.plan() 逐键收敛：已有行里 publishBashTool:false 会被改成 true 并补 extraGuidance/bashPath', () => {
       const LF2 = String.fromCharCode(10);
       const stale = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
