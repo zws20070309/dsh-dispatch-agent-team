@@ -1367,6 +1367,190 @@ async function main() {
     await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
 
   }
+  // ── 7.11) ops 原生链接（2026-10-15 改版）：真装配事实 × 装机 dsh-ops 的**真**门函数 ──
+  //
+  // 为什么这一节必须存在：整次交付的赌注是「both 档队员能拿到 ops_batch / ops_result」。
+  // 那条判定住在 dsh-ops 的 lib/ptc/index.js 里，而它读的是宿主 systemPrompt.assemble 的
+  // 公开返回值。所以这里做三件事：① 用真台架产出 native / ptc / both 三份真实装配；
+  // ② 把**装机那份文件里的 ptcPresentation 源码原文**抠出来执行（不是我在测试里重写的
+  // 等价物 —— 那测的是我自己），逐档核对判定；③ 负对照：run_code 单独出现但没有任何
+  // PTC 段时必须判 native（防门被放到过宽，让原生档队员也吃到批量工具）。
+  {
+    // ops_* 由第三方插件注册。这里注册进**各自作用域自己的层**而不是全局层：
+    // 全局层一旦多出两个工具，本文件后面的路由/缓存断言就不是原来的面了。
+    const opsNativeKey = { name: 'ops-native-mate' };
+    const opsBothKey = { name: 'ops-both-mate' };
+    const opsPtcKey = { name: 'ops-ptc-mate' };
+    const opsNativeScope = createScope(root, opsNativeKey);
+    const opsBothScope = createScope(root, opsBothKey);
+    const opsPtcScope = createScope(root, opsPtcKey);
+    for (const scope of [opsNativeScope, opsBothScope, opsPtcScope]) {
+      scope.ctx.get('tools').register(syntheticTool('ops_grep'));
+      scope.ctx.get('tools').register(syntheticTool('ops_batch'));
+    }
+    opsBothScope.ctx.get('tools').presentAs('both');
+    opsPtcScope.ctx.get('tools').presentAs('ptc');
+    await tick();
+
+    const asmNative = await root.get('systemPrompt').assemble({ scope: opsNativeKey });
+    const asmBoth = await root.get('systemPrompt').assemble({ scope: opsBothKey });
+    const asmPtc = await root.get('systemPrompt').assemble({ scope: opsPtcKey });
+    const hasTool = (assembly, toolName) => assembly.tools.some((tool) => tool.name === toolName);
+    const sectionState = (assembly, sectionName) => {
+      const hit = assembly.sections.find((section) => section.name === sectionName);
+      if (hit === undefined) return 'absent';
+      return String(hit.text).trim() === '' ? 'empty' : 'non-empty';
+    };
+
+    check('三档装配事实（PTC 门的判据来源）：both = 全部工具+run_code+非空 SDK 段；ptc = 只剩 run_code+非空 PTC_ONLY 段', () => {
+      if (hasTool(asmNative, 'run_code')) return 'native 档不该有 run_code：' + asmNative.tools.map((tool) => tool.name).join(', ');
+      if (!hasTool(asmNative, 'ops_grep')) return 'native 档看不到自己层里的 ops_grep';
+      if (!hasTool(asmBoth, 'run_code')) return 'both 档没有 run_code：批量能力无从谈起';
+      if (!hasTool(asmBoth, 'ops_grep')) return 'both 档丢了 ops_grep（presentAs(both) 把工具挡掉了？）';
+      if (asmBoth.tools.length < 3) return 'both 档的工具数不像「全部 + run_code」：' + asmBoth.tools.length;
+      if (sectionState(asmBoth, 'tools:sdk') !== 'non-empty') return 'both 档没有非空 tools:sdk 段：' + sectionState(asmBoth, 'tools:sdk');
+      if (sectionState(asmBoth, 'tools:ptc-only') === 'non-empty') return 'both 档出现了非空 PTC_ONLY 段（模型会被教成只能直调 run_code）';
+      if (asmPtc.tools.length !== 1 || !hasTool(asmPtc, 'run_code')) return 'ptc 档没裁成一个 run_code：' + asmPtc.tools.map((tool) => tool.name).join(', ');
+      if (sectionState(asmPtc, 'tools:ptc-only') !== 'non-empty') return 'ptc 档的 PTC_ONLY 段是空的：门的另一半判据不成立';
+      return true;
+    });
+
+    // 装机 dsh-ops 的**真**门函数。候选目录刻意不看 DSH_HOME（本文件已把它指向临时目录），
+    // 直接用真实 profile 布局 —— 验的就是用户机器上那一份文件。
+    const realFs = require('node:fs');
+    const realOs = require('node:os');
+    const opsCandidates = [process.env.DSH_PROFILE_DIR,
+      path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop'),
+      path.join(realOs.homedir(), '.dsh', 'profiles', 'web')].filter(Boolean);
+    let opsGateFile = null;
+    for (const dir of opsCandidates) {
+      const candidate = path.join(dir, 'node_modules', 'dsh-ops', 'lib', 'ptc', 'index.js');
+      if (realFs.existsSync(candidate)) { opsGateFile = candidate; break; }
+    }
+    let gate = null;
+    let gateNote = '';
+    if (opsGateFile === null) {
+      gateNote = '本机没有已安装的 dsh-ops（profiles/*/node_modules/dsh-ops 解析不到）：跳过真门函数核对';
+    } else {
+      const gateSrc = realFs.readFileSync(opsGateFile, 'utf8');
+      const fnMatch = /function ptcPresentation\(assembly\) \{[\s\S]*?\n\}/.exec(gateSrc);
+      if (fnMatch === null) gateNote = '装机 dsh-ops 的 ptc/index.js 里没有 ptcPresentation（补丁没打上或版本变了）：' + opsGateFile;
+      else gate = (new Function(fnMatch[0] + '; return ptcPresentation;'))();
+    }
+    if (gate === null) console.log('  SKIP  装机 dsh-ops 真门函数的三档判定（' + gateNote + '）');
+
+    check('装机 dsh-ops 的**真**门函数把三份装配各判对（native / both / ptc）', () => {
+      if (gate === null) return true; // 上面已打印 SKIP，不算通过也不算失败
+      const n = gate(asmNative); const b = gate(asmBoth); const pt = gate(asmPtc);
+      if (n !== 'native') return '真门函数把 native 装配判成 ' + n + '：原生档队员会被塞进批量工具';
+      if (b !== 'both') return '真门函数把 both 装配判成 ' + b + '：both 队员拿不到 ops_batch/ops_result（交付核心失败）';
+      if (pt !== 'ptc') return '真门函数把 ptc 装配判成 ' + pt + '：原版能力被改坏';
+      return true;
+    });
+
+    check('负对照：只有 run_code、没有任何 PTC 段的装配必须判 native（门没被放到过宽）', () => {
+      if (gate === null) return true;
+      const bare = { tools: [{ name: 'run_code' }], sections: [] };
+      const verdict = gate(bare);
+      if (verdict !== 'native') return 'run_code 单独出现就判成 ' + verdict + '：任何有 run_code 的部署都会吃到批量工具';
+      const sdkOnly = { tools: [{ name: 'run_code' }], sections: [{ name: 'tools:sdk', text: 'x' }] };
+      if (gate(sdkOnly) !== 'both') return 'SDK 段在、PTC_ONLY 段不在时应判 both（这正是放宽的目的）：实得 ' + gate(sdkOnly);
+      const ptcOnlySection = { tools: [{ name: 'run_code' }], sections: [{ name: 'tools:ptc-only', text: 'x' }] };
+      if (gate(ptcOnlySection) !== 'ptc') return 'PTC_ONLY 段非空时应判 ptc：实得 ' + gate(ptcOnlySection);
+      return true;
+    });
+
+    check('ptc 档下 ops_* 仍在 view 里（程序内可调用），只是不进 wire（不送给模型）', () => {
+      const visible = [...root.get('tools').view(opsPtcKey).visible.keys()];
+      if (!visible.includes('ops_grep')) return 'ptc 档的 view 里没有 ops_grep：run_code 程序里调不到它，适配的前提不成立';
+      const wire = root.get('tools').wireSchemas(opsPtcKey).knownNames;
+      if (wire.includes('ops_grep')) return 'ptc 档的 wire 里出现了 ops_grep：与官方裁工具语义不符';
+      return true;
+    });
+
+    // lib/ops-adapter.js 的链接行为：ops 不在场 = 零字节；在场 = 注册逐字节相同的指引段。
+    const adapter = await import(libUrl('ops-adapter.js'));
+    const fakeCtxWith = (rows, toolNames) => ({
+      get: (service) => {
+        // 夹具刻意让 fiber.state **不随 disabled 变化**（真 loader 里 disabled 行的 fiber 是空的，
+        // 但闸门要测的是"我们同时看 disabled 与 phase"这条判据本身 —— 若把 disabled 编码进
+        // phase，"忽略 disabled 只看 phase"的写法就测不出来（第一版正是这样空转的）。
+        if (service === 'loader') return { entries: () => rows.map((row) => ({ options: { id: row.id, name: 'dsh-ops/' + row.component }, disabled: row.disabled, fiber: { state: 2 } })) };
+        if (service === 'tools') return { get: (toolName) => (toolNames.includes(toolName) ? { name: toolName } : undefined) };
+        return undefined;
+      },
+    });
+    const fakeScoped = (sink) => ({ systemPrompt: { section: (spec) => { sink.push(spec); return () => {}; } } });
+    const realProfileDir = process.env.DSH_PROFILE_DIR;
+
+    const emptyProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-noprofile-'));
+    tempDirs.push(emptyProfile);
+    process.env.DSH_PROFILE_DIR = emptyProfile;
+    const absentSink = []; const absentNotes = [];
+    const absentLinked = adapter.linkOpsForMember(
+      fakeCtxWith([{ id: 'dsh-ops-file', component: 'file', disabled: false }], ['ops_grep']),
+      fakeScoped(absentSink), { id: 'a', ctx: {} }, absentNotes, []);
+
+    const presentProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-hasprofile-'));
+    tempDirs.push(presentProfile);
+    realFs.mkdirSync(path.join(presentProfile, 'node_modules', 'dsh-ops'), { recursive: true });
+    realFs.writeFileSync(path.join(presentProfile, 'package.json'), '{"name":"fake-profile"}', 'utf8');
+    realFs.writeFileSync(path.join(presentProfile, 'node_modules', 'dsh-ops', 'package.json'), '{"name":"dsh-ops","version":"9.9.9-test"}', 'utf8');
+    process.env.DSH_PROFILE_DIR = presentProfile;
+    const rowsAll = adapter.OPS_ROWS.map((row, index) => ({ id: row.id, component: row.component, disabled: index === 3 }));
+    const sinkA = []; const sinkB = []; const notesA = []; const notesB = [];
+    const disposersA = []; const disposersB = [];
+    const linkedA = adapter.linkOpsForMember(fakeCtxWith(rowsAll, ['ops_grep', 'ops_batch']), fakeScoped(sinkA), { id: 'm1', ctx: {} }, notesA, disposersA);
+    const linkedB = adapter.linkOpsForMember(fakeCtxWith(rowsAll, ['ops_grep', 'ops_batch']), fakeScoped(sinkB), { id: 'm2', ctx: {} }, notesB, disposersB);
+    // 两份 probe 必须在**恢复 DSH_PROFILE_DIR 之前**算：恢复后 resolveOpsPackage 会读到本机
+    // 真装的 dsh-ops（0.3.0），断言里的 9.9.9-test 就对不上了（第一版就是这么错的）。
+    const probeRows = adapter.detectOpsComponents(fakeCtxWith(rowsAll, ['ops_grep', 'ops_batch']), { id: 'x' });
+    const probeAllOff = adapter.detectOpsComponents(
+      fakeCtxWith(adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: true })), ['ops_grep']), { id: 'x' });
+    if (realProfileDir === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = realProfileDir;
+
+    check('ops 不在场：linkOpsForMember 零注册、零 note（没装 ops 的用户提示词一个字节都不涨）', () => {
+      if (absentLinked !== false) return '没装 dsh-ops 却返回了 true（resolveOpsPackage 的隔离没生效？）';
+      if (absentSink.length !== 0) return '没装 ops 也注册了段：' + absentSink.map((spec) => spec.name).join(', ');
+      if (absentNotes.length !== 0) return '没装 ops 也留了 note：' + absentNotes.join(' / ');
+      return true;
+    });
+
+    check('ops 在场：注册 dispatch:ops-link 段，两名队员的正文逐字节相同（共享前缀纪律）', () => {
+      if (linkedA !== true || linkedB !== true) return 'ops 在场却没链接上';
+      if (sinkA.length !== 1 || sinkA[0].name !== adapter.OPS_LINK_SECTION) return '段名/段数不对：' + JSON.stringify(sinkA.map((spec) => spec.name));
+      if (sinkA[0].text !== sinkB[0].text) return '两名队员的 ops 段正文不同：会把共享前缀切碎，缓存命中率归零';
+      if (sinkA[0].text.indexOf('m1') >= 0 || sinkA[0].text.indexOf('m2') >= 0) return '正文里出现了队员身份（按角色分叉 = 切碎缓存）';
+      if (typeof disposersA[0] !== 'function') return '没拿到 disposer，卸载时回卷不了';
+      if (notesA.join(' ').indexOf('ops 链接') < 0) return '没留 ops 链接的诊断 note：' + notesA.join(' / ');
+      if (notesA.join(' ').indexOf('9.9.9-test') < 0) return 'note 里没带 ops 版本号：' + notesA.join(' / ');
+      return true;
+    });
+
+    check('检测表与 ops 0.3.0 的注册面对齐：四组件行名 + 11 个公开工具名 + 无 ops_run', () => {
+      if (adapter.OPS_ROWS.length !== 4) return 'OPS_ROWS 不是四行：' + adapter.OPS_ROWS.map((row) => row.id).join(', ');
+      if (adapter.OPS_TOOL_NAMES.length !== 11) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      if (adapter.OPS_TOOL_NAMES.indexOf('ops_run') >= 0) return '名单里出现了 ops_run：0.3.0 任何组合都不发布它（docs/manual-validation.md:17）';
+      const probe = probeRows;
+      if (probe.mounted.length !== 3) return 'disabled 的那一行不该算挂载：' + probe.mounted.join(', ');
+      if (probe.mounted.indexOf('ptc') >= 0) return 'dsh-ops-ptc 被标 disabled 却仍算挂载';
+      if (probe.visibleTools.length !== 2) return '可见 ops_* 采集不对：' + JSON.stringify(probe.visibleTools);
+      if (String(probe.summary).indexOf('9.9.9-test') < 0) return 'summary 没带版本：' + probe.summary;
+      return true;
+    });
+
+    check('负对照：四行全 disabled 时 mounted 为空且 summary 指向插件页（不误报可用）', () => {
+      const allOff = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: true }));
+      const probe = probeAllOff;
+      if (probe.mounted.length !== 0) return '全 disabled 却仍报挂载：' + probe.mounted.join(', ');
+      if (String(probe.summary).indexOf('插件页') < 0) return '全关时的 summary 没给出可执行指引：' + probe.summary;
+      const sink = []; const notes = [];
+      const linked = adapter.linkOpsForMember(fakeCtxWith(allOff, ['ops_grep']), fakeScoped(sink), { id: 'y', ctx: {} }, notes, []);
+      if (linked !== false || sink.length !== 0) return '四组件全关却仍给队员注册了 ops 段（会教模型用不存在的工具）';
+      return true;
+    });
+  }
+
   // ── 队员预设：路由层的形状与白名单（2026-10-15）────────────────────────────
   const presetSaved = await callApi('POST', GATE, {
     op: 'set',
