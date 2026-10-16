@@ -2409,6 +2409,14 @@ function functionBodyOf(source, needle) {
       assert.ok(enableSrc.includes("id: '" + id + "'"), 'ops-enable 的 ROWS 必须覆盖 ' + id);
     }
     assert.ok(enableSrc.includes('--revert') && enableSrc.includes('pre-ops-enable'), 'ops-enable 必须可还原且写前备份');
+    // 迁移标记（P1）：ops 的 updatedConfig 会把无标记行的 allowSystemShellFallback 翻成 false 并写回。
+    const enableRows = enableSrc.slice(enableSrc.indexOf('const ROWS = ['));
+    const rowBlockOf = (id) => { const at = enableRows.indexOf("id: '" + id + "'"); return at < 0 ? '' : enableRows.slice(at, at + 600); };
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background']) {
+      assert.ok(rowBlockOf(id).includes('configUpdateVersion: 1'), 'ops-enable 的 ' + id + ' 行必须带 configUpdateVersion: 1（否则 ops 迁移会改写这一行）');
+    }
+    assert.ok(!rowBlockOf('dsh-ops-ptc').slice(0, 300).includes('configUpdateVersion'), 'ops-enable 的 ptc 行不得带 configUpdateVersion（resolvePtcConfig 会抛 Unknown PTC config key）');
+    assert.ok(rowBlockOf('dsh-ops-background').includes('allowSystemShellFallback: true'), 'ops-enable 的 background 行必须 allowSystemShellFallback: true（job 工具的发布门）');
     const driftSrc = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
     assert.ok(driftSrc.includes("require('./ops-enable.cjs')"), 'drift-check 必须复用 ops-enable 的 plan()（两处各写一份正则就会各自漂）');
     for (const listFile of ['repair.cjs', 'sync-to-dsh.cjs']) {
