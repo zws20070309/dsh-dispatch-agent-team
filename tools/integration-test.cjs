@@ -1737,6 +1737,7 @@ async function main() {
       for (let i = 0; i < words.length; i += per) out.push(words.slice(i, i + per).join(' '));
       return out;
     };
+    const FAKE_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe';
     const foldedChunks = foldWords(SHELL_OVERRIDE_TEXT, 3);
     const foldedRow = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
       '    publishBashTool: true', '    shellPolicy: advise', '    allowSystemShellFallback: false',
@@ -1744,12 +1745,19 @@ async function main() {
       '    extraGuidance: "' + foldedChunks[0],
       '      ' + foldedChunks[1],
       '      ' + foldedChunks[2] + '"',
-      '    bashPath: "C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe"'].join(LF3);
+      '    bashPath: ' + JSON.stringify(FAKE_BASH)].join(LF3);
+    const foldedOnce = planEnable(foldedRow, { bashPath: FAKE_BASH });
     check('宿主把 extraGuidance 折行后：--check 不许误报，值真改了仍要报（2026-10-16 真机）', () => {
       if (foldedOnce.patched.length !== 0) return '折行被当成缺键（每次启动都要重写 profile = 与宿主互相改写）：' + JSON.stringify(foldedOnce.patched);
       const wrong = planEnable(foldedRow.replace('OPS-TEAM OVERRIDE:', 'SOMETHING ELSE:'), { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
       if (!wrong.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '值真的不同却没报（折行容差不许吞掉真问题）：' + JSON.stringify(wrong.patched);
-      const clipped = planEnable(foldedRow.replace(/ as bash\."$/u, ' bash."'), { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      // 截词要作用在**折行的最后一段**上（extraGuidance 不是文件最后一行，早先用 $ 锚定
+      // 根本没替换成功 → clipped 与输入完全相同 → 那条断言是空转，闸门当场拒绝，对的）。
+      const tail = foldedChunks[2].replace(/ as bash\.$/u, ' bash.');
+      if (tail === foldedChunks[2]) return '夹具末段没有 " as bash."，截词控制无效：' + foldedChunks[2];
+      const clippedSrc = foldedRow.replace(foldedChunks[2] + '"' , tail + '"');
+      if (clippedSrc === foldedRow) return '截词没作用到夹具上（末段文本对不上）';
+      const clipped = planEnable(clippedSrc, { bashPath: FAKE_BASH });
       if (!clipped.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '折行里被截词却没报：' + JSON.stringify(clipped.patched);
       const again = planEnable(wrong.text, { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
       if (again.patched.length !== 0) return '修完第二遍仍在改 = 不幂等：' + JSON.stringify(again.patched);
