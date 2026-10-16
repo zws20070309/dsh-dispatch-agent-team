@@ -628,17 +628,27 @@ ptc 档拿到、both 档拿不到 ⇒ 因果确实只在呈现档这一项上。
 检测层如实报告，不假装可用：`detectOpsComponents` 在「PTC 组件挂着但该作用域看不到那两个工具」时
 把 `missingPtcTools` 置 true，summary 点名缺什么并给出**本插件**的修法（改角色配置），
 两个负对照钉住它 —— 拿得到时不催、PTC 组件被关掉时也不催（integration §7.11）。
+
 **profile 层的启用（本机交付）**：`profiles/desktop/package.json` 的 bundles 里加了 `dsh-ops`；
 `profiles/desktop/cordis.patch.yml` 用四行 `disabled: false` 覆盖它自带的关闭（`dsh-app-boot`
 `applyEntryPatches:104-107` 逐键赋值，profile 层在所有 bundle 层之后 → 唯一与启用顺序无关的落点）。
-两个刻意的配置决定：
-* `dsh-ops-shell` 的 `publishBashTool: false` —— 一开 `ops_bash`，ops 的 shell 段就会写
-  "Prefer bash for command execution … do not switch shells"（dsh-ops 0.3.0 实测 `lib/policy.js:61`），与调度模式
-  preset 给每个 agent 装的 persistent-pwsh（`presets/dispatch-mode.patch.yml:114-126`）直接矛盾。
-  这一行只取它的「随包 PS7 指向」能力。
-* `dsh-ops-background` 的 `allowSystemShellFallback: true` —— 它的发布门要求 bash 可解析
-  （dsh-ops `lib/tools.js:312`），而本机 `@dsh-ops/bash-win32-x64` 没装（实测 `resolveShells` 返回
-  `available: false`），不加这一条那四个 job 工具一个都不出现。
+两个刻意的配置决定（都不改 dsh-ops 一行源码）：
+* `dsh-ops-shell` 开 `ops_bash`，但带 `extraGuidance` —— ops 的 shell 段会写
+  "Prefer bash for command execution … do not switch shells"（dsh-ops 0.3.0 实测 `lib/policy.js:61`），
+  与调度模式 preset 给每个 agent 装的 persistent-pwsh（`presets/dispatch-mode.patch.yml:114-126`）矛盾。
+  2026-10-10 的解法是干脆不开 `ops_bash`（少一个工具）；用户 2026-10-15 要求「所有工具都要能用」，
+  所以改成**开工具 + 用 ops 自己的公开扩展点**：`extraGuidance`（`lib/config.js` 接受、
+  `lib/policy.js:64` 把它追加到该段末尾）把口径说清 —— 默认执行器仍是持久 PowerShell，
+  `ops_bash` 只用于一次性 POSIX 命令。文案住在 `tools/ops-enable.cjs` 的 `SHELL_OVERRIDE_TEXT`，
+  验收工具直接 require 同一份常量（两处各写一份就会漂）。实测（`ops-mount-check.mjs` D 段）：
+  `ops_bash` 已发布、那句 OVERRIDE 确实进段。
+* `dsh-ops-background` 同时带 `allowSystemShellFallback: true` 与 **`bashPath`** —— 它的发布门要求
+  bash 可解析（dsh-ops `lib/tools.js:312`），而本机 `@dsh-ops/bash-win32-x64` 没装（实测
+  `resolveShells` 返回 `available: false`），不加就一个 job 工具都不出。但**只加兜底是坑**：
+  ops 的 PATH 兜底只排除 `%SystemRoot%\System32\bash.exe`（`lib/shells.js:481-487`），
+  **不排除** `%LOCALAPPDATA%\...\WindowsApps\bash.exe` —— 那同样是 WSL 启动器，FastCtx 实测直接拒绝
+  （"not a working bash … WindowsApps shim"）。所以 `detectBash()` 显式探测 Git for Windows 的 bash
+  并写进 `bashPath`，探测不到才退回兜底。C 段还**真调一次** `ops_run_background`（发布 ≠ 可用）。
 
 **一个差点毁掉交付的陷阱（P1，2026-10-15 读 dsh-ops 源码时发现，已修）**：ops 的配置迁移
 `updatedConfig()`（dsh-ops `lib/config-updates.js:9-14`）会把「**没有** `configUpdateVersion` 且

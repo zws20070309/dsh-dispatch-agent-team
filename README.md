@@ -204,7 +204,7 @@ node tools/install.cjs
 |---|---|
 | file | `ops_grep` / `ops_glob` / `ops_inspect_local_file` / `ops_replace` —— 检索与批量替换 |
 | background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` —— 长任务托管（需会话处于完全访问） |
-| shell | 把命令执行器换成随包 PowerShell 7（Windows 上通常比系统自带的好用） |
+| shell | `ops_bash`（一次性 POSIX 命令）+ 把命令执行器换成随包 PowerShell 7（Windows 上通常比系统自带的好用） |
 | PTC 增强 | `ops_batch` / `ops_result` —— 一次调用完成跨文件的复制/移动/删除（先 plan 再执行），大结果分页引用 |
 
 三点如实说明：

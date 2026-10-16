@@ -539,6 +539,14 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
     return 'profile 层缺这些行：' + planResult.appended.join(', ')
       + ' —— 会退回 dsh-ops 自带默认（background/ptc 是关的）。修法：node tools/ops-enable.cjs 然后重启 DSH。';
   }
+  // 逐键不齐也算不健康：plan() 会把已有行的 config 与 ROWS 对齐（publishBashTool /
+  // extraGuidance / bashPath / 迁移标记）。漏掉这一条就会出现「ROWS 改了、真 profile 没跟上、
+  // 而 drift 仍报绿」—— 本仓库 2026-10-16 真的这样假绿灯过一次（ops-enable --check 说齐备，
+  // 实际 shell 行还停在 publishBashTool: false）。
+  if (planResult.patched.length > 0) {
+    return 'profile 层这些行的 config 与本包期望不一致（plan 会补齐）：' + planResult.patched.join(', ')
+      + '。修法：node tools/ops-enable.cjs 然后重启 DSH。';
+  }
   // 迁移标记（P1，2026-10-15 实测）：dsh-ops 的 updatedConfig()（lib/config-updates.js:9-14）会把
   // 「没有 configUpdateVersion 且 allowSystemShellFallback: true」的行改成 false 并**写回 profile**
   // （mountConfigUpdates 里的 entry.parent.tree.write()）。而 background 那四个 job 工具的发布门

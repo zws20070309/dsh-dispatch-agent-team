@@ -107,6 +107,9 @@ async function makeMember(root, id, mode) {
 
 const PTC_TOOLS = ['ops_batch', 'ops_result'];
 const FILE_TOOLS = ['ops_inspect_local_file', 'ops_grep', 'ops_glob', 'ops_replace'];
+// 与 tools/ops-enable.cjs 写进 profile 的那句同源（直接 require 那份常量，不各写一份）。
+const OPS_ENABLE = createRequire(path.join(PLUGIN, 'tools', 'x.js'))('./ops-enable.cjs');
+const OPS_TEAM_SHELL_GUIDANCE = OPS_ENABLE.SHELL_OVERRIDE_TEXT;
 
 const declared = new Map();
 
@@ -269,8 +272,50 @@ try {
 say('');
 
 say('');
-const pass = okA === true && (okB === true || okB === null) && (okC === true || okC === null);
-say(pass ? '总体：通过（A 交付态' + (okB === null ? '，负对照跳过' : '，B 负对照成立') + (okC === null ? '，C 跳过' : '，C 后台任务实测') + '）' : '总体：不通过');
+
+// ── D：shell 组件（ops_bash 是否发布 + 冲突提示词是否被本包的 extraGuidance 说清）────
+// 为什么测这两件事而不是真跑命令：ops_bash 的执行要 ctx.get('subprocess')（宿主提供），
+// 台架里给的是抛错替身 —— 所以这里测**注册**与**提示词**，执行留给真机重启后的探针。
+// 冲突点：ops 的 shell 段会写「Prefer bash … do not switch shells」
+// （dsh-ops lib/policy.js:61），与本团队 preset 的 persistent-pwsh 矛盾。本包用 ops 自己的
+// 公开扩展点 extraGuidance（lib/config.js 接受、lib/policy.js:64 追加到段尾）把口径改回来，
+// 不改它一行源码。文案与 ops-enable.cjs 的 ROWS 同源（同一份 SHELL_OVERRIDE_TEXT）。
+say('D) shell 组件（ops_bash + extraGuidance）：');
+let okD = null;
+try {
+  const shellBash = OPS_ENABLE.detectBash();
+  const rootD = await makeRoot();
+  const shellComp = await import(opsFile('lib/components/shell/index.js'));
+  shellComp.apply(rootD, {
+    promptPolicy: true, publishBashTool: true, shellPolicy: 'advise',
+    allowSystemShellFallback: shellBash === null,
+    ...(shellBash === null ? {} : { bashPath: shellBash }),
+    extraGuidance: OPS_TEAM_SHELL_GUIDANCE,
+    configUpdateVersion: 1,
+  });
+  await tick(12);
+  const mateD = await makeMember(rootD, 'mate-shell', 'both');
+  const seenD = [...rootD.get('tools').view(mateD).visible.keys()];
+  // 生产的 assemble 上下文是 { agent, scope: agent }（dsh-agent/lib/index.js:291-297）——
+  // ops 的段用 context.agent 取可见工具，只传 scope 会拿到空表（第一版就是这么误判"段是空的"）。
+  const asmD = await rootD.get('systemPrompt').assemble({ agent: mateD, scope: mateD });
+  const secD = asmD.sections.find((section) => section.name === 'dsh-ops:repository-tooling:shell');
+  const textD = secD === undefined ? '' : String(secD.text);
+  const bashPublished = seenD.includes('ops_bash');
+  const overrideIn = textD.indexOf('OPS-TEAM OVERRIDE') >= 0;
+  okD = bashPublished === true && overrideIn === true;
+  say('  ops_bash 已发布 = ' + bashPublished + '；ops 原文「Prefer bash…」在段里 = ' + /Prefer bash/.test(textD)
+    + '；本包的 OVERRIDE 追加在段尾 = ' + overrideIn);
+  say('  判定 D = ' + (okD
+    ? '✓ ops_bash 可用，且冲突口径由 ops 自己的公开扩展点消解（未改其源码）'
+    : '✗ ops_bash 未发布或 extraGuidance 没进段（检查 shell 组件配置与 ops-enable 的 ROWS）'));
+} catch (error) {
+  say('  判定 D = 挂载失败：' + (error && error.message ? error.message : String(error)));
+}
+say('');
+
+const pass = okA === true && (okB === true || okB === null) && (okC === true || okC === null) && (okD === true || okD === null);
+say(pass ? '总体：通过（A 交付态' + (okB === null ? '，B 跳过' : '，B 负对照成立') + (okC === null ? '，C 跳过' : '，C 后台任务实测') + (okD === null ? '，D 跳过' : '，D shell 实测') + '）' : '总体：不通过');
 process.exitCode = pass ? 0 : 1;
 // FastCtx 子进程/管道句柄会钉住事件循环；判定已打印并已落盘，直接结束进程。
 setTimeout(() => process.exit(pass ? 0 : 1), 500).unref?.();
