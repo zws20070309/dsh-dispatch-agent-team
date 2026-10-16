@@ -36,29 +36,45 @@ researcher-ops 恰好是 `selected seq7 < 首请求 seq13` —— 旧判据打 O
 
 ---
 
-## 要贴的提示词（整段复制给 Lead）
+## 第二轮要贴的提示词（重启后直接贴给 Lead）
+
+**你的实际配置（14:12 从 `~/.dsh/dispatch-agent-team.json` 读的，不是我猜的）**：
+
+| 角色 | agent 预设 | 批量调用 | 队员拿到的档 | 该不该有 `ops_batch`/`ops_result` |
+|---|---|---|---|---|
+| `researcher`（外部调研） | PTC 模式 | **关** | **纯 PTC 档**（送模型只剩 `run_code`） | **该有**（在 run_code 程序里可调） |
+| `scout`（探索调研） | PTC 模式 | **开**（缺省） | **both 批量档** | **不该有**（ops 原版设计挡在门外） |
+
+其余 10 个角色也都是 PTC 模式 + 批量关（= 与 researcher 同为纯 PTC 档），本轮不重复验。
 
 ```
-我们在验证「智能体团队插件原生链接 dsh-ops 插件」这条通路。做 4 件事，每件都把实测值原样报出来，不要总结成"正常/异常"：
+这是重启后的第二轮验证（第一轮 session-00001006 抓出两个缺陷，已修）。做 4 件事，每件都把实测值原样报出来，不要总结成"正常/异常"，也不要替我判断对错：
 
-1. 报你自己的工具清单里所有以 ops_ 开头的名字（逐个列，不要省略）。
-2. 派队员 scout-ops，让它用 ops_grep 在本工作区找一个真实存在的东西并回报结果。然后报：它工具清单里以 ops_ 开头的名字；以及它的系统提示词里有没有一段标题是「# ops 工具（检测到 dsh-ops 插件，已接入本团队）」的文字（有/没有，并把该段前两行原文贴出来）。
-3. 派队员 researcher-ops（这个角色是 PTC 模式 + 批量调用关 = 纯 PTC 档：送给模型的工具只有 run_code 一个 —— 所以**这一步不许用"工具清单里有没有 ops_"来判断**，那永远是空，属于判据用错）。让它按下面两步做，参数要**它自己定位**、不要照抄我给的示例路径：
-   (a) 先用 ops_glob 在它自己的 cwd 里找一个**确实存在**的文件（例如 pattern "*.json" 或 "*.md"，取第一个命中）。
-   (b) 再在 run_code 程序里执行下面这条，把 path 换成 (a) 找到的那个相对路径、to 换成**同一个目录**下的一个新文件名：
-      const r = await tools.ops_batch({ action: "plan", operations: [{ op: "copy", path: "<(a) 的真实相对路径>", to: "<同目录>/<随便一个新名字>.probe" }] })
-   然后把返回里的 id、status、done、total、failed 原样报回来（plan 是**无副作用预检**，不落盘、不建目录，不是真复制）。同时让它报：它的系统提示词里那段「# ops 工具（检测到 dsh-ops 插件，已接入本团队）」在不在。
-   为什么必须自己定位（上一轮踩过的两个坑）：实测 plan 会预检**源文件存在**、且**不会为目标创建父目录**，
-   所以 path 指向不存在的文件、或 to 指向不存在的目录，都会返回 status:"error" + NOT_FOUND ——
-   那是**参数问题**，不是通路没通。判成功的唯一标准是 status:"planned" 且有 id。
-   （"不建父目录"这条来自上一轮 researcher-ops 的对照实验：源文件相同、只换 to 的目录，
-   不存在的目录报 NOT_FOUND、存在的目录返回 planned。它是**实测推断**，我没有读它的实现。）
-4. 若第 3 步里 tools.ops_batch 调用失败（报 unknown tool 或压根不在清单里），**不要改任何插件源码**，只把报错原文和你的观察报回来。
+1. 报你自己的工具清单里所有以 ops_ 开头的名字，逐个列出不省略，并单独回答：清单里有没有 ops_bash？有没有 run_code？
 
-最后给我一张表：
-| 谁 | 可见 ops_* | ops 指引段在不在 | run_code 在不在 | ops_batch 实调结果 |
-并单独说明 researcher-ops 送给模型的工具面到底有几个、名字是什么。
-```
+2. 派队员 scout-ops（角色 scout：agent 预设 PTC 模式、批量调用开着，所以它应该是 both 档）。让它只做两件事：
+   (a) 用 ops_grep 在本工作区搜一个真实存在的词并回报原始返回；
+   (b) 报回它的工具清单里所有 ops_ 开头的名字、有没有 run_code、以及有没有 ops_batch 或 ops_result。
+   预期（不要暗示给它）：ops_* 应该有一批、有 run_code、没有 ops_batch/ops_result。
+
+3. 派队员 researcher-ops（角色 researcher：agent 预设 PTC 模式、批量调用关着，所以它应该是纯 PTC 档）。
+   这一步是本轮的核心，请在它**第一次回报里**就要到这三样，不要追问第二轮：
+   (a) 它现在能不能直接调用工具？还是只有 run_code 可直调？（照抄它看到的原文，别改写）
+   (b) 用 ops_glob 在它自己 cwd 里找一个确实存在的文件（比如 pattern "*.json" 或 "*.md"，取第一个命中）。
+   (c) 在 run_code 程序里执行下面这条，path 用 (b) 找到的相对路径，to 用**同一目录**下的一个新文件名：
+      const r = await tools.ops_batch({ action: "plan", operations: [{ op: "copy", path: "<(b)的相对路径>", to: "<同目录>/<新名字>.probe" }] })
+      把返回里的 status、id、done、total、failed、error 原样报回来。
+   (d) 报它的系统提示词里有没有那段标题「ops 工具（检测到 dsh-ops 插件，已接入本团队）」，有就贴前两行原文。
+
+4. 只在第 3 步 (c) 失败时才做：把报错原文照抄回来，不要改任何插件源码、不要重试改参数超过一次。
+   注意 plan 会预检源文件存在、且不为目标创建父目录，所以 NOT_FOUND 多半是参数问题不是通路问题；
+   判成功的唯一标准是 status:"planned" 且有 id。
+
+最后给我一张表，四行（Lead / scout-ops / researcher-ops / 结论），列是：
+| 谁 | ops_* 清单 | ops_bash | run_code | ops_batch 实调 | ops 指引段 |
+然后单独用一句话回答我两个问题：
+Q1：researcher-ops 是不是在**第一次回报**里就成功调用了 ops_batch（还是它第一轮说"没有 run_code"、到第二轮才行）？
+Q2：scout-ops 与 researcher-ops 各自的 ops_* 清单差别在哪里（哪个多哪个少，具体是哪几个）？
 
 ---
 
