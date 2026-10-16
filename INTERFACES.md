@@ -687,7 +687,7 @@ purePtc 省略时**保守方向是不报警**。summary 点名缺什么，措辞
 本机实测）。两条闸门盯住：`drift-check` 10f 查 profile 三行的标记与 background 的 true；
 `integration` §7.11 用**装机的真 updatedConfig** 跑双向断言（带标记 = 逐字节原样；不带 = 必须被翻成
 false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提醒我们重核，M14 变异验证过）。
-**代价**：指引段约 700 字，与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
+**代价**：指引段每次改动都会变，所以这里**不写死数字** —— 量它跑 `node .probe-tmp/measure-text.mjs`（打印行数/字符数/UTF-8 字节/粗估 token）。与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
 `ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
 
 **验证**：`integration-test` §7.11 用真台架产出 native/ptc/both 三份**真实装配**（原版门的判据来源），
