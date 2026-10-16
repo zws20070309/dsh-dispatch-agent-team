@@ -807,6 +807,62 @@ function functionBodyOf(source, needle) {
     assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
   });
 
+  await check('队员 model 校正：官方给的是继承模型，必须换成请求真正用的那份（session-00001005 的 P1）', () => {
+    // 现场（2026-10-16 session-00001005，逐条从会话日志核出）：两名队员的 list_agents 行都写
+    // model=model-a（= Lead 自己的模型），而它们的 request/header.header.config 与 request/context
+    // 全是 provider-b/model-b（角色配置里的模型）。根因是官方 listMembers 取
+    // live?.options.model ?? root.options.model（dsh-experimental-agent-team/lib/index.js:698、:449），
+    // options.model 是继承来的那份；本包的角色覆盖发生在 agent/request 拦截器（installRouteOverride），
+    // 不回写 options.model —— 所以 Lead 问到的是**错的数据**，不是显示滞后。
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', model: 'model-a', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'inactive', model: 'model-a', diagnostics: [] },
+      { id: 'b-id', name: 'scout', role: 'teammate', status: 'inactive', model: 'model-a', diagnostics: [] },
+    ];
+    const fixed = roster.annotateMemberModels(rows, new Map([['a-id', { provider: 'provider-b', model: 'model-b' }]]));
+    assert.equal(fixed[1].model, 'model-b', '记到路由的队员要显示真模型');
+    assert.equal(fixed[0], rows[0], 'Lead 行不许动（它没有覆盖，官方那份就是它的真值）');
+    assert.equal(fixed[2], rows[2], '没记账的队员不许猜：保持官方原值，也别产生新对象');
+    assert.equal(rows[1].model, 'model-a', '入参必须不被修改');
+    assert.equal(roster.annotateMemberModels(fixed, new Map([['a-id', { model: 'model-b' }]]))[1], fixed[1], '已经对了就不重建对象（幂等）');
+    // 空账本 = 零副作用。
+    assert.equal(roster.annotateMemberModels(rows, new Map())[1], rows[1]);
+    assert.equal(roster.annotateMemberModels(rows, {})[1], rows[1]);
+    assert.equal(roster.annotateMemberModels(rows, null)[2], rows[2]);
+    assert.equal(roster.annotateMemberModels(null, new Map([['a-id', { model: 'm' }]])).length, 0, 'rows 不是数组时退化成空表，不抛');
+    // 记到了但 model 是脏值：一律不动那一行（宁可退回官方那份）。
+    assert.equal(roster.annotateMemberModels(rows, new Map([['a-id', {}]]))[1], rows[1], '没有 model 就不校正');
+    assert.equal(roster.annotateMemberModels(rows, new Map([['a-id', { model: '' }]]))[1], rows[1], '空串 model 不校正');
+    assert.equal(roster.annotateMemberModels(rows, new Map([['a-id', { model: 42 }]]))[1], rows[1], '非字符串 model 不校正');
+    // 只改 model 这一个已有字段：不许新增字段（新增 = 改 Lead 工具目录 = 动缓存前缀）。
+    const only = roster.annotateMemberModels(rows, new Map([['a-id', { provider: 'p', model: 'm', reasoningEffort: 'high' }]]))[1];
+    assert.deepEqual(Object.keys(only).sort(), ['diagnostics', 'id', 'model', 'name', 'role', 'status'], '校正只写 model 一个已有字段');
+  });
+
+  await check('路由账本写入点：脏值不进账本、空对象不进、读口返回副本（宁缺毋滥）', async () => {
+    // 为什么单独测写入点：annotateMemberModels 自己也会拦脏 model（纵深防御的第二道），
+    // 于是「noteAppliedRoute 不校验 model 空串」这种变异会被下游吸收、集成测试照样绿 ——
+    // 这条闸门让**上游那道校验**有独立的可咬性（变异 M26）。
+    const rt = await load('runtime.js');
+    const id = 'gate-agent-' + Math.random().toString(36).slice(2);
+    rt.noteAppliedRoute(id, { model: '' });
+    rt.noteAppliedRoute(id, { provider: '   ' });
+    rt.noteAppliedRoute(id, {});
+    rt.noteAppliedRoute(id, null);
+    rt.noteAppliedRoute('', { model: 'm' });
+    if (rt.appliedMemberRoutes().has(id)) return '脏值被写进了账本：' + JSON.stringify(rt.appliedMemberRoutes().get(id));
+    rt.noteAppliedRoute(id, { provider: 'provider-b', model: 'model-b', reasoningEffort: 'high' });
+    const got = rt.appliedMemberRoutes().get(id);
+    if (got === undefined) return '合法路由没进账本';
+    if (got.model !== 'model-b' || got.provider !== 'provider-b') return JSON.stringify(got);
+    // 读口必须是副本：Lead 侧改它不该动内部账本。
+    const snap = rt.appliedMemberRoutes();
+    snap.delete(id);
+    if (!rt.appliedMemberRoutes().has(id)) return 'appliedMemberRoutes 返回的是内部 Map 本身（可被调用方改坏）';
+    rt.clearAppliedRoute(id);
+    if (rt.appliedMemberRoutes().has(id)) return 'clearAppliedRoute 没作废';
+  });
+
   await check('任务板闭环提示：只算未闭环、只标 Lead 行、不改入参、幂等（session-00001000 的闸门）', () => {
     // 现场（2026-10-14 session-00001000，逐条从会话日志核出）：Lead 建了 4 条任务后全程没回看，
     // 7 个队员都交了 completed 报告，任务板停在 pending。用户来问「是不是显示 bug」——
@@ -2397,6 +2453,17 @@ function functionBodyOf(source, needle) {
     // 所以这里钉住：不许再出现「放心直调」这类无条件直调的说法，且必须含档无关的自查指引。
     assert.ok(!adapterSrc.includes('放心直调'),
       'ops 指引段又出现无条件的「放心直调」（纯 PTC 档直调会被拒，这句在骗模型）');
+    // 文案真实性闸门第二弹（2026-10-16 真机 session-00001005 + 本会话对照实验）：
+    // 上一版写「返回开头常另起一行 (Background: …) 通知（报告其它已结束/在跑的任务，本轮实测 5 次皆有）」。
+    // 对照实验证伪了它：只起一个任务时**没有**这一行（R1 原文 = "(Complete: job j-lhvnbs started; …)"），
+    // 第二个任务在跑时才出现（R2 开头 "(Background: j-lhvnbs running 0s.)"）。
+    // scout-qa 那轮 5 次都是单任务，返回里就没有 Background 行 —— 它照抄原文时如实报了没有，
+    // 而我们的文案在骗模型「开头常另起一行」。「5 次皆有」那句话还是我从**别的**一轮的观测搬过来的，
+    // 搬来时没在本轮复核：本轮 2.3 只跑了一次 ops_run_background。
+    assert.ok(!adapterSrc.includes('5 次皆有') && !adapterSrc.includes('常另起一行'),
+      'ops 指引段又出现「(Background:) 开头常另起一行 / 5 次皆有」这种无条件断言（对照实验：单任务时那行不存在）');
+    assert.ok(adapterSrc.includes('还有别的任务在跑') && adapterSrc.includes('没有这一行'),
+      'ops 指引段必须把 (Background:) 行的出现条件写成「本会话还有别的任务在跑」，并说明单任务时没有这一行');
     assert.ok(adapterSrc.includes('只有 run_code') && adapterSrc.includes('别因为直调被拒就判定通路不通'),
       'ops 指引段缺少「纯 PTC 档直调被拒是正常的」这条自查（两名队员共用同一段，必须档无关）');
     // 这段必须对所有队员逐字节相同（共享前缀纪律）：不得含角色名/队员身份插值。    // 队员指引段必须与具体队员无关（共享前缀纪律）：文本里不得出现角色/名字插值。
@@ -2440,6 +2507,32 @@ function functionBodyOf(source, needle) {
     const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
     assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes('return true;'),
       'applyMemberBatch 成功路径必须 return true（purePtc 判据依赖这个返回值）');
+
+    // ②c 队员 model 显示链路（2026-10-16 session-00001005 P1 的形状闸门）：
+    //     runtime 必须在**真的把覆盖写进请求对象之后**才记账（记早了会把「解析出但没采用」的写进去），
+    //     list_agents 必须消费这份账（否则 Lead 拿到的还是继承来的模型 = 错数据）。
+    const rtForModel = runtimeSrc;
+    const ioAt = rtForModel.indexOf('function installRouteOverride');
+    assert.ok(ioAt >= 0, 'runtime.js 必须有 installRouteOverride');
+    const ioBody = rtForModel.slice(ioAt, ioAt + 3600);
+    assert.ok(ioBody.includes('noteAppliedRoute(agent.id,'), 'installRouteOverride 必须经唯一写入点记路由（不许散写 appliedRoutes.set）');
+    assert.ok(ioBody.indexOf('noteAppliedRoute(agent.id,') < ioBody.indexOf('return override;'),
+      '记账必须在 return override 之前、且在覆盖真的合进请求对象之后（catch 分支里不许记 = 宁缺毋滥）');
+    assert.ok(!/catch[\s\S]{0,240}noteAppliedRoute/.test(ioBody),
+      'catch 分支（覆盖失败退回原配置）里不许记路由：记了就是把没用上的东西报成用过');
+    assert.ok(/export function noteAppliedRoute\(agentId, route\)/.test(rtForModel), '必须有唯一写入点 noteAppliedRoute');
+    assert.ok(/export function clearAppliedRoute\(agentId\)/.test(rtForModel), '必须有唯一作废点 clearAppliedRoute');
+    assert.ok(!/function installRouteOverride[\s\S]{0,3000}appliedRoutes\.set/.test(rtForModel),
+      'installRouteOverride 里不许绕过写入点直接 set 账本');
+    assert.ok(rtForModel.includes('clearAppliedRoute(agentId);'), 'disposeInstalled 必须作废该队员的记账');
+    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账');
+    assert.ok(/export function appliedMemberRoutes\(\) \{/ .test(rtForModel), 'runtime 必须导出 appliedMemberRoutes()');
+    assert.ok(/appliedMemberRoutes,\n/.test(rtForModel), 'appliedMemberRoutes 必须进 runtimeApi');
+    const toolsSrc = readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8');
+    assert.ok(toolsSrc.includes("annotateMemberModels(withRetries, runtime?.appliedMemberRoutes?.() ?? new Map())"),
+      'list_agents 必须消费 appliedMemberRoutes（不接 = Lead 继续看到继承模型）');
+    assert.ok(!/model:\s*\{[^\n]*required/.test(toolsSrc.split('MEMBER_VIEW_SCHEMA')[1]?.slice(0, 1200) ?? ''),
+      '不许把 model 变成必填字段（那是改 Lead 的工具目录）');
 
     // ②a 纪律闸门（用户 2026-10-15 明令「别改 ops 的源码」）：本仓库不得再出现任何
     //     修改 dsh-ops 包内文件的工具、判据字面或备份痕迹。适配只能发生在本包这一侧。
