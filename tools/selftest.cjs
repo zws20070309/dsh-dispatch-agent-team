@@ -2409,6 +2409,11 @@ function functionBodyOf(source, needle) {
       assert.ok(enableSrc.includes("id: '" + id + "'"), 'ops-enable 的 ROWS 必须覆盖 ' + id);
     }
     assert.ok(enableSrc.includes('--revert') && enableSrc.includes('pre-ops-enable'), 'ops-enable 必须可还原且写前备份');
+    // 补丁生效判据只有一份字面：adapter 的 ptcGateState 与 drift-check 10g 必须同串。
+    const GATE_NEEDLE = 'function ptcPresentation(';
+    assert.ok(adapterSrc.includes(GATE_NEEDLE), 'ops-adapter 的 ptcGateState 必须用 ' + GATE_NEEDLE + ' 当判据');
+    const driftSrcHere = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
+    assert.ok(driftSrcHere.includes("includes('" + GATE_NEEDLE + "')"), 'drift-check 必须用与 adapter 同一串判据（否则 drift 绿而运行时判 pristine）');
     // 迁移标记（P1）：ops 的 updatedConfig 会把无标记行的 allowSystemShellFallback 翻成 false 并写回。
     const enableRows = enableSrc.slice(enableSrc.indexOf('const ROWS = ['));
     const rowBlockOf = (id) => { const at = enableRows.indexOf("id: '" + id + "'"); return at < 0 ? '' : enableRows.slice(at, at + 600); };

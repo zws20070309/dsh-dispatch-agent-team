@@ -597,7 +597,9 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   }
   // PTC 组件的注册门：必须是本仓库 tools/ops-ptc-both.cjs 放宽后的形状（ptc + both）。
   const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
-  if (!ptcIndex.includes('function ptcPresentation(assembly)')) {
+  // needle 与 lib/ops-adapter.js 的 ptcGateState 用**同一串**（selftest 有交叉闸门钉住，
+  // 免得两处各写一份、其中一份漂了就出现「drift 绿而运行时判 pristine」）。
+  if (!ptcIndex.includes('function ptcPresentation(')) {
     return `dsh-ops ${version} 的 PTC 组件注册门仍是原版（只认纯 ptc）：调度模式的队员默认是批量调用档（both），` +
       + '拿不到 ops_batch / ops_result。修法：node tools/ops-ptc-both.cjs 然后重启 DSH。';
   }
