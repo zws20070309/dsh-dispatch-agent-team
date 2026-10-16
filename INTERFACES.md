@@ -284,6 +284,10 @@ export function appliedMemberRoutes();      // -> Map<agentId, {provider?, model
 export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点（监听器与测试共用）
 export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
+export function noteAppliedRoute(agentId, route); // 路由账本的唯一写入点（installRouteOverride 与
+                                            //   测试共用）；provider/model/reasoningEffort 三个键都只收非空白字符串，
+                                            //   全空则整条不记（宁缺毋滥：记了就是把没用上的报成用过）
+export function clearAppliedRoute(agentId);      // 作废该队员的记账（卸载时调用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
 export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
                                             //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。

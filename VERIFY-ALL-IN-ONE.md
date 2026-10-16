@@ -156,6 +156,19 @@ scout-qa 若 2.1 直调成功 = 原生工具可直调；researcher-qa 若 3.2 �
    **已有的** model 字段（不新增字段 = 不动 Lead 的工具目录 = 不动缓存前缀），
    并断言校正后的行仍过官方返回值校验器。前端画布不受影响（lib/graph.js 的 model
    本来就优先取 request/context 的真值）。
+   **生效时机（别当成没修好）**：账本落在 `agent/request` 拦截器里（lib/runtime.js 的
+   installRouteOverride），也就是**这名队员真的发出第一个请求**之后才有；annotateMemberModels
+   查不到条目时按纪律**不动那一行**。所以刚 spawn、还没开跑的那一瞬间，list_agents 仍显示
+   继承来的模型 = 「还没有数据」，不是修复失效。派出去「本该用什么模型」看 spawn_teammate
+   返回值里的 `route`（那个在 spawn 当时就给出）。
+   本轮有现成铁证（session-3c654f6e seq23/seq80，原文照抄）：同一条 spawn_teammate 返回里
+   `member.model = "qfmodel"` 与 `route.model = "step-5-preview"` **并存** —— 一个是继承来的，
+   一个是真要用的。所以 Lead 拿 route 判、别拿 member.model 判。
+   
+   **这条修复要重启 DSH 才在真机生效**（改的是 lib/*.js，进程加载的是启动时那份）。
+   本轮那两名队员跑的是修复前的代码，所以它们的 list_agents 仍是 qfmodel —— 那是预期，
+   不是没修好。重启后派**新**队员、让它先跑出一两步，再 list_agents 看 model 是否变成
+   角色配置里的那个。
 3. **P2 探针假陈述**：`MCP 工具 = (无：这个进程里 MCP 服务器的工具没注册进来)`。纯 PTC 档的
    wire 被裁成一个 run_code（宿主 dsh-tools/lib/index.js:2840-2843），MCP 工具同样不进 wire ——
    同一进程里 both 档队员在 run_code 程序内枚举到 **37 个** `mcp__matlab__*`。探针改成
