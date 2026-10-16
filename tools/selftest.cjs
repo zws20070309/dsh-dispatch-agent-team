@@ -2462,8 +2462,15 @@ function functionBodyOf(source, needle) {
     // 搬来时没在本轮复核：本轮 2.3 只跑了一次 ops_run_background。
     assert.ok(!adapterSrc.includes('5 次皆有') && !adapterSrc.includes('常另起一行'),
       'ops 指引段又出现「(Background:) 开头常另起一行 / 5 次皆有」这种无条件断言（对照实验：单任务时那行不存在）');
-    assert.ok(adapterSrc.includes('还有别的任务在跑') && adapterSrc.includes('没有这一行'),
-      'ops 指引段必须把 (Background:) 行的出现条件写成「本会话还有别的任务在跑」，并说明单任务时没有这一行');
+    // 而且我**第一版修正本身也是错的**（写成「只有当本会话还有别的任务在跑时」）。
+    // 同一条会话里后来起的第三次调用打出 (Background: j-lhvnbs exited 0, j-djf7lx exited 0.)
+    // —— 那两个任务**都已经结束了**。ops 自己的 jobs.js:21-29 也是按「本会话拥有过的 job」筛
+    // （ENTRY 正则同时认 running / exited / killed / interrupted），不是只认在跑的。
+    // 所以判据锁这两句：出现条件 = 本会话此前有过别的任务（在跑或已结束都算），且首个任务没有这行。
+    assert.ok(adapterSrc.includes('此前有过别的任务') && adapterSrc.includes('在跑的或已结束的都算') && adapterSrc.includes('没有这一行'),
+      'ops 指引段对 (Background:) 行的判据必须是「本会话此前有过别的任务（在跑或已结束都算）」+「首个任务没有这一行」；「只在还有任务在跑时出现」是我犯过的第二个错');
+    assert.ok(!adapterSrc.includes('还有别的任务在跑'),
+      'ops 指引段又回到「只有当本会话还有别的任务在跑」这个错的中间版（实测已结束的任务同样进 Background 行）');
     assert.ok(adapterSrc.includes('只有 run_code') && adapterSrc.includes('别因为直调被拒就判定通路不通'),
       'ops 指引段缺少「纯 PTC 档直调被拒是正常的」这条自查（两名队员共用同一段，必须档无关）');
     // 这段必须对所有队员逐字节相同（共享前缀纪律）：不得含角色名/队员身份插值。    // 队员指引段必须与具体队员无关（共享前缀纪律）：文本里不得出现角色/名字插值。

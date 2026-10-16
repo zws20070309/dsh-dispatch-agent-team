@@ -141,11 +141,21 @@ scout-qa 若 2.1 直调成功 = 原生工具可直调；researcher-qa 若 3.2 �
 测试本身全部符合预期（Lead 还自己写脚本回日志算了 sha）。
 真正有价值的是它顺带暴露的四件事，**都已修**（本条之后）：
 
-1. **P1 假文案**：指引段说 `ops_run_background` 返回「开头常另起一行 (Background:)，本轮实测 5 次皆有」。
-   scout-qa 照抄原文时如实报了**没有这一行**。我做对照实验：单任务 →
-   `(Complete: job j-xxxxxx started; …)` 一行；同会话再起第二个（前一个还在跑）才出现
-   `(Background: j-xxxxxx running 0s.)\n(Complete: …)`。所以那句是**无条件断言，错了**；
-   「5 次皆有」是我从别的轮次搬来的观测，搬来时没在本轮复核。
+1. **P1 假文案，而且我连着错了两次**（全过程照实记录）：
+   - 原文案说 ops_run_background 返回「开头常另起一行 (Background:)，本轮实测 5 次皆有」。
+     scout-qa 照抄原文时如实报了**没有这一行** —— 它那一轮 2.3 只起过一个任务，返回是
+     `(Complete: job j-b5wgha started; log at …)`。「5 次皆有」是我从**别的轮次**搬来的观测，
+     搬来时没在本轮复核：这是第一个错。
+   - 我做对照实验（只起一个 → 无该行；再起第二个、前一个还在跑 → `(Background: j-lhvnbs
+     running 0s.)`），得出「只有当本会话还有别的任务**在跑**时才有」。这是第二个错 ——
+     同一条会话里我后来第三次调用打出
+     `(Background: j-lhvnbs exited 0, j-djf7lx exited 0.)`，那两个任务**都已经结束了**；
+     ops 自己的实现（装机 dsh-ops lib/jobs.js:3 与 :21-29）也是按「本会话拥有过的 job」筛，
+     ENTRY 正则同时认 running / exited / killed / interrupted，不是只认在跑的。
+   - 最终判据（已进文案与闸门）：**本会话此前有过别的任务**（在跑或已结束都算）时返回开头多一行
+     `(Background: …)` 列出那些 job；本会话这是**第一个**任务时没有这一行。两种形状都
+     以 `job <id> started` 里的 id 为准。闸门有两条负对照（M28 咬旧错、M29 咬我的中间版错）。
+
 2. **P1 list_agents 报错误数据**：两名队员的行都写 `model: qfmodel`（= Lead 的模型），
    而它们的 `request/header.header.config` 与 `request/context` 全是 `workbuddy/step-5-preview`。
    根因是官方 `listMembers` 取 `live?.options.model ?? root.options.model`
