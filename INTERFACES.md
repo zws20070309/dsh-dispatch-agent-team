@@ -653,12 +653,19 @@ false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提�
 **代价**：指引段约 700 字，与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
 `ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
 
-**验证**：`integration-test` §7.11（9 条）用真台架产出 native/ptc/both 三份**真实装配**，再把
+**验证**：`integration-test` §7.11（12 条）用真台架产出 native/ptc/both 三份**真实装配**，再把
 **装机那份文件里的 `ptcPresentation` 源码原文**抠出来执行逐档核对（不是测试里重写的等价物），
 含两条负对照：只有 run_code 而无任何 PTC 段必须判 `native`；四行全 disabled 时 `mounted` 必须为空
 且不许注册指引段。9/9 变异验证（M1..M9）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
 队员分叉、名单混入 `ops_run`、摘掉 `installMember` 的链接调用、复活自带 ops-file 行、把 ptc 行改回
-disabled、把真门函数的 both 判成 native、抹掉补丁形状 —— 每一条都让对应闸门变红。
+disabled、把真门函数的 both 判成 native、抹掉补丁形状、摘掉迁移标记、把 fallback 改成 false、
+给 ptc 行误加标记、把真 updatedConfig 改成恒等函数 —— 每一条都让对应闸门变红（M12/M14 还
+专门验证「闸门在故障消失时也会红」，即不许静默假绿）。
+
+本机离线端到端验收（不需要重启 DSH）：`node .probe/ops-live-mount.mjs` —— 两个**互相独立**的
+真 Context，A 挂装机（已放宽）的 file+PTC 组件、B 挂补丁前备份的原版 PTC 组件，各自造一名
+both 队员：A 的 `ops_batch/ops_result` 可见且进 wire，B 两个都拿不到 ⇒ 补丁是承重环节。
+（`.probe/` 不入库：这条是本地验收工具，长期保护在 §7.11 与 drift-check 10f/10g。）
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
 九个工具的**蓝本是官方 0.1.7 源码**（照抄，不要自创）：

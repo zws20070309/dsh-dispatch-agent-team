@@ -1592,6 +1592,65 @@ async function main() {
       return true;
     });
 
+    // ptcGateState()：PTC 注册门的状态探测（别人装了原版 ops 时，检测要能点名 + 给修法）。
+    const gateFixture = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-gate-'));
+    tempDirs.push(gateFixture);
+    realFs.mkdirSync(path.join(gateFixture, 'lib', 'ptc'), { recursive: true });
+    realFs.writeFileSync(path.join(gateFixture, 'package.json'), '{"name":"dsh-ops","version":"0.0.0-fixture"}', 'utf8');
+    const gateFile = path.join(gateFixture, 'lib', 'ptc', 'index.js');
+    realFs.writeFileSync(gateFile, 'export function ptcPresentation(assembly) { return "both"; }\n', 'utf8');
+    const patchedSeen = adapter.ptcGateState(path.join(gateFixture, 'package.json'));
+    realFs.writeFileSync(gateFile, 'async function ptcOnly(ctx, agent) { return false }\n', 'utf8');
+    const pristineSeen = adapter.ptcGateState(path.join(gateFixture, 'package.json'));
+    const absentSeen = adapter.ptcGateState(path.join(gateFixture, 'nope', 'package.json'));
+    // 真机交付态：装机那份必须是 patched（否则本机队员拿不到批量工具）。
+    const realGate = opsGateFile === null ? 'absent' : adapter.ptcGateState(path.join(path.dirname(path.dirname(path.dirname(opsGateFile))), 'package.json'));
+
+    check('ptcGateState 三态判对（patched / pristine / absent），且本机装机态 = patched', () => {
+      if (patchedSeen !== 'patched') return '带 ptcPresentation 的文件被判成 ' + patchedSeen;
+      if (pristineSeen !== 'pristine') return '原版形状被判成 ' + pristineSeen + '（负对照不成立 = 这条闸门是空转的）';
+      if (absentSeen !== 'absent') return '文件不存在却判成 ' + absentSeen;
+      if (opsGateFile !== null && realGate !== 'patched') {
+        return '本机装机的 dsh-ops 门状态是 ' + realGate + '：both 队员拿不到 ops_batch/ops_result。'
+          + '修法：node tools/ops-ptc-both.cjs 后重启 DSH。';
+      }
+      return true;
+    });
+
+    // pristine 门的**真**路径：造一份带 lib/ptc/index.js 的假 profile，两种形状各测一次。
+    // （第一版只在没有 ptc/index.js 的夹具上测，实际走的是 absent 分支 —— 假绿灯。）
+    const gateProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-gateprofile-'));
+    tempDirs.push(gateProfile);
+    const gatePkgDir = path.join(gateProfile, 'node_modules', 'dsh-ops');
+    realFs.mkdirSync(path.join(gatePkgDir, 'lib', 'ptc'), { recursive: true });
+    // resolveOpsPackage 的入口条件是「profile 目录自己有 package.json」（它拿这个建 require 基准），
+    // 漏了这一行 pkg 就是 null、summary 是 undefined —— 上一版就是这么真失败的。
+    realFs.writeFileSync(path.join(gateProfile, 'package.json'), '{"name":"fake-gate-profile"}', 'utf8');
+    realFs.writeFileSync(path.join(gatePkgDir, 'package.json'), '{"name":"dsh-ops","version":"0.0.0-gate"}', 'utf8');
+    const realProfileDir2 = process.env.DSH_PROFILE_DIR;
+    process.env.DSH_PROFILE_DIR = gateProfile;
+    // rowsPtcOn = 四行全挂（催补丁的前提）；rowsAll = ptc 行 disabled（用户主动关，不该催）。
+    const rowsPtcOn = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: false }));
+    const summaryWith = (ptcSource, rows) => {
+      realFs.writeFileSync(path.join(gatePkgDir, 'lib', 'ptc', 'index.js'), ptcSource, 'utf8');
+      return String(adapter.detectOpsComponents(fakeCtxWith(rows, ['ops_grep']), { id: 'gate' }).summary);
+    };
+    const pristineSummary = summaryWith('async function ptcOnly(ctx, agent) {\n  return false\n}\n', rowsPtcOn);
+    const pristineButOff = summaryWith('async function ptcOnly(ctx, agent) {\n  return false\n}\n', rowsAll);
+    const patchedSummary = summaryWith('function ptcPresentation(assembly) {\n  return "both"\n}\n', rowsPtcOn);
+    if (realProfileDir2 === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = realProfileDir2;
+
+    check('原版门时 summary 点名 ops_batch 缺席并给出可执行修法；已放宽时不给多余指引', () => {
+      if (pristineSummary.indexOf('ops-ptc-both') < 0) return 'pristine 的 summary 没给修法：' + pristineSummary;
+      if (pristineSummary.indexOf('ops_batch') < 0) return 'pristine 的 summary 没点名缺什么：' + pristineSummary;
+      if (patchedSummary.indexOf('ops-ptc-both') >= 0) return '已放宽却仍提示要打补丁：' + patchedSummary;
+      // PTC 组件被关掉时不许催打补丁（那扇门根本不在用）。
+      if (pristineButOff.indexOf('undefined') === 0) return 'PTC 关着时 summary 整个没了：' + pristineButOff;
+      if (pristineButOff.indexOf('ops-ptc-both') >= 0) return 'PTC 组件没挂载却催用户打补丁：' + pristineButOff;
+      if (patchedSummary.indexOf('9.9.9-test') < 0 && patchedSummary.indexOf('0.0.0-gate') < 0) return 'patched 的 summary 丢了版本：' + patchedSummary;
+      return true;
+    });
+
     check('ops-enable.plan()：翻转 true→false、补齐缺行、二次幂等，且绝不碰别的行', () => {
       if (pass1.flipped.join(',') !== 'dsh-ops-shell') return '第一遍该翻转 shell，实得 ' + JSON.stringify(pass1.flipped);
       if (pass1.appended.join(',') !== 'dsh-ops-file,dsh-ops-background,dsh-ops-ptc') return '该补三行，实得 ' + JSON.stringify(pass1.appended);
