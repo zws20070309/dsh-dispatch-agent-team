@@ -105,7 +105,7 @@ export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减�
 export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）。**不许含 'skill'**：见 §3.5
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
 export const TEAMMATE_PRESET_IDS;         // 2026-10-15：可指派给队员的 agent preset id 白名单（用户定案：只放 ptc / standard / minimal-grayscale）。
-                                          //    存 id 不存显示名（注册表只回 id，名字是官方客户端本地化的）；配置里空 = 跟随 Lead。详见 §6 末「队员预设」。
+                                          //    存 id 不存显示名（注册表只回 id，名字是官方客户端本地化的）；配置里空 = 跟随 Lead。契约见 §3.6，页面那一列的渲染见 §6:1060「队员 agent 预设这一列」。
 // 2026-10-16 新增（缓存前缀断裂修复，见 §3.6 末「persona 钉住」）：
 export const MEMBER_PERSONA_SECTION;      // 'deployment:persona-prefix' —— 官方 persona 槽位名（本包不 import 宿主包，故在这里存字面量）
 export const MEMBER_PERSONA_ORDER;        // 0 = 官方 DEPLOYMENT_PERSONA_PREFIX 的排序值；drift-check 钉住官方那张表
@@ -305,7 +305,7 @@ export async function teamGraph(ctx, sessionId);      // 工作区画布数据�
                                             //    （只有宿主读得到 listTasks），**句子在浏览器拼**（2026-10-14 i18n）：
                                             //    服务端拼中文等于把界面语言焊死在宿主半，而知道 active 的只有浏览器。
                                             //    同一理由用在折叠工具组（只发 `count`）与回合结局（只发
-                                            //    `reason/message/code`）。判据见 §6「服务端发事实」那条。
+                                            //    `reason/message/code`）。判据见 §6:1023「服务端发事实，浏览器拼句子」那条。
                                             //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
                                             //    返回另带两个**结构化**字段（2026-10-14/15 加的）：
                                             //    `historyRecovered` —— 成员名单是否来自历史恢复。浏览器半原来靠
@@ -991,7 +991,7 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
   `view === 'summary'` 分支是防御性的：官方只在 `plugins.bundle.config` 槽位上以 `{ view: 'page' }` 渲染本组件。
   bundle 详情页的**基本信息（图标/标题/版本/包名/描述）由页面白送**（plugin-manager README + `:1908-1947`），
   你只做：角色列表 + 模型/强度选择 + 保存/放弃 + 状态提示。
-- 数据与写入**全部走我们自己的 host 路由**（先例：**第三方插件** `@xxxyz/dsh-mcp-manager` v2.2.7 的 `apiCall()`，本机路径 `~/.dsh/profiles/web/node_modules/@xxxyz/dsh-mcp-manager/lib/client.js:91-101` —— 它不是官方包、也不在 `app.asar` 里，但**本机确实装着、行号可逐字复核**；官方侧对应的只有 `@deepseek-ai/dsh-mcp-client` 与 `dsh-mcp-resources`）：
+- 数据与写入**全部走我们自己的 host 路由**（先例：**第三方插件** `@xxxyz/dsh-mcp-manager` v2.2.7 的 `apiCall()`，本机路径 `~/.dsh/profiles/web/node_modules/@xxxyz/dsh-mcp-manager/lib/client.js:91-101` —— 它不是官方包、也不在 `app.asar` 里，但**本机确实装着、行号可逐字复核**；官方侧对应的只有 `@deepseek-ai/dsh-mcp-client` 与 `dsh-mcp-resources`。**别人机器上不一定有这个包**，所以这条只作写法先例，不当作可移植的依据）：
   - `POST /zws-dispatch-agent-team/api`，header 必须带 `content-type: application/json`
     与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照上面那个第三方插件的 `:92-95`）。
   - ops（注意：现行实现比这里多 `revision` / `diagnostics`，见 §0.1 第 18 条）：
