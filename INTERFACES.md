@@ -590,6 +590,64 @@ select() 是先 await recompose() 再落事件（registry :760-761），所以�
 批量档默认开时**恰好掩盖**它：第一发就是 both（自己那层、同步声明），所以看不到「旧档」的现象。
 根因未钉死前不许说已修。
 
+### 3.8 ops 原生链接（dsh-ops 插件，2026-10-15 用户改版：不再内嵌）
+
+**结论先说**：本包**不含**任何 ops 代码。四个组件（shell / file / background / PTC 增强）全部由
+独立插件 `dsh-ops` 自己挂载；本包只做两件事 —— ① 检测它在不在、哪几个组件活着（写进状态文件），
+② 队员安装时注册一段**逐字节相同**的 ops 使用指引。没装 ops 的用户：① 静默、② 一个字节都不加。
+
+历史：2026-10-11 曾 vendor 过 file 组件（`vendor/ops/` + 第 4 组件 `ops-file` 行 +
+`lib/ops-coexist.js` 防重复注册自愈）。2026-10-15 用户明确要求改为两插件各自安装各自启用，
+那三样**已全部删除**（`tools/drift-check.cjs` 10f 盯着它们不许复活）。
+
+**ops_* 工具面**（逐名读自装机 dsh-ops 0.3.0，非文档转述）：
+
+| 组件 | 注册的工具 | 注册在哪一层 | 权限门 |
+|---|---|---|---|
+| file | `ops_inspect_local_file` / `ops_grep` / `ops_glob` / `ops_replace` | 全局层（dsh-ops `lib/file/runtime.js:21-23`、`lib/tools.js:621`） | 无 |
+| shell | `ops_bash`（每授权 agent）+ 把宿主 pwsh-sandbox 指向随包 PS7 | agent 子 fiber（dsh-ops `lib/session-shells.js:72`） | danger-full-access 或可 confine |
+| background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` | agent 子 fiber（dsh-ops `lib/tools.js:358-366`） | **bash 可解析** + 会话 danger-full-access（dsh-ops `lib/tools.js:311-316`） |
+| PTC 增强 | `ops_batch` / `ops_result` | agent 子 fiber（dsh-ops `lib/ptc/index.js:64`，补丁后实测行号） | 该作用域呈现档 ∈ {ptc, both}（见下） |
+
+`ops_run` 在 0.3.0 **任何组合都不发布**（`docs/manual-validation.md:17` 原话），所以 `OPS_TOOL_NAMES`
+是 11 个而不是 12 个 —— 这条被 integration §7.11 钉住。四组件同时开**不会**重复注册：
+shell 行拿到的 `runtime = undefined`（dsh-ops `lib/index.js:115`），只有 background 构造 FastCtxTools，
+两行的工具集不交（dsh-ops `lib/index.js:79` 决定谁注册什么）。
+
+**PTC 增强组件的适配（本次任务的核心）**：原版（补丁前备份实测的行号）dsh-ops `lib/ptc/index.js:16-22` 的 `ptcOnly()` 只认
+**纯 ptc**（装配工具恰好 1 个 run_code + `tools:ptc-only` 段非空）。而 §3.7 的批量档让队员是
+**both**（全部工具 + run_code），原版门把 `ops_batch`/`ops_result` 挡在每一个队员之外 ——
+「PTC 加强组件要适配到所有队员」的落点就在这。适配 = 把门放宽成三态
+（`native` / `ptc` / `both`），判据仍然**只用公开装配事实**：`run_code` 在不在 `assemble().tools` 里、
+`tools:ptc-only` 与 `tools:sdk` 两段是否非空（官方语义：both 下 PTC_ONLY 渲染为空、SDK 必注册，
+见 §3.7 的 :2725 / :2745-2757），**不碰** `modeFor`/`layers` 私有面（ops 自己的文件头注释也这么要求）。
+
+落地方式：`tools/ops-ptc-both.cjs`（幂等、带 `.bak`、`--check`/`--revert`、形状不符就拒绝盲改）。
+本机已施加到 `profiles/desktop/node_modules/dsh-ops/lib/ptc/index.js`，**重启 DSH 后生效**。
+没打补丁的原版 ops **不坏**：both 队员只是拿不到那两个批量工具，其余 ops_* 照常；把该角色预设选成
+ptc 则原版也能拿到。ops 升级冲掉补丁 → `drift-check` 10g 变红并给出重跑命令。
+
+**profile 层的启用（本机交付）**：`profiles/desktop/package.json` 的 bundles 里加了 `dsh-ops`；
+`profiles/desktop/cordis.patch.yml` 用四行 `disabled: false` 覆盖它自带的关闭（`dsh-app-boot`
+`applyEntryPatches:104-107` 逐键赋值，profile 层在所有 bundle 层之后 → 唯一与启用顺序无关的落点）。
+两个刻意的配置决定：
+* `dsh-ops-shell` 的 `publishBashTool: false` —— 一开 `ops_bash`，ops 的 shell 段就会写
+  "Prefer bash for command execution … do not switch shells"（dsh-ops 0.3.0 实测 `lib/policy.js:61`），与调度模式
+  preset 给每个 agent 装的 persistent-pwsh（`presets/dispatch-mode.patch.yml:114-126`）直接矛盾。
+  这一行只取它的「随包 PS7 指向」能力。
+* `dsh-ops-background` 的 `allowSystemShellFallback: true` —— 它的发布门要求 bash 可解析
+  （dsh-ops `lib/tools.js:312`），而本机 `@dsh-ops/bash-win32-x64` 没装（实测 `resolveShells` 返回
+  `available: false`），不加这一条那四个 job 工具一个都不出现。
+
+**代价**：指引段约 700 字，与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
+`ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
+
+**验证**：`integration-test` §7.11（9 条）用真台架产出 native/ptc/both 三份**真实装配**，再把
+**装机那份文件里的 `ptcPresentation` 源码原文**抠出来执行逐档核对（不是测试里重写的等价物），
+含两条负对照：只有 run_code 而无任何 PTC 段必须判 `native`；四行全 disabled 时 `mounted` 必须为空
+且不许注册指引段。9/9 变异验证（M1..M9）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
+队员分叉、名单混入 `ops_run`、摘掉 `installMember` 的链接调用、复活自带 ops-file 行、把 ptc 行改回
+disabled、把真门函数的 both 判成 native、抹掉补丁形状 —— 每一条都让对应闸门变红。
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
 九个工具的**蓝本是官方 0.1.7 源码**（照抄，不要自创）：
