@@ -2429,6 +2429,7 @@ function functionBodyOf(source, needle) {
       assert.ok(listSrc.includes("'tools/ops-enable.cjs'"), listFile + ' 的文件清单必须含 ops-enable.cjs（漏了 = 装到别人机器上没这条修复命令）');
       assert.ok(listSrc.includes("'tools/ops-ptc-both.cjs'"), listFile + ' 的文件清单必须含 ops-ptc-both.cjs（漏了 = PTC 放宽补丁没法施加）');
       assert.ok(!listSrc.includes("'lib/ops-coexist.js'"), listFile + ' 不得再列已删除的 ops-coexist.js');
+      assert.ok(listSrc.includes("'tools/ops-mount-check.mjs'"), listFile + ' 的文件清单必须含 ops-mount-check.mjs（离线验收工具要能随包分发）');
     }
     // ③ PTC 补丁脚本：三态判定 + 拒绝盲改 + 可还原。
     const ptcSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-ptc-both.cjs'), 'utf8');

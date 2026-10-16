@@ -96,6 +96,7 @@ const FILES = [
   'tools/selftest.cjs',
   'tools/ops-ptc-both.cjs',
   'tools/ops-enable.cjs',
+  'tools/ops-mount-check.mjs',
   'tools/integration-test.cjs',
   'tools/client-smoke-test.cjs',
   'tools/emergency-disable.cjs',
