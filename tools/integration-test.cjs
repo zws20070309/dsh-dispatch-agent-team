@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:570），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:604），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -2162,6 +2162,8 @@ async function main() {
     // 截断账本的读口也委托给真 runtime：noteTurnEndReason 是它的写入点，
     // list_agents 通过这里取值（被测的就是生产路径）。
     truncatedMemberIds: () => runtime.truncatedMemberIds(),
+    // model 校正的读口同样委托真 runtime：noteAppliedRoute 是它的写入点（生产路径同一个函数）。
+    appliedMemberRoutes: () => runtime.appliedMemberRoutes(),
   };
   const reportTeams = {
     // 与真域服务同形：队员名只能从 membership 拿（ReactLoopAgent 上没有 name 字段，
@@ -2455,6 +2457,35 @@ async function main() {
     if ((done.diagnostics || []).length !== 0) return '正常收尾后标志没被清掉：' + JSON.stringify(done.diagnostics);
     return true;
   });
+  // 真链路：noteAppliedRoute 就是 installRouteOverride 里覆盖合进请求对象后调的那个写入点
+  // （lib/runtime.js），测试与生产共用同一函数；list_agents 必须据此把队员行的 model 换掉。
+  // 现场（2026-10-16 session-3c654f6e）：官方给的是继承自 Lead 的 options.model，Lead 问「scout-qa
+  // 在用什么模型」拿到 qfmodel，而它每一次真实请求都是 workbuddy/step-5-preview。
+  const rowsBeforeModel = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  runtime.noteAppliedRoute('scout-agent', { provider: 'workbuddy', model: 'step-5-preview', reasoningEffort: 'high' });
+  runtime.noteAppliedRoute('builder-agent', { model: '' });   // 脏值：不该动那一行
+  const rowsWithModel = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  runtime.clearAppliedRoute('scout-agent');
+  const rowsCleared = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  check('list_agents 的队员 model = 它最近一次请求真的用上的那份（不是继承来的 Lead 模型）', () => {
+    const scoutOf = (rows) => rows.find((row) => row.target === 'scout');
+    if (scoutOf(rowsBeforeModel).model !== undefined) return '前提不成立：测试替身本来就有 model';
+    if (scoutOf(rowsWithModel).model !== 'step-5-preview') return JSON.stringify(scoutOf(rowsWithModel));
+    const builder = rowsWithModel.find((row) => row.target === 'builder');
+    if (builder.model !== undefined) return '脏值（空串 model）被当成事实写进来了：' + JSON.stringify(builder);
+    if (scoutOf(rowsCleared).model !== undefined) return '记账作废后还在校正：' + JSON.stringify(scoutOf(rowsCleared));
+    const lead = rowsWithModel.find((row) => row.target === 'lead');
+    if (lead.model !== undefined) return 'Lead 行不许被校正（它没有覆盖）：' + JSON.stringify(lead);
+    // 关键：校正后的行必须仍然过**官方返回值校验器**。生产路径上 dsh-tools 的
+    // createSuccessResult 会 validateJsonSchemaValue(tool.output.schema, value)
+    // （@deepseek-ai/dsh-tools/lib/index.js:3541-3544），不合就抛 ToolOutputError ——
+    // 「execute 返回值对了」不等于「模型真能拿到」。model 是 MEMBER_VIEW_SCHEMA 里的
+    // 可选字段（lib/tools.js:235），所以写它不新增字段、不动 Lead 的工具目录。
+    const violations = dshTools.validateJsonSchemaValue(listTool.output.schema, rowsWithModel, 'value');
+    if (violations.length > 0) return '校正后的行过不了官方 schema：' + JSON.stringify(violations).slice(0, 200);
+    return true;
+  });
+
   // ── 工具返回值的**形状**校验（官方同一个校验器）────────────────────────────────────
   // 为什么单列一段：上面所有断言都是直调 definition.execute(...)，而**生产路径**上
   // dsh-tools 的 createSuccessResult 会先 validateJsonSchemaValue(tool.output.schema, value)

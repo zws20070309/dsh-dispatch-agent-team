@@ -128,6 +128,9 @@ export const BOARD_CLOSURE_ID_LIMIT;      // 6：提示里最多点名的条目�
 export function boardClosureNote(tasks, idLimit?);  // -> 一句提示 | undefined（全闭环或读不到）；纯函数
 export function annotateBoardClosure(rows, note);
                                     // -> 新数组；只把 note 追加到 role==='lead' 那一行的 diagnostics，不改入参
+export function annotateMemberModels(rows, routesByAgentId);
+                                    // -> 新数组；把队员行的 model 换成该队员最近一次请求**真的用上**的那份；
+                                    //    官方那份是继承自 Lead 的 options.model；记不到就不动那一行
 export function askLeadMessage(question, blocking);  // -> 投递给 lead 的正文（含固定前缀）
 export function deriveRole(name);   // 'verify-2' / 'verify-deep' -> 'verify'（最长角色前缀）；
                                     // 形状不是官方队员名 -> undefined（'scout-' / 'Scout' / 'lead'）
@@ -275,6 +278,9 @@ export function markReportDelivered(entry, delivered);
                                             //   「页面显示已交报告、Lead 从未收到」（2026-10-05 审查 §1-⑤）
 export function truncatedMemberIds();      // -> Set<agentId>；上一轮撞输出上限且未交付的队员（list_agents 标注用）
 export function retriedMemberIds();         // -> Map<agentId, 摘要>；最近一次 llm/retry 的记录（list_agents 标注用）
+export function appliedMemberRoutes();      // -> Map<agentId, {provider?, model?, reasoningEffort?}>；该队员
+                                            //    最近一次请求**实际写进请求对象**的路由（list_agents 校正 model 用；
+                                            //    覆盖失败退回原配置时不记 = 宁缺毋滥）
 export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点（监听器与测试共用）
 export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
@@ -467,7 +473,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:570`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:604`）。
    注意 `lib/tools.js:671-675` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
