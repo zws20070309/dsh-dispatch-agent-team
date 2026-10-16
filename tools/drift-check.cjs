@@ -527,12 +527,17 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   }
   const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
   if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
-  const profileText = fs.readFileSync(profilePatchPath, 'utf8');
-  for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
-    const at = profileText.search(new RegExp('^-\\s*id:\\s*' + id + '\\s*$', 'm'));
-    if (at < 0) return `profile 的 cordis.patch.yml 没有 - id: ${id} 行：交付要求四个组件全开，这一行没人钉住（依赖 dsh-ops 自己的默认值，background/ptc 默认是关的）`;
-    const tail = profileText.slice(at).split(/\n-\s*(?:id|insert):/)[0];
-    if (!/^\s*disabled:\s*false\s*$/m.test(tail)) return `profile 层的 ${id} 行没有 disabled: false：组件不会挂载（交付要求四组件全开）`;
+  // 判据复用 tools/ops-enable.cjs 的 plan()（同一份真值，不在这里重写一遍正则 ——
+  // 两处各写一份就会各自漂，那是本仓库反复栽过的坑）。plan 报"要翻转/要补行"= 不健康。
+  const { plan } = require('./ops-enable.cjs');
+  const planResult = plan(fs.readFileSync(profilePatchPath, 'utf8'));
+  if (planResult.flipped.length > 0) {
+    return 'profile 层这些行仍是 disabled: true：' + planResult.flipped.join(', ')
+      + ' —— 组件不会挂载（交付要求四组件全开）。修法：node tools/ops-enable.cjs 然后重启 DSH。';
+  }
+  if (planResult.appended.length > 0) {
+    return 'profile 层缺这些行：' + planResult.appended.join(', ')
+      + ' —— 会退回 dsh-ops 自带默认（background/ptc 是关的）。修法：node tools/ops-enable.cjs 然后重启 DSH。';
   }
   // 本包不得再依赖 vendor：目录与 exports 子路径都必须不存在。
   if (fs.existsSync(path.join(PLUGIN_DIR, 'vendor'))) return 'vendor/ 目录又出现了：内嵌 ops 已按用户要求删除';

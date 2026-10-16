@@ -1539,6 +1539,44 @@ async function main() {
       return true;
     });
 
+    // ops-enable.cjs 的 plan()：四组件启用的唯一真值（drift-check 复用它）。
+    const { plan: planEnable } = require('./ops-enable.cjs');
+    const sampleProfile = '- id: agent-team\n  config:\n    maxMembers: 48\n\n'
+      + '- id: dsh-ops-shell\n  disabled: true\n\n- id: llm-deepseek\n  name: x\n';
+    const pass1 = planEnable(sampleProfile);
+    const pass2 = planEnable(pass1.text);
+    const passEmpty = planEnable('- id: agent-team\n  config:\n    a: 1\n');
+    check('ops-enable.plan()：翻转 true→false、补齐缺行、二次幂等，且绝不碰别的行', () => {
+      if (pass1.flipped.join(',') !== 'dsh-ops-shell') return '第一遍该翻转 shell，实得 ' + JSON.stringify(pass1.flipped);
+      if (pass1.appended.join(',') !== 'dsh-ops-file,dsh-ops-background,dsh-ops-ptc') return '该补三行，实得 ' + JSON.stringify(pass1.appended);
+      if (!/- id: dsh-ops-shell\n  disabled: false/.test(pass1.text)) return '翻转后 shell 行没变成 disabled: false';
+      if (pass1.flipped.length + pass1.appended.length !== 4) return '四组件没全被处理：' + JSON.stringify([pass1.flipped, pass1.appended]);
+      if (pass2.flipped.length !== 0 || pass2.appended.length !== 0) return '第二遍仍有动作 = 不幂等（重启循环的隐患）';
+      if (pass1.text.indexOf('maxMembers: 48') < 0 || pass1.text.indexOf('name: x') < 0) return '改写了别人的行（agent-team / llm-deepseek 必须原样）';
+      if (passEmpty.appended.length !== 4) return '空 profile 应补四行，实得 ' + passEmpty.appended.length;
+      if (!/- id: dsh-ops-ptc\n  disabled: false\n  config:\n    required: false\n$/.test(passEmpty.text)) return '追加块结尾不是 ptc 行（顺序或缩进漂了）';
+      return true;
+    });
+
+    check('ops-enable.plan() 对**真** profile 的判断与 drift-check 一致（本机交付态）', () => {
+      const realFs2 = require('node:fs');
+      const candidates = [process.env.DSH_PROFILE_DIR,
+        path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop')].filter(Boolean);
+      let file = null;
+      for (const dir of candidates) {
+        const candidate = path.join(dir, 'cordis.patch.yml');
+        if (realFs2.existsSync(candidate)) { file = candidate; break; }
+      }
+      if (file === null) return true; // 没有 profile：本机不是交付环境，跳过不算失败
+      const result = planEnable(realFs2.readFileSync(file, 'utf8'));
+      if (result.flipped.length + result.appended.length !== 0) {
+        return '本机 profile 的四组件启用态不干净（翻转 ' + result.flipped.join(',') + ' / 缺 ' + result.appended.join(',')
+          + '）：node tools/ops-enable.cjs 后重启 DSH。文件：' + file;
+      }
+      if (result.kept.length !== 4) return '四行没全部识别为已启用：' + JSON.stringify(result.kept);
+      return true;
+    });
+
     check('负对照：四行全 disabled 时 mounted 为空且 summary 指向插件页（不误报可用）', () => {
       const allOff = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: true }));
       const probe = probeAllOff;

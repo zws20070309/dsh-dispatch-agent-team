@@ -2397,11 +2397,20 @@ function functionBodyOf(source, needle) {
     assert.ok(indexSrc.includes("from './ops-adapter.js'"), 'lib/index.js 必须 import ops-adapter');
     assert.ok(indexSrc.includes('detectOpsComponents(ctx)'), 'lib/index.js 启动期必须做 ops 组件检测');
     assert.ok(!indexSrc.includes('healOpsCoexist'), 'lib/index.js 不得再调用 healOpsCoexist（旧共存自愈）');
-    assert.ok(indexSrc.includes('status.opsIntegration = detectOpsIntegration(ctx)'), 'writeStatusFile 必须落盘 opsIntegration');
+    assert.ok(indexSrc.includes('status.opsIntegration = detectOpsComponents(ctx)'), 'writeStatusFile 必须落盘 opsIntegration（状态文件是唯一真值来源）');
     const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
     assert.ok(runtimeSrc.includes('linkOpsForMember(ctx, scoped, agent, notes, disposers)'),
       'installMember 必须给每名队员接 ops 链接（Lead 不接：那是用户主会话，ops 自己全局可见）');
 
+    // ②b profile 启用工具：四行钉 disabled:false，且 drift-check 复用它的 plan()（单一真值）。
+    const enableSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-enable.cjs'), 'utf8');
+    assert.ok(enableSrc.includes('module.exports = { plan, splitRows'), 'ops-enable.cjs 必须导出 plan/splitRows（drift-check 要复用同一份判据）');
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
+      assert.ok(enableSrc.includes("id: '" + id + "'"), 'ops-enable 的 ROWS 必须覆盖 ' + id);
+    }
+    assert.ok(enableSrc.includes('--revert') && enableSrc.includes('pre-ops-enable'), 'ops-enable 必须可还原且写前备份');
+    const driftSrc = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
+    assert.ok(driftSrc.includes("require('./ops-enable.cjs')"), 'drift-check 必须复用 ops-enable 的 plan()（两处各写一份正则就会各自漂）');
     // ③ PTC 补丁脚本：三态判定 + 拒绝盲改 + 可还原。
     const ptcSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-ptc-both.cjs'), 'utf8');
     assert.ok(ptcSrc.includes("function ptcPresentation(assembly)"), 'ops-ptc-both 必须有三态判定 ptcPresentation');
