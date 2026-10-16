@@ -607,7 +607,7 @@ select() 是先 await recompose() 再落事件（registry :760-761），所以�
 | file | `ops_inspect_local_file` / `ops_grep` / `ops_glob` / `ops_replace` | 全局层（dsh-ops `lib/file/runtime.js:21-23`、`lib/tools.js:621`） | 无 |
 | shell | `ops_bash`（每授权 agent）+ 把宿主 pwsh-sandbox 指向随包 PS7 | agent 子 fiber（dsh-ops `lib/session-shells.js:72`） | danger-full-access 或可 confine |
 | background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` | agent 子 fiber（dsh-ops `lib/tools.js:358-366`） | **bash 可解析** + 会话 danger-full-access（dsh-ops `lib/tools.js:311-316`） |
-| PTC 增强 | `ops_batch` / `ops_result` | agent 子 fiber（dsh-ops `lib/ptc/index.js:64`，补丁后实测行号） | 该作用域呈现档 ∈ {ptc, both}（见下） |
+| PTC 增强 | `ops_batch` / `ops_result` | agent 子 fiber（dsh-ops `lib/ptc/index.js:52` 注册，装机 0.3.0 实读） | **仅纯 PTC 档**（`lib/ptc/index.js:20` 要求组合恰好只有一个 run_code），见下 |
 
 `ops_run` 在 0.3.0 **任何组合都不发布**（`docs/manual-validation.md:17` 原话），所以 `OPS_TOOL_NAMES`
 是 11 个而不是 12 个 —— 这条被 integration §7.11 钉住。四组件同时开**不会**重复注册：
@@ -686,16 +686,21 @@ false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提�
 并走真安装路径证明 `batch:false` 的角色不被本包覆盖成批量档（对照：开着批量档就被覆盖成 both）；
 检测层的 `missingPtcTools` 有三条负对照（拿得到时不催、PTC 关掉时不催、非纯 PTC 档看不到时不催 ——
 最后一条就是防 Lead/both 被误报的那道）。含另两条负对照：
-四行全 disabled 时 `mounted` 必须为空且不许注册指引段。9/9 变异验证（M1..M9）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
+四行全 disabled 时 `mounted` 必须为空且不许注册指引段。变异验证 M1..M17 + M13b + M19（变异驱动
+`.probe-tmp/mut-ops*.cjs`，跑完各自从干净副本还原）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
 队员分叉、名单混入 `ops_run`、摘掉 `installMember` 的链接调用、复活自带 ops-file 行、把 ptc 行改回
-disabled、把真 updatedConfig 改成恒等函数（模拟上游修掉陷阱）、摘掉迁移标记、把 fallback 改成 false、
-给 ptc 行误加标记、把真 updatedConfig 改成恒等函数 —— 每一条都让对应闸门变红（M12/M14 还
-专门验证「闸门在故障消失时也会红」，即不许静默假绿）。
+disabled、摘掉迁移标记、把 fallback 改成 false、给 ptc 行误加标记、只摘 ops-enable 里 background 行的标记
+（M13b）、把真 updatedConfig 改成恒等函数（模拟上游修掉陷阱 —— M12/M14 专门验证「闸门在故障消失时
+也会红」，即不许静默假绿）、去掉「PTC 挂着才催」条件（M15）、清单漏 ops-mount-check（M16）、把
+ops-enable --check 退化成只看两个键（M17，就是那次假绿灯的成因）、把 profileDirs 的退回链丢掉 .dsh
+段（M19 = 复现 2026-10-16 的真机 P1，selftest 那条新闸门当场红，实测输出见提交 f217184）。
 
-本机离线端到端验收（不需要重启 DSH）：`node tools/ops-mount-check.mjs` —— 两个**互相独立**的
-真 Context，A 挂**原版未改**的 file+PTC 组件（纯 PTC 档队员拿到 `ops_batch/ops_result`、批量档队员没有），
+本机离线端到端验收（不需要重启 DSH）：`node tools/ops-mount-check.mjs` —— 四个**互相独立**的
+真 Context（共用一个 root 会互相抢注，第一版就是这么把负对照搞失效的）。A 挂**原版未改**的 file+PTC 组件
+（纯 PTC 档队员的**可见层**拿到 `ops_batch/ops_result`、批量档队员没有），
 B 同一份组件只差呈现档做负对照（ptc 拿到 / both 拿不到 ⇒ 因果在本包能配的那一项上），
-C 真起 FastCtx 服务器验证四个 job 工具确实发布。
+C 真起 FastCtx 服务器验证四个 job 工具确实发布，并**真调一次** `ops_run_background`（发布 ≠ 可用），
+D shell 组件：`ops_bash` 已发布，且 ops 原文「Prefer bash…」与本包的 OVERRIDE 同时进段。
 （这条工具入库：别人装完也能跑；长期保护仍在 §7.11 与 drift-check 10f/10g。）
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 

@@ -26,7 +26,7 @@
 | DSH 桌面端 | 0.2.0-rc.2 或更新（更早的版本请先跑 `node tools/drift-check.cjs` 看兼容性） |
 | Node.js | ≥ 18 |
 | 官方 bundle | 需在插件页启用 `@deepseek-ai/dsh-experimental-agent-team-profile`（本插件复用它不可替代的持久化域服务；工具面与界面由本插件接管） |
-| 可选：dsh-ops | 装了并启用后，Lead 与每个队员自动获得它的 Rust 工具（见下文「ops 工具」）。**不装也完全能用**，本插件不依赖它 |
+| 可选：dsh-ops | 装了并启用后，Lead 与每个队员自动获得它的**文件检索四件套**（注册在全局层）；其余工具各有权限门 —— `ops_bash` 与四个 job 工具要会话处于「完全访问」，`ops_batch`/`ops_result` 只给纯 PTC 档队员（见下文「ops 工具」）。**不装也完全能用**，本插件不依赖它 |
 
 ## 安装
 
@@ -200,14 +200,14 @@ both 档的组合是「全部原生工具 + `run_code`」，工具数 >1，被�
 是 ops 的设计；要它们见下面第一条。Lead 那侧本插件**刻意不动** —— 那是你的主会话。
 
 想确认这套链接在你机器上真的通了（**不用重启 DSH**）：`node tools/ops-mount-check.mjs` —— 它挂真 dsh-ops 组件与真宿主注册表跑一遍，
-三段各自独立：A 交付态、B 负对照（同一份原版组件只差呈现档）、C 后台任务真起服务器。
+四段各自独立（各用独立 Context）：A 交付态、B 负对照（同一份原版组件只差呈现档）、C 后台任务真起 FastCtx 服务器并**真调一次** `ops_run_background`、D shell 组件（`ops_bash` 发布 + 口径文字确实进段）。
 
 | dsh-ops 组件 | 队员拿到什么 |
 |---|---|
 | file | `ops_grep` / `ops_glob` / `ops_inspect_local_file` / `ops_replace` —— 检索与批量替换 |
 | background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` —— 长任务托管（需会话处于完全访问） |
 | shell | `ops_bash`（一次性 POSIX 命令）+ 把命令执行器换成随包 PowerShell 7（Windows 上通常比系统自带的好用） |
-| PTC 增强 | `ops_batch` / `ops_result` —— 一次调用完成跨文件的复制/移动/删除（先 plan 再执行），大结果分页引用 |
+| PTC 增强 | `ops_batch` / `ops_result` —— 一次调用完成跨文件的复制/移动/删除（先 plan 再执行），大结果分页引用。**仅纯 PTC 档队员**（预设 `ptc` + 关闭「批量调用」）拿得到；Lead 与批量档队员按 ops 的设计拿不到 |
 
 三点如实说明：
 
@@ -218,7 +218,7 @@ both 档的组合是「全部原生工具 + `run_code`」，工具数 >1，被�
   但**其余 ops 工具照常可用**，不影响任何功能。
 - **没装 dsh-ops 的用户零影响**：不注册任何提示词、不多一个字节，插件页也不会出现 ops 组件。
 - **状态可查**：`~/.dsh/dispatch-agent-team-status.json` 的 `opsIntegration` 字段记录四个组件的挂载事实、
-  当前可见的 ops_* 清单，以及（若 dsh-ops 的门还是原版）一句点名修法。
+  当前可见的 ops_* 清单，以及（仅当某名**纯 PTC 档**队员看不到 `ops_batch`/`ops_result` 时）一句点名修法。
 
 想四个组件都开（含 dsh-ops 默认关着的 background 与 PTC）：`node tools/ops-enable.cjs` 后重启 DSH；
 `--check` 只看不改，`--revert` 删掉这四行回到 dsh-ops 自带默认。
