@@ -558,7 +558,13 @@ PTC_ONLY_INSTRUCTION :2517 且 both 渲染为空（:2725 官方注释原话
 **三条规则**：
 
 1. **默认开**。配置里没有 batch 键 = 开，只有显式 batch: false 才关（roleBatchOn 判 !== false）。
-   老配置因此零迁移。关掉 = 完全沿用所选预设自己的档（选 PTC 就是纯 PTC），这是「关」唯一的诚实语义。
+   老配置因此零迁移。关掉 = 沿用所选预设自己的档（选 PTC 就是纯 PTC），这是「关」的诚实语义。
+   但**「沿用」不能靠等**：2026-10-16 真机证伪了旧实现（那一支什么都不做，等异步预设重绑把档带过来）。
+   实测 researcher-ops（预设 ptc + 关批量）逐请求是 native(76)→ptc(1)→native(76)→ptc(1)，
+   **第一次请求跑在继承来的 native 组合上**，于是它把「没有 run_code、没有 ops_batch」当事实报给 Lead，
+   白跑一轮再自我更正；而 scout-ops（本包同步声明 both 在自己那层）是 both(77)→both(79) 稳定。
+   现在这一支在预设是 ptc 时**同步** presentAs('ptc')（declareMemberMode，与 both 支完全对称、
+   同样先探 ptcRuntime），standard 等原生档仍然什么都不做（那本来就是继承来的档，没有时序要抢）。
 2. **声明在队员自己那一层**：agent.ctx.tools.presentAs('both')（:2810）。它压得住预设那层的 ptc，
    依据是 modeFor 从作用域链**尾部**往前取第一个声明（:2767-2774）+ chainLayers 的顺序
    「farthest ancestor first and the exact scope last」（dsh-scope/lib/index.js:155-169）。
@@ -621,9 +627,11 @@ shell 行拿到的 `runtime = undefined`（dsh-ops `lib/index.js:115`），只�
 
 合法杠杆本来就在本包里，不需要新代码：**角色预设选 `ptc` 且把该角色的「批量调用」关掉**
 （`batch: false`）→ 那名队员就是纯 PTC 档 → 原版 ops 自己把 `ops_batch`/`ops_result` 注册给他。
-实测（`tools/ops-mount-check.mjs`，真挂原版组件 + 真宿主注册表，两个独立 Context）：
-ptc 档拿到、both 档拿不到 ⇒ 因果确实只在呈现档这一项上。§3.7 的 `batch:false` 语义
-（"完全沿用所选预设自己的档"）正是这条杠杆的前提。
+实测（`tools/ops-mount-check.mjs`，真挂原版组件 + 真宿主注册表，四个独立 Context）：
+ptc 档拿到、both 档拿不到 ⇒ 因果确实只在呈现档这一项上；A 段还**真调一次** `ops_batch`
+（见 §3.8 末），所以「能调用」不是从「能看见」推出来的。§3.7 的 `batch:false` 语义
+（关掉 = 沿用所选预设自己的档）正是这条杠杆的前提 —— 前提成立要求**第一次装配**就是纯 PTC，
+这就是 §3.7 规则 1 那条同步声明存在的理由（真机上它当时不成立）。
 
 检测层如实报告，不假装可用，但**也不误报**（2026-10-16 修）：`missingPtcTools` 的前提是
 调用方告知「该作用域是纯 PTC 档」（`detectOpsComponents(ctx, scope, purePtc)` 第三参）。
