@@ -1029,7 +1029,9 @@ function functionBodyOf(source, needle) {
     // ⑥ 而且 `usageOf` 真的被扫描路径用上了（不是导出给人看、内部却不用）。
     // 判据必须带**解构前缀**：第一版写成 /summarizeSession\(events\)/，结果匹配到的是
     // `function summarizeSession(events) {` 这个**定义头** —— 把调用整行删掉它照样绿（M33-e 咬出来的）。
-    assert.ok(/const \{ requests, headers \} = summarizeSession\(events\);/.test(src),
+    // 判据写成「const { … } = summarizeSession(events);」：解构里多一个字段（比如 usageMissing）
+    // 不该把门判红（2026-10-17 我自己加字段时就红了一次），但**必须**是解构赋值而不是定义头。
+    assert.ok(/const \{[^}]*\} = summarizeSession\(events\);/.test(src),
       '扫描路径没有调用 summarizeSession 折表：实测口径又空了');
   });
 

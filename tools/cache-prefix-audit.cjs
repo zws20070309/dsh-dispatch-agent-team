@@ -124,6 +124,7 @@ function summarizeSession(events) {
   let sysChangedSinceRequest = false;
   const requests = [];         // 每次**请求**（assistant/message 带 usage）一条
   const headers = [];          // 每次**装配**（request/header）一条
+  let usageMissing = 0;        // 带 message 但没有 usage 的 assistant/message 条数（如实计入，不当 0 命中）
   let requestIndex = 0;
   for (const event of events) {
     if (event.type === 'system/message') {
@@ -148,6 +149,7 @@ function summarizeSession(events) {
     }
     if (event.type === 'assistant/message') {
       const u = usageOf(event);
+      if (u === undefined) usageMissing += 1;
       if (u !== undefined) {
         requestIndex += 1;
         requests.push({
@@ -168,7 +170,7 @@ function summarizeSession(events) {
       history += textOf(message).length;
     }
   }
-  return { requests, headers };
+  return { requests, headers, usageMissing };
 }
 
 /** 扫描 + 汇报。包成函数是为了让本文件能被 require 而不产生副作用（selftest 只取纯函数）。 */
@@ -201,10 +203,10 @@ for (const file of files) {
   const isMember = events.some((e) => e.type === 'system/message' && textOf(e.data.message).includes(MARKER));
   if (!all && !isMember) continue;
   events.sort((a, b) => a.seq - b.seq);
-  const { requests, headers } = summarizeSession(events);
+  const { requests, headers, usageMissing } = summarizeSession(events);
   if (requests.length === 0 && headers.length === 0) continue;
   const versions = new Set(requests.map((r) => r.system)).size;
-  rows.push({ dir: path.basename(path.dirname(file)), mtime: fs.statSync(file).mtimeMs, requests, headers, versions });
+  rows.push({ dir: path.basename(path.dirname(file)), mtime: fs.statSync(file).mtimeMs, requests, headers, versions, usageMissing });
 }
 
 rows.sort((a, b) => b.mtime - a.mtime);
@@ -212,8 +214,9 @@ const picked = Number.isFinite(tail) && tail > 0 ? rows.slice(0, tail) : rows;
 
 // ── ① 实测命中率（唯一真口径，按请求算）───────────────────────────────────────
 const zero = () => ({ hit: 0, miss: 0, n: 0 });
-const real = { total: zero(), first: zero(), afterFlip: zero(), steady: zero(), noUsage: 0 };
+const real = { total: zero(), first: zero(), afterFlip: zero(), steady: zero(), usageMissing: 0 };
 for (const row of picked) {
+  real.usageMissing += row.usageMissing;
   for (const r of row.requests) {
     const bucket = r.index === 1 ? real.first : (r.afterSystemChange ? real.afterFlip : real.steady);
     bucket.hit += r.hit;
@@ -223,9 +226,6 @@ for (const row of picked) {
     real.total.miss += r.miss;
     real.total.n += 1;
   }
-  const withUsage = row.requests.length;
-  const headersWithUsage = new Set(row.requests.map((r) => r.sysVersion)).size;
-  void withUsage; void headersWithUsage;
 }
 // 展示用：与 lib/cache.js 同式（走 hitRateOf），没有分母时渲染「—」而不是编一个 0%。
 const pctOf = (b) => {
@@ -288,6 +288,9 @@ console.log('  总体          = ' + pctOf(real.total) + '   请求数 ' + real.
 console.log('  第一次请求    = ' + pctOf(real.first) + '   请求数 ' + real.first.n);
 console.log('  前缀变了的请求 = ' + pctOf(real.afterFlip) + '   请求数 ' + real.afterFlip.n + '   ← persona/装配翻面落在这一档');
 console.log('  前缀没变的请求 = ' + pctOf(real.steady) + '   请求数 ' + real.steady.n);
+if (real.usageMissing > 0) {
+  console.log('  注：另有 ' + real.usageMissing + ' 条 assistant/message 不带 usage —— 没有测量就是没有测量，未按 0 计入上面任何一档');
+}
 console.log('');
 console.log('② 装配对模型（只看字节是否相同，用来定位断裂点；不是命中率）');
 console.log('  相邻装配对 = ' + pairs);
