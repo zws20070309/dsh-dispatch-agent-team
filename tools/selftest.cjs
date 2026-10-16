@@ -2390,7 +2390,16 @@ function functionBodyOf(source, needle) {
       'ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill', 'ops_batch', 'ops_result']) {
       assert.ok(adapterSrc.includes("'" + tool + "'"), 'ops-adapter 的 OPS_TOOL_NAMES 必须含 ' + tool);
     }
-    // 队员指引段必须与具体队员无关（共享前缀纪律）：文本里不得出现角色/名字插值。
+    // 文案真实性闸门（2026-10-16 第二轮真机，researcher-ops2 自己抓出来的）：
+    // 旧文案写「与宿主工具同级，放心直调」，但纯 PTC 档队员**直调任何 ops_* 一律被拒**
+    // （实测原文：unknown tool "ops_glob": only run_code is callable directly）。它据此把
+    // 「提示词与实际行为不一致」列成未决项 —— 那是我们自己的文案在骗模型。
+    // 所以这里钉住：不许再出现「放心直调」这类无条件直调的说法，且必须含档无关的自查指引。
+    assert.ok(!adapterSrc.includes('放心直调'),
+      'ops 指引段又出现无条件的「放心直调」（纯 PTC 档直调会被拒，这句在骗模型）');
+    assert.ok(adapterSrc.includes('只有 run_code') && adapterSrc.includes('别因为直调被拒就判定通路不通'),
+      'ops 指引段缺少「纯 PTC 档直调被拒是正常的」这条自查（两名队员共用同一段，必须档无关）');
+    // 这段必须对所有队员逐字节相同（共享前缀纪律）：不得含角色名/队员身份插值。    // 队员指引段必须与具体队员无关（共享前缀纪律）：文本里不得出现角色/名字插值。
     assert.ok(adapterSrc.includes("name: OPS_LINK_SECTION") && adapterSrc.includes('OPS_LINK_ORDER'),
       'linkOpsForMember 必须注册 dispatch:ops-link 段');
 

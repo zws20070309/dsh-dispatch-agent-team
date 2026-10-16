@@ -60,13 +60,17 @@ researcher-ops 恰好是 `selected seq7 < 首请求 seq13` —— 旧判据打 O
 3. 派队员 researcher-ops（角色 researcher：agent 预设 PTC 模式、批量调用关着，所以它应该是纯 PTC 档）。
    这一步是本轮的核心，请在它**第一次回报里**就要到这三样，不要追问第二轮：
    (a) 它现在能不能直接调用工具？还是只有 run_code 可直调？（照抄它看到的原文，别改写）
-   (b) 用 ops_glob 在它自己 cwd 里找一个确实存在的文件（比如 pattern "*.json" 或 "*.md"，取第一个命中）。
+   (b) 在 run_code 程序里用 tools.ops_glob 在它自己 cwd 里找一个确实存在的文件，取第一个命中。
+      注意两点（都是实测）：pattern 必须传**数组**（传字符串会被 INVALID_ARGUMENT 拒：invalid type: string, expected a sequence）；
+      纯 PTC 档下**外层直调 ops_glob 一定被拒**，所以这一步也要放在 run_code 里做，别去试直调。
+      例：await tools.ops_glob({ path: ".", pattern: ["*.json", "*.md"] })
    (c) 在 run_code 程序里执行下面这条，path 用 (b) 找到的相对路径，to 用**同一目录**下的一个新文件名：
       const r = await tools.ops_batch({ action: "plan", operations: [{ op: "copy", path: "<(b)的相对路径>", to: "<同目录>/<新名字>.probe" }] })
       把返回里的 status、id、done、total、failed、error 原样报回来。
    (d) 报它的系统提示词里有没有那段标题「ops 工具（检测到 dsh-ops 插件，已接入本团队）」，有就贴前两行原文。
 
 4. 只在第 3 步 (c) 失败时才做：把报错原文照抄回来，不要改任何插件源码、不要重试改参数超过一次。
+   注意：纯 PTC 档「直调被拒」是**正常**的（只有 run_code 可直调），那不是失败；只有 run_code 程序里的调用失败才算。
    注意 plan 会预检源文件存在、且不为目标创建父目录，所以 NOT_FOUND 多半是参数问题不是通路问题；
    判成功的唯一标准是 status:"planned" 且有 id。
 
