@@ -138,14 +138,14 @@ cd <本插件目录>   # 例：git clone 出来的 dsh-dispatch-agent-team
 node tools/ops-mount-check.mjs
 ```
 
-它挂真 dsh-ops 组件 + 真宿主注册表跑 A/B/C/D 四段（组件一行都不改，是装机那份原版）。2026-10-16 12:26 最后一次实测：
+它挂真 dsh-ops 组件 + 真宿主注册表跑 A/B/C/D 四段（组件一行都不改，是装机那份原版）。最近一次实测：
 `总体：通过（A 交付态，B 负对照成立，C 后台任务实测，D shell 实测）`
 
 | 段 | 实测到什么 |
 |---|---|
-| A | 纯 PTC 档队员的**可见层**有 `ops_batch`+`ops_result`；并**真调一次** `ops_batch(action=plan)` → `id=j-3d5a8663… / failed=0 / logicalBytes=2163`。事后核对目标文件**没被创建**、worker 写的审计存根里 `state:"pending"` ⇒ plan 确属无副作用 |
+| A | 纯 PTC 档队员的**可见层**有 `ops_batch`+`ops_result`；并**真调一次** `ops_batch(action=plan)` → `status:"planned"`、`failed=0/unknown=0`、`logicalBytes=2163`（= `package.json` 的真实字节数）。事后核对目标文件**没被创建**、worker 写的审计存根里 `state:"pending"` ⇒ plan 确属无副作用。`id` 每次运行都变，所以这里不写死（旧版写了 `j-3d5a8663…`，下一次跑就对不上了） |
 | B | 同一份原版组件，只差呈现档：ptc 档拿到两个、both 档拿到空 ⇒ 因果就在本包能配的「预设 ptc + 关批量调用」上 |
-| C | 真起 FastCtx 服务器 + **真调一次** `ops_run_background`（发布 ≠ 可用，bashPath 指到 Git bash） |
+| C | 真起 FastCtx 服务器 + **真调一次** `ops_run_background` 并回收 job 输出（发布 ≠ 可用，bashPath 指到 Git bash）。job id 同样每次变，不写死 |
 | D | `ops_bash` 已发布，且 ops 原文「Prefer bash…」与本包的口径覆盖文字同时进段 |
 
 ### 两个已知无害现象（别当 bug）
