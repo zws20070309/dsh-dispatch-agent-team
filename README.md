@@ -255,7 +255,8 @@ node tools/repair.cjs             # 安装状态体检（bundles / junction / �
 ```bash
 node tools/session-probe.cjs --tools --session <会话子串>          # 会话里团队工具面的真实增删
 node tools/asar-probe.cjs --grep "<字符串>" --list "dsh-llm/lib"   # 官方安装包里到底有没有这个东西
-node tools/cache-prefix-audit.cjs                                  # 提示词前缀到底能不能命中缓存（对着真实会话日志算）
+node tools/cache-prefix-audit.cjs                                  # 缓存命中率：① 实测（读会话日志的 usage）② 前缀复用模型（定位断裂点）
+node tools/cache-prefix-audit.cjs --all --tail 200                 # 连非本插件的会话一起看
 ```
 
 ## 开发者文档

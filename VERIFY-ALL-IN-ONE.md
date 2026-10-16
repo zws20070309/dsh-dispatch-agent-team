@@ -171,7 +171,6 @@ scout-qa 若 2.1 直调成功 = 原生工具可直调；researcher-qa 若 3.2 �
     model=provider-b/model-b，所以走的是 s.model 这一支），`meta` 就是 listMembers 那一行（:580），也就是**继承来的那份**。
     所以准确说法是：画布通常对，但当那名队员的日志读不到 model 事件时，它会退到同一个错来源。
     本轮修的是 Lead 的 list_agents；画布那条退层级没动（要动就是改 graph，不在这次范围）。
-   本来就优先取 request/context 的真值）。
    **生效时机（别当成没修好）**：账本落在 `agent/request` 拦截器里（lib/runtime.js 的
    installRouteOverride），也就是**这名队员真的发出第一个请求**之后才有；annotateMemberModels
    查不到条目时按纪律**不动那一行**。所以刚 spawn、还没开跑的那一瞬间，list_agents 仍显示

@@ -62,7 +62,7 @@
 **验证为对、可以继续依据的条目**（本次逐条复核过）：§7.5 的 `agent/request` payload 形状与
 `mode=waterfall`、`ctx.llm` 六个方法、`ctx.webServer.register` 契约、`plugins.bundle.config` 槽位与
 `registration` 声明、`dsh-commands` 的 `COMMAND_NAME` 正则与 `normalizeResult`、
-`createUserMessage` 的 message 形状、mcp-manager 的 API 通道写法、`agent/created` 的安装时机
+`createUserMessage` 的 message 形状、第三方 mcp-manager 的 API 通道写法、`agent/created` 的安装时机
 （0.1.7 是 `await ctx.serial(...)`，逐个 await 监听器；`create()` 的调用者要等它 resolve）。
 
 ## 0. 运行环境事实（先读，避免写错 API）
@@ -549,14 +549,14 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 **代价（必须告诉用户）**：混用多种预设会把队员的**工具目录**切成几份，跨组不再命中缓存；
 默认「跟随 Lead」= 零变化，这条只在你主动选之后成立。
 2026-10-16 之前这条代价还要再乘一倍：换预设会连第一屏的 persona 一起换掉，于是**每一名**被重绑
-的队员第二次请求就从第 60 字节翻面（下面「persona 钉住」把它修掉了，剩下的分组代价只在工具面）。
+的队员第二次请求就从第 60 字节翻面（下面「persona 钉住」把**第一处**分叉往后抬到工具文档段，公共前缀 60 → 1,442~3,033 字节；剩下的分组代价仍在工具面）。
 
 **测试覆盖**：`integration-test` §7.9 用**真的** `dsh-scope` 父子链 + 真的 `dsh-tools.view()`
 （不是替身）：每份组合各注册一个独占工具与一句 persona，断言换预设后**工具集真的换了**、
 own 层团队工具不受伤、会话日志落了 `agent-preset/selected` 且投影被推进、已开播的不绕锁、
 id 没装时降级并留诊断；第一屏的 persona 则断言**不再跟着换**（那是下面的「persona 钉住」）。
 §7.9b 再加三条物理断言（同一份作用域链换父：不钉 → 公共前缀落在 persona 那一行之内；
-钉了 → 装配结果逐字节相同；并把两者的差额钉成可算的量）。路由层另有 5 条（只配预设能落盘 /
+钉了 → **在本夹具内**装配结果逐字节相同——夹具只注册了 persona 一个段，真机还会在工具文档段分叉，见下面那两处更正；并把两者的差额钉成可算的量）。路由层另有 5 条（只配预设能落盘 /
 读回来一致 / 可用性表形状 / 白名单外拒绝 / `roles` 整表替换语义）。
 `drift-check` 钉住上面引用的每一处官方实现（含 persona 槽位、dsh-subagent 的同类覆盖、
 dsh-scope 的「最近一层赢 / 同层同名抛错」、以及官方两份 persona 文字确实不同这五组事实）。
@@ -568,11 +568,24 @@ dsh-scope 的「最近一层赢 / 同层同名抛错」、以及官方两份 per
 | 事实 | 数值 |
 |---|---|
 | 队员**第一次**请求渲染的 persona | 143 / 143 都是「跟随 Lead」那一份（灰度短版） |
-| 出现两版 system 的队员会话 | 15 / 143 —— 每一次都是「短版 → 角色预设那份」的翻面 |
-| 两版 system 的最长公共前缀 | **60 字节**（官方 harness:identity 那一句）。其余 68,016 ~ 75,892 字节 system、2,126 ~ 59,492 字节工具清单、以及已跑出来的整段历史**全部不计入命中** |
-| 最近 40 个队员会话 | 相邻请求对 21：完整复用 5（23.8%）、system 断裂 16（76.2%）、字节加权命中 **27.6%**、单次最大损失 152,576 字符 |
-| 全部 61 个 ≥2 请求的队员会话 | 完整复用 96/116（82.8%）、字节加权 93.6%。两个数不矛盾：长会话里一次断裂被后续大历史稀释；而队员普遍只有 2~4 次请求，所以真实体感是上面那个 27.6% |
+| 出现多版本 system 的队员会话 | 15 / 143；其中 **12 个**相邻两版确实不同（另 3 个多版本但相邻相同） |
+| **实测命中率**（读 `assistant/message.usage`；公式同 `lib/cache.js:262-264`） | 最近 40 个队员会话 **96.8%**（835 次请求）；全部 143 个队员会话里**带 usage 的 140 个**是 **95.0%**（另 3 个的 assistant/message 没有 usage，不计入）。分档：首次请求 16.2%、**前缀变了的那一次 20.5%（16 次请求）**、其余 97.6%（779 次） |
+| 两版 system 的最长公共前缀 | **60 字节**（官方 harness:identity 那一句）—— persona 是**第一处**分叉 |
+| 钉住 persona **之后**的最长公共前缀 | **1,442 ~ 3,033 字节**（同一批 12 个会话逐对实测）—— 只抬到第一处**工具文档段**的差异处，**不是**整段相同 |
+| 装配对模型（**定位用，不是命中率**） | 最近 40 个会话的 21 对相邻**装配**：完整复用 5（23.8%）、system 断裂 16（76.2%）、字节加权复用率 27.6%、单次最大损失 152,576 字符 |
+| 全部 61 个 ≥2 装配的队员会话 | 完整复用 96/116（82.8%）、字节加权复用率 93.6% |
 | 冷重启恢复的队员 | 4da2b02d 四次请求是 短(76 工具)→长(1)→短(76)→长(1)：**每次 resume 翻两次** |
+
+**两处更正（2026-10-17，我上一轮说错的话，逐条改准）**
+
+1. **「会话日志里没有 usage，只能做理论分析」是假话。** `assistant/message.data.usage` 一直带
+   `cacheReadTokens`：本机 143 个队员会话里 8,603 条 assistant/message **全部**带 usage、8,041 条
+   带 `cacheReadTokens`；本包自己的 `lib/graph.js:168` 与 `lib/cache.js:240` 也一直在读它。上一轮我把
+   「字节加权 27.6%」当缓存现状汇报，而同一批会话的**实测**命中率是 **96.8%**。
+2. **「两版 system 只有第一屏那一行不同」也是假的。** 真机上两版还差在**工具文档段**（实测
+   0e572d03：两版工具数都是 1，system 却是 68,016 → 75,511 字节，hunk 级差分 17 处）。persona 是
+   **第一处**分叉，所以钉住它把公共前缀从 60 字节抬到 1,442~3,033 字节 —— 有量可算的收益，但
+   **不是**「整段复用」。整段相同只在我那份只注册 persona 的集成夹具里成立（`integration-test` §7.9b）。
 
 根因由三条官方事实拼成：persona 属于**继承面**贡献（`dsh-persona/lib/index.js:8-11` 的原话——挂在
 预设里就遮蔽部署级 persona，与 `dsh-subagent` 的 per-child persona 同一套路），而重绑换的正是继承面
@@ -583,7 +596,7 @@ dsh-scope 的「最近一层赢 / 同层同名抛错」、以及官方两份 per
 `lib/roster.js` 的 `MEMBER_PERSONA_SECTION` / `MEMBER_PERSONA_ORDER` / `MEMBER_PERSONA_PIN`，落点在
 `lib/runtime.js` 的 `pinMemberPersona`。依据是 `dsh-scope/lib/index.js:177-181` 的 merge：「由远及近
 set，最近的一层赢」，所以本层一句就压得住部署级与预设级两份。注册写在两处 `await` **之前**，
-因此第一次装配就用得上，前后逐字节相同。
+因此第一次装配就用得上。**边界（2026-10-17 实测更正）**：钉住只消掉 persona 这一处分叉；两版 system 在它之后仍会因**工具文档段**不同而分叉，实测公共前缀 60 → 1,442~3,033 字节，**不是**整段相同。
 
 三条边界，每条都有门：
 
@@ -977,9 +990,9 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
   `view === 'summary'` 分支是防御性的：官方只在 `plugins.bundle.config` 槽位上以 `{ view: 'page' }` 渲染本组件。
   bundle 详情页的**基本信息（图标/标题/版本/包名/描述）由页面白送**（plugin-manager README + `:1908-1947`），
   你只做：角色列表 + 模型/强度选择 + 保存/放弃 + 状态提示。
-- 数据与写入**全部走我们自己的 host 路由**（先例：mcp-manager 的 `apiCall()`，`lib/client.js:90-101`）：
+- 数据与写入**全部走我们自己的 host 路由**（先例：**第三方插件** mcp-manager 的 `apiCall()`，其 `lib/client.js:90-101` —— 那不是本仓库的文件；本机 `app.asar` 里**没有**这个包，只有 `@deepseek-ai/dsh-mcp-client` 与 `dsh-mcp-resources`，所以这条只作写法先例、不作可复核的官方引用）：
   - `POST /zws-dispatch-agent-team/api`，header 必须带 `content-type: application/json`
-    与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照 mcp-manager `:94`）。
+    与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照上面那个第三方插件的 `:94`）。
   - ops（注意：现行实现比这里多 `revision` / `diagnostics`，见 §0.1 第 18 条）：
     `{op:'get'}` → `{ok:true, config, roles:[...], path, revision, diagnostics}`；
     `{op:'list-models'}` → `{ok:true, groups, failures}`；
@@ -990,7 +1003,7 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     `{op:'team-conversation', args:{sessionId, targetId, limit}}` → `{ok:true, rows:[{kind,text,time}]}`
     （浮动窗口的对话尾部；targetId 不属于该团队 → `{ok:false}`）。
 - UI 要求（「原版 UI 味道」：灰阶、细边框、12–13px、克制，**不要花哨、不要浓 AI 味**）：
-  - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（mcp-manager 的 CSS 可抄）。
+  - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（第三方 mcp-manager 的 CSS 可抄）。
   - 每个角色一行：角色名（中文）+ 角色 id（等宽小字）+ 使命一句话；「模型」下拉；「思考强度」下拉。
   - 下拉用原生 `<select>` 即可（官方等价物 `Menu` 需要 ui-primitives，本包**不注入**它以降低失败面）。
     模型选项 value 用 `provider + '\u0000' + model` 不透明键，label 用 `provider / model`；

@@ -277,6 +277,28 @@ check('dsh-llm 仍提供 listProviders / listModels / resolveModelInfo', () => {
   return missing.length === 0 ? true : `dsh-llm 缺：${missing.join(', ')} —— lib/runtime.js 的 listModelCatalog/preflightRoute 需要重写`;
 });
 
+// 5b) 实测命中率的两个官方事实（2026-10-17 补）
+//     为什么要钉：tools/cache-prefix-audit.cjs 的「实测命中率」完全建立在这两条上 ——
+//     ① provider 字段被翻成 cacheReadTokens；② 会话日志里 assistant/message 真的带 usage。
+//     我上一轮正是因为**没读这两处**，对用户说了「会话日志里没有 usage，只能做理论分析」这句假话。
+const deepseekLlm = asar.read('dsh/node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js') || '';
+check('官方仍把 provider 的 cache_read_input_tokens 映射成 cacheReadTokens（实测命中率的前提）', () => {
+  if (deepseekLlm === '') return '读不到 dsh-llm-deepseek/lib/index.js';
+  if (!deepseekLlm.includes('cache_read_input_tokens: "cacheReadTokens"')) {
+    return '映射变了：tools/cache-prefix-audit.cjs 与 lib/cache.js 读的 cacheReadTokens 可能已经不是缓存命中数';
+  }
+  return true;
+});
+
+const tokenMeterTypes = asar.read('dsh/node_modules/@deepseek-ai/dsh-token-meter/lib/types/usage-projection.js') || '';
+check('官方 usage 投影仍把 cacheReadTokens 分出来（所以它一路带进 assistant/message）', () => {
+  if (tokenMeterTypes === '') return '读不到 dsh-token-meter/lib/types/usage-projection.js';
+  if (!tokenMeterTypes.includes('cacheReadTokens')) {
+    return 'usage 投影不再有 cacheReadTokens：实测命中率要换字段读，本包的两处读点（lib/graph.js、lib/cache.js）都要重读';
+  }
+  return true;
+});
+
 // 6) 命令名正则（中文命令不可行的前提）是否变化
 const commandsIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-commands/lib/index.js') || '';
 check('dsh-commands 的命令名正则未变（仍是 ASCII-only）', () => {
