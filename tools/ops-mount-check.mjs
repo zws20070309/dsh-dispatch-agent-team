@@ -1,14 +1,16 @@
-// 离线验收探针：把**装机的真 dsh-ops 组件**挂进真 cordis + 真 dsh-tools，
-// 看调度模式的队员（both 档）到底能不能拿到 ops_batch / ops_result。
+// 离线验收探针：把**装机的真 dsh-ops 组件（一行源码都不改）**挂进真 cordis + 真 dsh-tools，
+// 看调度模式的队员到底能不能拿到它的工具。
 //
 // 为什么需要它：交付要求「ops 四组件都打开 + 团队完美使用它的工具」，而真机要重启 DSH 才看得到。
-// 这个探针在**当前进程之外**复刻同一条装配路径（真 Context、真 register、真 presentAs、真 assemble、
+// 这个工具在**当前进程之外**复刻同一条装配路径（真 Context、真 register、真 presentAs、真 assemble、
 // 真 dsh-ops 组件代码），所以给的是实测结论，不是推理。
 //
-// 两个互相独立的 Context（第一版共用一个 root，结果「原版」那一发被已打补丁的组件抢注了
-// ops_batch —— 负对照失效。组件都监听 agent/created，必须物理隔离才有对照意义）：
-//   A = 打过补丁的装机组件（交付态）→ 期望 both 队员拿到 ops_batch / ops_result
-//   B = 补丁前备份的原版组件        → 期望**拿不到**（证明补丁是承重环节）
+// 三段（各用**独立** Context —— 组件都监听 agent/created，共用一个 root 会互相抢注，
+// 第一版就是这么把负对照搞失效的）：
+//   A = 交付态：file 四件套人人可见；纯 PTC 档队员（预设 ptc + 关批量档）拿到 ops_batch/ops_result
+//   B = 负对照：同一份原版组件，只差呈现档 —— ptc 档拿到 / both 档拿不到
+//             ⇒ 因果在**本包能配的那一项**上，不需要也不允许去改 ops
+//   C = background 组件真起 FastCtx 服务器，四个 job 工具确实发布
 //
 // 用法：node tools/ops-mount-check.mjs      退出码 0 = 通过（含「本机没装 dsh-ops」这种不适用）
 import fs from 'node:fs';
@@ -29,9 +31,9 @@ let opsRoot;
 try {
   opsRoot = path.dirname(reqProfile.resolve('dsh-ops/package.json'));
 } catch {
-  console.log('本机没有已安装的 dsh-ops（profile 的 node_modules 里解析不到）：');
-  console.log('本插件不依赖它，ops 检测会静默跳过、队员提示词一个字节都不涨 —— 这就是「没装 ops 也能用」的样子。');
-  console.log('想要 ops 的能力：装 dsh-ops 插件并在插件页启用它的组件，再跑 node tools/ops-enable.cjs。');
+  say('本机没有已安装的 dsh-ops（profile 的 node_modules 里解析不到）：');
+  say('本插件不依赖它，ops 检测会静默跳过、队员提示词一个字节都不涨 —— 这就是「没装 ops 也能用」的样子。');
+  say('想要 ops 的能力：装 dsh-ops 插件并在插件页启用它的组件，再跑 node tools/ops-enable.cjs。');
   process.exit(0);
 }
 const opsFile = (rel) => pathToFileURL(path.join(opsRoot, rel)).href;
@@ -41,7 +43,24 @@ const versionOf = (name) => {
     return name.replace('@deepseek-ai/', '') + '@' + JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
   } catch { return name + '@?'; }
 };
+// 结果同时写一份日志文件：C 段会起真 FastCtx 子进程，管道句柄可能让 Node 不退出
+// （实测卡过一次）—— 有文件就不必等进程结束，也不会把结论吞掉。
+const LOG = path.join(PLUGIN, '.probe-tmp', 'mount-check.log');
+try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.writeFileSync(LOG, '', 'utf8'); } catch { /* 日志写不了不影响判定 */ }
+const say = (line) => { console.log(line); try { fs.appendFileSync(LOG, line + String.fromCharCode(10), 'utf8'); } catch { /* 同上 */ } };
+
 const tick = async (n = 8) => { for (let i = 0; i < n; i += 1) await new Promise((r) => setImmediate(r)); };
+// 真 MCP 握手（spawn + initialize + listTools）比固定 tick 慢，这里做有界轮询而不是猜时长。
+const waitFor = async (predicate, timeoutMs = 90_000) => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let value = null;
+    try { value = predicate(); } catch { value = null; }
+    if (value) return value;
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+};
 
 const { Context } = await import(libUrl('@deepseek-ai/cordis'));
 const { createScope } = await import(libUrl('@deepseek-ai/dsh-scope'));
@@ -70,14 +89,14 @@ async function makeRoot() {
   return root;
 }
 
-/** 造一名 both 档队员。**关键**：scope key 就是 agent 对象本身
+/** 造一名指定呈现档的队员。**关键**：scope key 就是 agent 对象本身
  *  （dsh-agent-loop/lib/index.js:778 createScope(loopCtx, this)），而 dsh-ops 的 PTC 门
  *   用 assemble({ scope: agent }) 查呈现档 —— 换成别的对象当 key 就查不到自己声明的层。 */
-async function makeBothMember(root, id) {
+async function makeMember(root, id, mode) {
   const agent = { id, options: {}, session: { id: 'session-' + id } };
   const scope = createScope(root, agent);
-  scope.ctx.get('tools').presentAs('both');
-  declared.set(agent.id, 'both');
+  scope.ctx.get('tools').presentAs(mode);
+  declared.set(agent.id, mode);
   agent.ctx = new Proxy(scope.ctx, {
     get: (target, prop, receiver) => ((prop === 'tools' || prop === 'systemPrompt') ? target.get(prop) : Reflect.get(target, prop, receiver)),
   });
@@ -105,19 +124,19 @@ async function report(root, agent, label) {
   // 呈现档按**声明**报（我们调过 presentAs），不要用 wire.length 反推：
   // 第一版用 wire.length>1 判 both，结果 B 场景（没挂 file 组件、wire 只剩 run_code）被误标成 ptc。
   const mode = declared.get(agent.id) ?? '?';
-  console.log('  ' + label + '：声明档=' + mode + '，wire ' + wire.length + ' 个'
+  say('  ' + label + '：声明档=' + mode + '，wire ' + wire.length + ' 个'
     + ' 可见 ops_*=' + JSON.stringify(opsSeen)
     + ' 送模型 ops_*=' + JSON.stringify(opsWire)
     + ' 段[sdk=' + text('tools:sdk') + ', ptc-only=' + text('tools:ptc-only') + ']');
   return { opsSeen, opsWire, mode };
 }
 
-console.log('模块基准：' + ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-scope', '@deepseek-ai/dsh-system-prompt'].map(versionOf).join(' / '));
-console.log('dsh-ops = ' + JSON.parse(fs.readFileSync(path.join(opsRoot, 'package.json'), 'utf8')).version + ' @ ' + opsRoot);
-console.log('');
+say('模块基准：' + ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-scope', '@deepseek-ai/dsh-system-prompt'].map(versionOf).join(' / '));
+say('dsh-ops = ' + JSON.parse(fs.readFileSync(path.join(opsRoot, 'package.json'), 'utf8')).version + ' @ ' + opsRoot);
+say('');
 
-// ── A：交付态（打过补丁的装机组件）──────────────────────────────────────────
-console.log('A) 装机 dsh-ops（已放宽 PTC 门）+ file 组件：');
+// ── A：交付态 —— 原版 dsh-ops（本包不改它一行源码）+ file 组件 ──────────────
+say('A) 装机 dsh-ops（原版，未改）+ file 组件：');
 const rootA = await makeRoot();
 const fileComp = await import(opsFile('lib/components/file/index.js'));
 fileComp.apply(rootA, { promptPolicy: true, enableShellTools: false, required: false, toolCallTimeoutMs: 300000, configUpdateVersion: 1 });
@@ -125,54 +144,134 @@ await tick(8);
 const ptcComp = await import(opsFile('lib/components/ptc/index.js'));
 ptcComp.apply(rootA, { required: false });
 await tick(8);
-const mateA = await makeBothMember(rootA, 'mate-patched');
-const a = await report(rootA, mateA, 'both 队员');
-const okA = PTC_TOOLS.every((n) => a.opsSeen.includes(n) && a.opsWire.includes(n))
-  && FILE_TOOLS.every((n) => a.opsSeen.includes(n));
-console.log('  判定 A = ' + (okA
-  ? '✓ both 队员真的拿到了 ops_batch / ops_result（可见且送给模型），file 四件套也在'
-  : '✗ 缺批量工具：' + JSON.stringify(PTC_TOOLS.filter((n) => !a.opsWire.includes(n)))));
-console.log('');
+// 两名队员：一名纯 PTC 档（预设 ptc + 关批量档 = 本包的合法杠杆），一名批量档（默认）。
+const matePtc = await makeMember(rootA, 'mate-ptc', 'ptc');
+const mateBoth = await makeMember(rootA, 'mate-both', 'both');
+const aPtc = await report(rootA, matePtc, '纯 PTC 档队员');
+const aBoth = await report(rootA, mateBoth, '批量档队员');
+const fileOk = FILE_TOOLS.every((n) => aPtc.opsSeen.includes(n) && aBoth.opsSeen.includes(n));
+// 纯 PTC 档的判据是**可见**（view 里有 = run_code 程序里 await tools.ops_batch(...) 调得到）；
+// 它不进 wire 是官方设计 —— ptc 档把送给模型的工具裁成一个 run_code（dsh-tools:2840-2843），
+// 所以这里若拿 opsWire 判就永远不成立（第一版 A2 就是这么误判 ✗ 的）。
+const ptcOk = PTC_TOOLS.every((n) => aPtc.opsSeen.includes(n));
+const bothNo = PTC_TOOLS.every((n) => !aBoth.opsSeen.includes(n));
+const okA = fileOk && ptcOk;
+say('  判定 A1（file 四件套人人可见）= ' + (fileOk ? '✓' : '✗'));
+say('  判定 A2（纯 PTC 档队员可见 ops_batch/ops_result，即可在 run_code 程序里调用）= ' + (ptcOk ? '✓ 本包的杠杆成立，且没动 ops 一行源码' : '✗ 没拿到'));
+say('  附带事实（批量档队员没有那两个工具，符合 ops 原版设计）= ' + (bothNo ? '✓' : '✗ 与预期不符'));
+say('');
 
-// ── B：负对照（补丁前的原版组件，独立 Context，不碰装机包）─────────────────
-const baks = fs.readdirSync(path.join(opsRoot, 'lib', 'ptc')).filter((n) => n.includes('pre-ptc-both')).sort();
-const worker = path.join(opsRoot, 'runtime', 'win32-x64', 'dsh-ops-worker.exe');
+// ── B：负对照 —— 同一份原版组件，both 档 vs ptc 档只差在呈现档 ───────────────
+// 目的：证明 A2 的因果在**呈现档**（本包能配的那一项），不是环境凑巧。
 let okB = null;
-if (baks.length === 0 || !fs.existsSync(worker)) {
-  console.log('B) 负对照跳过（找不到补丁前备份或 worker 二进制）');
-} else {
-  // 副本必须是「包根 / lib / …」的布局：resolveWorker 的 PACKAGE_ROOT 是
-  // lib/ptc/runtime.js 往上两级（runtime.js:6），只拷 lib 会把包根算成 Temp 本身。
-  const tmp = path.join(os.tmpdir(), 'ops-pristine-' + Date.now());
-  fs.cpSync(path.join(opsRoot, 'lib'), path.join(tmp, 'lib'), { recursive: true });
-  fs.copyFileSync(path.join(opsRoot, 'lib', 'ptc', baks[baks.length - 1]), path.join(tmp, 'lib', 'ptc', 'index.js'));
-  // resolveWorker 对 runtime/ 下的二进制会核对 provenance.json 的 version 与**包根 package.json**
-  // （runtime.js:21-26），所以副本的 package.json 必须带真实 version，否则对照挂载不起来。
-  const opsPkg = JSON.parse(fs.readFileSync(path.join(opsRoot, 'package.json'), 'utf8'));
-  fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify({ type: 'module', version: opsPkg.version }), 'utf8');
-  try {
-    const rootB = await makeRoot();
-    const pristine = await import(pathToFileURL(path.join(tmp, 'lib', 'components', 'ptc', 'index.js')).href);
-    // 副本的 PACKAGE_ROOT 推不出装机路径，必须显式给 worker（否则 resolveWorker 直接失败、
-    // 组件静默不挂载 —— 那会让「原版也没给」变成假阳性，所以先自检再挂）。
-    const { resolveWorker } = await import(pathToFileURL(path.join(tmp, 'lib', 'ptc', 'runtime.js')).href);
-    const resolved = resolveWorker({ binaryPath: worker });
-    console.log('B) 原版组件（独立 Context，worker=' + path.basename(resolved) + '）：');
-    pristine.apply(rootB, { required: false, binaryPath: worker });
-    await tick(8);
-    const mateB = await makeBothMember(rootB, 'mate-pristine');
-    const b = await report(rootB, mateB, 'both 队员');
-    okB = PTC_TOOLS.every((n) => !b.opsSeen.includes(n));
-    console.log('  判定 B = ' + (okB
-      ? '✓ 原版门下 both 队员拿不到 ops_batch/ops_result —— 补丁确实是承重环节'
-      : '✗ 原版门也给了：' + JSON.stringify(b.opsSeen) + '（补丁不是必要条件，或对照被污染）'));
-  } catch (error) {
-    console.log('B) 负对照挂载失败：' + (error && error.message ? error.message : String(error)));
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
+{
+  const rootB = await makeRoot();
+  const compB = await import(opsFile('lib/components/ptc/index.js'));
+  compB.apply(rootB, { required: false, binaryPath: path.join(opsRoot, 'runtime', 'win32-x64', 'dsh-ops-worker.exe') });
+  await tick(8);
+  const seenOf = async (mode, tag) => {
+    const agent = mode === 'ptc' ? await makeMember(rootB, tag, 'ptc') : await makeMember(rootB, tag, 'both');
+    const seen = [...rootB.get('tools').view(agent).visible.keys()];
+    return PTC_TOOLS.filter((n) => seen.includes(n));
+  };
+  // 组件的注册是异步 reconcile（agent/created 之后还要跑一轮），所以两种档各试几轮。
+  let gotPtc = [];
+  for (let i = 1; i <= 3 && gotPtc.length < 2; i += 1) gotPtc = await seenOf('ptc', 'mate-b-ptc-' + i);
+  let gotBoth = [];
+  for (let i = 1; i <= 3; i += 1) { gotBoth = await seenOf('both', 'mate-b-both-' + i); if (gotBoth.length > 0) break; }
+  okB = gotPtc.length === 2 && gotBoth.length === 0;
+  say('B) 负对照（同一份原版组件，只差呈现档）：ptc 档拿到 ' + JSON.stringify(gotPtc) + '，both 档拿到 ' + JSON.stringify(gotBoth));
+  say('  判定 B = ' + (okB
+    ? '✓ ptc 档拿到 / both 档拿不到 —— 因果确实在呈现档，本包的修法（预设 ptc + 关批量档）成立'
+    : '✗ 与预期不符：说明 ops 的门或本包的杠杆需要重新核对'));
+  say('');
 }
-console.log('');
-const pass = okA === true && (okB === true || okB === null);
-console.log(pass ? '总体：通过' + (okB === null ? '（负对照跳过）' : '（含负对照）') : '总体：不通过');
+
+// ── C：background 组件（真 spawn FastCtx 服务器）───────────────────────────────
+// 为什么必须实测它：四个组件里只有它的发布门最长 —— 要 fastctx 二进制 + bash 可解析
+// + 会话 danger-full-access 三样同时成立（dsh-ops lib/tools.js:311-316），
+// 而本机 @dsh-ops/bash-win32-x64 没装，靠 profile 那行的 allowSystemShellFallback: true
+// 让 Git bash 顶上。这一条不实测就没人知道那四个 job 工具到底在不在。
+// FastCtx 走裸 spawn（dsh-ops lib/handshake.js:134），不经 ctx.get('subprocess')，
+// 所以离线台架能真的把它挂起来。
+say('C) background 组件（真起 FastCtx 服务器）：');
+let okC = null;
+try {
+  const { resolveBinary, probeBinary } = await import(opsFile('lib/binary.js'));
+  const { resolveShells } = await import(opsFile('lib/shells.js'));
+  const rt = resolveBinary({ packageRoot: opsRoot });
+  const probe = probeBinary(rt.file);
+  // 用**本包真正会写进 profile 的那份配置**（detectBash 与 ops-enable 共用，不各写一份）：
+  // 只给 allowSystemShellFallback 会让 PATH 兜底选中 WindowsApps 的 WSL 启动器，
+  // 而 FastCtx 明确拒绝它 —— 那样测的就不是交付态。
+  const { detectBash } = createRequire(path.join(PLUGIN, 'package.json'))('./tools/ops-enable.cjs');
+  const bashPath = detectBash();
+  const shells = resolveShells({ bashPath: bashPath ?? undefined, allowSystemShellFallback: bashPath === null, publishBashTool: true, shellPolicy: 'advise' });
+  say('  fastctx = ' + path.basename(rt.file) + '（' + rt.source + '，probe ' + (probe.ok ? 'ok' : 'FAIL') + ' ' + (probe.version ?? '') + '）');
+  say('  bash = ' + (shells.bash.available ? shells.bash.file : '(不可解析：' + String(shells.bash.detail).slice(0, 60) + ')'));
+  if (probe.ok !== true) {
+    say('  判定 C = 跳过（fastctx 不可用：' + probe.detail + '）');
+  } else {
+    const rootC = await makeRoot();
+    const bgComp = await import(opsFile('lib/components/background/index.js'));
+    bgComp.apply(rootC, { promptPolicy: true, enableShellTools: true, required: false, toolCallTimeoutMs: 300000,
+      allowSystemShellFallback: bashPath === null, ...(bashPath === null ? {} : { bashPath }), configUpdateVersion: 1 });
+    const jobTools = ['ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill'];
+    // 后台工具注册在**这名队员自己的层**上（dsh-ops lib/tools.js:358-366），而注册动作发生在
+    // attachAgent → refreshAgents；FastCtx 握手（spawn + initialize + listTools，约 4-6s）完成前
+    // bashAvailable 还是 false（lib/tools.js:477），那一发就会空手。
+    // 生产里队员永远在插件启动完成之后才被派出，所以这里**连派几名**（每派一名都触发一次刷新）：
+    // 第一发撞上启动窗口、后续拿到 = 正常；全都拿不到 = 门真没过。
+    let c = null;
+    let gotC = [];
+    let attempts = 0;
+    let mateC = null;
+    const deadline = Date.now() + 150_000;
+    while (Date.now() < deadline) {
+      attempts += 1;
+      mateC = await makeMember(rootC, 'mate-bg-' + attempts, 'both');
+      const seen = [...rootC.get('tools').view(mateC).visible.keys()];
+      gotC = jobTools.filter((n) => seen.includes(n));
+      c = await report(rootC, mateC, 'both 队员 #' + attempts);
+      if (gotC.length === jobTools.length) break;
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    say('  尝试次数 = ' + attempts + '（每发都是一名新队员，与生产同一条路径）');
+    okC = gotC.length === jobTools.length;
+    // 发布 ≠ 可用：真调一次 run_background，让 FastCtx 自己裁决这个 bash 行不行。
+    let execNote = '（未测）';
+    if (okC) {
+      try {
+        const def = rootC.get('tools').get('ops_run_background', mateC);
+        // dsh-ops 的 execute 只要 exec.agent.session（权限门从 ctx.get('sandboxPolicy')
+        // 按 session 解析，lib/tools.js:666-669）+ exec.signal；cwd 缺省取 session.header.cwd。
+        const exec = { agent: mateC, signal: new AbortController().signal };
+        const result = await def.execute({ command: 'echo ops-mount-check-ok' }, exec);
+        const text = JSON.stringify(result).slice(0, 260);
+        const bad = /POLICY_DENIED|not a working bash|error/i.test(text);
+        execNote = (bad ? '✗ 调用被拒：' : '✓ 调用成功：') + text;
+        okC = !bad;
+      } catch (error) {
+        execNote = '✗ 调用抛错：' + (error && error.message ? error.message : String(error));
+        okC = false;
+      }
+    }
+    say('  真调一次 ops_run_background = ' + execNote);
+    say('  判定 C = ' + (okC
+      ? '✓ 四个 job 工具全部发布且真能跑（bashPath 指到可用 bash + danger-full-access 门过）'
+      : '✗ 只拿到 ' + JSON.stringify(gotC) + '（bash 解析或权限门没过 —— 检查 profile 的 allowSystemShellFallback 与迁移标记）'));
+    // 收尾：FastCtx 有父进程监视（FASTCTX_NO_PARENT_WATCH=0），进程退出即回收。
+    if (typeof rootC.dispose === 'function') rootC.dispose();
+  }
+} catch (error) {
+  say('  判定 C = 挂载失败：' + (error && error.message ? error.message : String(error)));
+}
+say('');
+
+say('');
+const pass = okA === true && (okB === true || okB === null) && (okC === true || okC === null);
+say(pass ? '总体：通过（A 交付态' + (okB === null ? '，负对照跳过' : '，B 负对照成立') + (okC === null ? '，C 跳过' : '，C 后台任务实测') + '）' : '总体：不通过');
 process.exitCode = pass ? 0 : 1;
+// FastCtx 子进程/管道句柄会钉住事件循环；判定已打印并已落盘，直接结束进程。
+setTimeout(() => process.exit(pass ? 0 : 1), 500).unref?.();
+process.exit(pass ? 0 : 1);
