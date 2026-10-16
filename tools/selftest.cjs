@@ -1793,9 +1793,12 @@ function functionBodyOf(source, needle) {
     //   * 指针前面是「/」：官方包全路径的尾巴（…/dsh-llm/lib/index.js:2367）。
     //   * 上一行以「/」收尾：官方包路径**跨行折断**写的（dsh-client-ui-user-questions/
     //     换行 lib/client.js:1668-1677）。实测有 2 处这种写法，不跳就误报。
-    //   * 句中出现 mcp-manager / dsh-xxx / 第三方插件：官方包**速记**。例：§6 那句
-    //     「先例：mcp-manager 的 apiCall()，lib/client.js:90-101」指官方那份的 90-101，
-    //     不是我们自己的 client.js（我们的 90-101 是 bridgeService）。
+    //   * 句中出现 mcp-manager / dsh-xxx / 第三方插件：**非本仓库**文件的速记。例：§6 那句
+    //     「先例：@xxxyz/dsh-mcp-manager 的 apiCall()，lib/client.js:91-101」指的是那个第三方包
+    //     （本机 ~/.dsh/profiles/web/node_modules/…，2026-10-17 逐字读过）的 91-101，
+    //     不是我们自己的 client.js（我们的 90-101 是 bridgeService）。不跳就会误报。
+    //     注意：这类引用**在别人机器上不一定存在**（第三方插件），所以文档里要写明它是第三方、
+    //     并把本机路径给出来，别让读者以为那是官方包或本仓库文件。
     const ROOT = path.join(__dirname, '..');
     const files = ['lib/client.js', 'lib/graph.js', 'lib/runtime.js', 'lib/index.js', 'lib/playbook.js',
       'lib/roster.js', 'lib/tools.js', 'tools/selftest.cjs', 'tools/integration-test.cjs',
