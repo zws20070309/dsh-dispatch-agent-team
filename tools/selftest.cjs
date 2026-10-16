@@ -1042,8 +1042,13 @@ function functionBodyOf(source, needle) {
     const interfaces = readFileSync(path.join(PLUGIN_DIR, 'INTERFACES.md'), 'utf8');
     assert.ok(interfaces.includes('实测命中率'),
       'INTERFACES.md 里没有「实测命中率」：缓存这一节又只剩推算模型了');
-    assert.ok(interfaces.includes('96.8%') && interfaces.includes('95.0%'),
-      'INTERFACES.md 没有写明实测数字（最近 40 个会话 96.8% / 全部 143 个 95.0%）');
+    // 数字必须与 `node tools/cache-prefix-audit.cjs` 的默认输出一致（全部 143 个会话那一档）。
+    // 判据只钉「94.9%」这个可复现的总数 + 两个分档名；不钉最近 40 个会话那一档（它会随日志增长漂）。
+    assert.ok(interfaces.includes('94.9%'),
+      'INTERFACES.md 没写实测总数 94.9%（`node tools/cache-prefix-audit.cjs --tail 0` 的输出）；'
+      + '把推算模型当现状汇报正是上一轮那个错，数字必须能一眼对上');
+    assert.ok(interfaces.includes('前缀变了的那一次'),
+      'INTERFACES.md 没写「前缀变了的那一次」这一档：读者会以为实测命中率是均匀的');
     assert.ok(/cacheReadTokens/.test(interfaces),
       'INTERFACES.md 没写实测命中率的来源字段 cacheReadTokens：读者无法复核');
     const readme = readFileSync(path.join(PLUGIN_DIR, 'README.md'), 'utf8');

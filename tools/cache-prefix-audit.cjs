@@ -14,10 +14,11 @@
  *
  * 2026-10-17 更正（本脚本第一版的错，留在这里以免再犯）：第一版只有 ②，我据此在会话里对用户
  * 说过「会话日志里没有 usage 字段，拿不到实测命中率，只能做理论分析」—— 那是**假话**。
- * `assistant/message.data.usage` 一直带 cacheReadTokens：本机 143 个队员会话里 8603 条
- * assistant/message **全部**带 usage、8041 条带 cacheReadTokens；本包自己的 lib/graph.js:168 与
+ * `assistant/message.data.usage` 一直带 cacheReadTokens：本机 143 个队员会话共 8606 条
+ * assistant/message，其中 8603 条带 usage、8041 条带 cacheReadTokens；本包自己的 lib/graph.js:168 与
  * lib/cache.js:240 也一直在读它。所以「理论命中率 27.6%」被当成了缓存现状汇报，而同一批会话的
- * **实测**命中率是 96.8%。现在 ① 是主口径，② 退回到它真正的用途：定位断裂点。
+ * **实测**命中率是 94.9%（8603 次带 usage 的请求；最近 40 个会话那一档是 96.8%）。
+ * 现在 ① 是主口径，② 退回到它真正的用途：定位断裂点。
  *
  * 另一个必须写下来的事实（第一版把 ② 的数说成「相邻请求对」，错了）：`request/header` 不是每个
  * 请求都记，而是**装配变化时**才记 —— 实测 session-00001011 有 7 条 assistant/message（7 次请求）
