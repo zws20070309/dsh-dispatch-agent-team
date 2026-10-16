@@ -1147,6 +1147,93 @@ async function main() {
     });
   }
 
+  // ── 12)「推荐」按钮（2026-10-16 用户：在统一选择那块右上角加一个推荐，点一下填好并保存）──
+  //
+  // 用户诉求原话：「在画圈的地方加一个推荐，点击之后直接就可以直接把最适合这个队员的基本信息填上并保存」。
+  // 所以钉四件事：① 按钮渲染在 dat-bulk-head 里（= 画圈那一行）；② 点一下**既填又存**
+  // （发出 set，载荷里 preset/batch 正确、模型与强度**没被改动**）；③ 回执要说清只动了两格；
+  // ④ 宿主没回推荐取值时按钮禁用并写明原因（不许静默少一个功能）。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: {
+          researcher: { provider: 'p1', model: 'm1', reasoningEffort: 'high', preset: 'standard', batch: false },
+          scout: { provider: 'p1', model: 'm1', reasoningEffort: 'high' },
+          builder: { provider: 'p1', model: 'm1', reasoningEffort: 'high', preset: 'ptc', batch: false },
+        } },
+        roles: ROLES,
+        revision: 'rec:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+        recommendations: [ { roleId: 'researcher', preset: 'ptc', batch: false }, { roleId: 'scout', preset: 'ptc', batch: false }, { roleId: 'builder', preset: 'ptc', batch: true }, ], recommendationRule: '规则文本（只读型走纯 PTC，写域型保留批量调用）',
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'rec:2' },
+    });
+    const tree = page.tree();
+    const head = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-bulk-head')[0];
+    const btn = findAll(head === undefined ? { props: { children: [] } } : head, (node) => node.type === 'button' && textOf(node) === '推荐')[0];
+
+    check('推荐按钮渲染在统一选择那一行（dat-bulk-head = 用户画圈的位置）', () => {
+      if (head === undefined) return '找不到 dat-bulk-head';
+      if (btn === undefined) return 'dat-bulk-head 里没有「推荐」按钮';
+      if (btn.props.disabled === true) return '有推荐取值时按钮却被禁用';
+      return true;
+    });
+    check('推荐按钮的 title 用宿主回传的规则文本（页面不自己写一份理由）', () => {
+      if (btn.props.title !== '规则文本（只读型走纯 PTC，写域型保留批量调用）') return JSON.stringify(btn.props.title);
+      return true;
+    });
+
+    btn.props.onClick();
+    await flush();
+    check('点一下 = 直接保存（发出 set，且带读到的 revision）', () => {
+      const call = sent.find((entry) => entry.op === 'set');
+      if (call === undefined) return '点「推荐」没有发出 set 请求（只填不存 = 用户还得自己点保存）';
+      if (call.args.revision !== 'rec:1') return '没带上读到的 revision：' + JSON.stringify(call.args.revision);
+      return true;
+    });
+    check('点一下 = 按角色填对两格，且模型与思考强度原样保留', () => {
+      const roles = sent.find((entry) => entry.op === 'set').args.roles;
+      const want = {
+        researcher: { preset: 'ptc', batch: false },   // 原本就是纯 PTC：保持
+        scout: { preset: 'ptc', batch: false },        // 原本没有 batch 键（默认开）→ 推荐关 = 落键 false
+        builder: { preset: 'ptc', batch: undefined },  // 写域型：从「关」被拨回「开」= 默认 = 不落键
+      };
+      for(const id of Object.keys(want)) {
+        const row = roles[id];
+        if (row === undefined) return id + ' 没进载荷';
+        if (row.preset !== want[id].preset) return id + ' preset=' + row.preset;
+        if (row.batch !== want[id].batch) return id + ' batch=' + JSON.stringify(row.batch) + '（应为 ' + JSON.stringify(want[id].batch) + '）';
+        if (row.provider !== 'p1' || row.model !== 'm1' || row.reasoningEffort !== 'high') return id + ' 的模型/强度被改了：' + JSON.stringify(row);
+      }
+      return true;
+    });
+    check('保存成功的回执说清「只填了两格、模型与强度未动」', () => {
+      const text = textOf(page.repaint());
+      if (!text.includes('模型与思考强度未改动')) return '回执没说明改动范围：' + text.slice(-260);
+      return true;
+    });
+  }
+  {
+    // 降级：宿主是旧版（get 不回 recommendations）→ 按钮不许消失，要禁用 + 给原因。
+    const page = await mount({
+      get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: 'x:1', diagnostics: [] },
+      'list-models': { ok: true, groups: [], failures: [] },
+    });
+    const tree = page.tree();
+    const head = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-bulk-head')[0];
+    const btn = findAll(head, (node) => node.type === 'button' && textOf(node) === '推荐')[0];
+    check('宿主没回推荐取值：按钮仍渲染但禁用，并写明原因（不静默少功能）', () => {
+      if (btn === undefined) return '按钮整个消失了';
+      if (btn.props.disabled !== true) return '读不到推荐取值却仍可点';
+      const text = textOf(tree);
+      if (!text.includes('宿主没有回传推荐取值')) return '没有给出原因：' + text.slice(-200);
+      return true;
+    });
+  }
+
   // ── 11) 批量调用开关（both 档，2026-10-15 用户选路径 1：默认开 + 开关放控件列左边）──
   //
   // 这一维最容易出的两种错：① 开关被摞进右边那一列（用户明确不要的版面）；

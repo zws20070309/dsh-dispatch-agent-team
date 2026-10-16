@@ -486,7 +486,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2574）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2678）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -837,6 +837,39 @@ function functionBodyOf(source, needle) {
     // 只改 model 这一个已有字段：不许新增字段（新增 = 改 Lead 工具目录 = 动缓存前缀）。
     const only = roster.annotateMemberModels(rows, new Map([['a-id', { provider: 'p', model: 'm', reasoningEffort: 'high' }]]))[1];
     assert.deepEqual(Object.keys(only).sort(), ['diagnostics', 'id', 'model', 'name', 'role', 'status'], '校正只写 model 一个已有字段');
+  });
+
+  await check('「推荐」表：恰好覆盖全部角色、预设 id 在白名单里、batch 是布尔（按钮的取值真值）', async () => {
+    // 为什么钉这条：配置页那个「推荐」按钮的取值来自 lib/roster.js，页面只照抄。
+    // 漏一个角色 = 那个角色**静默不被填**（按钮看起来生效了，实际少改一行）；
+    // 预设 id 写错 = 派队员时拿到官方的 agent-preset/not-found，退回跟随 Lead。
+    // 两者都不会在页面上报错，所以必须在这里钉住。
+    const roster = await load('roster.js');
+    const rec = roster.ROLE_RECOMMENDATIONS;
+    const ids = roster.ROLE_IDS;
+    assert.deepEqual(Object.keys(rec).slice().sort(), ids.slice().sort(),
+      '推荐表与角色表不是同一批角色（漏 = 静默不填，多 = 死条目）');
+    for (const roleId of ids) {
+      const item = rec[roleId];
+      assert.equal(typeof item, 'object', roleId + ' 没有推荐条目');
+      assert.ok(roster.TEAMMATE_PRESET_IDS.includes(item.preset),
+        roleId + ' 的推荐预设 ' + item.preset + ' 不在可指派白名单里（派出来会 not-found 退回跟随 Lead）');
+      assert.equal(typeof item.batch, 'boolean', roleId + ' 的推荐 batch 不是布尔');
+      // 推荐值必须能被 recommendedRoleConfig 原样取回（它是页面/路由唯一的取值口）
+      assert.deepEqual(roster.recommendedRoleConfig(roleId), { preset: item.preset, batch: item.batch },
+        roleId + ' 经 recommendedRoleConfig 取回的值与表里不一致');
+    }
+    assert.equal(roster.recommendedRoleConfig('no-such-role'), undefined, '不存在的角色必须回 undefined');
+    assert.equal(roster.recommendedRoleConfig('__proto__'), undefined, '原型键不许被当成有推荐（hasOwnProperty 守卫）');
+    assert.ok(roster.RECOMMENDATION_RULE.includes('纯 PTC') && roster.RECOMMENDATION_RULE.includes('模型'),
+      '规则文本要同时说清「填什么」与「不填什么」，否则用户不知道按钮动了哪几格');
+    // 分组本身也是判据：只读/汇报型 = 关批量，写域型 = 开批量（这条划分是这张表的全部理由）。
+    const pure = ids.filter((roleId) => rec[roleId].batch === false);
+    const both = ids.filter((roleId) => rec[roleId].batch === true);
+    assert.deepEqual(pure.slice().sort(), ['frontier-auditor', 'plan-critic', 'red-team', 'researcher', 'scout', 'verify', 'visual-critic'],
+      '纯 PTC 那一档的角色集合变了：' + JSON.stringify(pure));
+    assert.deepEqual(both.slice().sort(), ['builder', 'integrator', 'refiner', 'scribe', 'tester'],
+      '保留批量调用那一档的角色集合变了：' + JSON.stringify(both));
   });
 
   await check('路由账本写入点：脏值不进账本、空对象不进、读口返回副本（宁缺毋滥）', async () => {
