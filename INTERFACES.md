@@ -639,6 +639,17 @@ ptc 则原版也能拿到。ops 升级冲掉补丁 → `drift-check` 10g 变红�
   （dsh-ops `lib/tools.js:312`），而本机 `@dsh-ops/bash-win32-x64` 没装（实测 `resolveShells` 返回
   `available: false`），不加这一条那四个 job 工具一个都不出现。
 
+**一个差点毁掉交付的陷阱（P1，2026-10-15 读 dsh-ops 源码时发现，已修）**：ops 的配置迁移
+`updatedConfig()`（dsh-ops `lib/config-updates.js:9-14`）会把「**没有** `configUpdateVersion` 且
+`allowSystemShellFallback: true`」的行**改成 false 并写回 profile**（`mountConfigUpdates` 里的
+`entry.parent.tree.write()`）。而 background 那四个 job 工具的发布门正好要这个 true
+（dsh-ops `lib/tools.js:311-316` + 本机 `@dsh-ops/bash-win32-x64` 未装）—— 不声明标记的话，
+首次启动就会被静默关掉，连我们写的注释理由都会当场失效。修法：三行（shell/file/background）
+各自带 `configUpdateVersion: 1`（`lib/config.js:157-160` 接受并校验该键，语义就是「本行迁移已完成」）；
+**ptc 行不能带**（`resolvePtcConfig` 只认 `binaryPath`/`required`，多给键抛 Unknown PTC config key，
+本机实测）。两条闸门盯住：`drift-check` 10f 查 profile 三行的标记与 background 的 true；
+`integration` §7.11 用**装机的真 updatedConfig** 跑双向断言（带标记 = 逐字节原样；不带 = 必须被翻成
+false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提醒我们重核，M14 变异验证过）。
 **代价**：指引段约 700 字，与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
 `ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
 

@@ -24,6 +24,12 @@
  *   * 写前先备份 .bak-<ts>-pre-ops-enable；
  *   * 已经是 disabled:false 的行不重复追加（幂等）；true 的行就地翻转；
  *   * 没有 disabled 键的行（dsh-ops 自带 patch 里 shell/file 就属于这种）视为已启用，不插键；
+ *   * 每行都带 configUpdateVersion: 1 —— dsh-ops 的 updatedConfig()（lib/config-updates.js:9-14）
+ *     会把「没有该标记且 allowSystemShellFallback: true」的行**迁移成 false 并写回 profile**
+ *     （mountConfigUpdates 的 entry.parent.tree.write()）。不声明标记 = background 那四个 job
+ *     工具在首次启动就被静默关掉，且我们的文件被改。标记的语义就是「本行迁移已完成」
+ *     （lib/config.js:157-160 接受并校验该键）；ptc 行不需要（它走 resolvePtcConfig，只认
+ *     binaryPath/required，多给键会抛 Unknown PTC config key）。
  *   * 缺的行追加到文件**末尾**：这里不是哨兵区结构，末尾不会被宿主 AST 追加吞掉
  *     （吞掉事故只发生在「哨兵区在末尾」的场景，见 self-heal.js 的 2026-10-10 P0）。
  */
@@ -43,6 +49,7 @@ const ROWS = [
     '    publishBashTool: false',
     '    shellPolicy: advise',
     '    allowSystemShellFallback: false',
+    '    configUpdateVersion: 1',
   ] },
   { id: 'dsh-ops-file', lines: [
     '- id: dsh-ops-file',
@@ -52,6 +59,7 @@ const ROWS = [
     '    enableShellTools: false',
     '    required: false',
     '    toolCallTimeoutMs: 300000',
+    '    configUpdateVersion: 1',
   ] },
   { id: 'dsh-ops-background', lines: [
     '- id: dsh-ops-background',
@@ -62,6 +70,7 @@ const ROWS = [
     '    required: false',
     '    toolCallTimeoutMs: 300000',
     '    allowSystemShellFallback: true',
+    '    configUpdateVersion: 1',
   ] },
   { id: 'dsh-ops-ptc', lines: [
     '- id: dsh-ops-ptc',

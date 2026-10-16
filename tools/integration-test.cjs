@@ -1429,18 +1429,21 @@ async function main() {
     }
     let gate = null;
     let gateNote = '';
+    let gateMissing = false;
     if (opsGateFile === null) {
       gateNote = '本机没有已安装的 dsh-ops（profiles/*/node_modules/dsh-ops 解析不到）：跳过真门函数核对';
     } else {
       const gateSrc = realFs.readFileSync(opsGateFile, 'utf8');
       const fnMatch = /function ptcPresentation\(assembly\) \{[\s\S]*?\n\}/.exec(gateSrc);
-      if (fnMatch === null) gateNote = '装机 dsh-ops 的 ptc/index.js 里没有 ptcPresentation（补丁没打上或版本变了）：' + opsGateFile;
+      if (fnMatch === null) { gateNote = '装机 dsh-ops 的 ptc/index.js 里没有 ptcPresentation（补丁没打上或版本变了）：' + opsGateFile; gateMissing = true; }
       else gate = (new Function(fnMatch[0] + '; return ptcPresentation;'))();
     }
     if (gate === null) console.log('  SKIP  装机 dsh-ops 真门函数的三档判定（' + gateNote + '）');
 
     check('装机 dsh-ops 的**真**门函数把三份装配各判对（native / both / ptc）', () => {
-      if (gate === null) return true; // 上面已打印 SKIP，不算通过也不算失败
+      // 装了 ops 却没有 ptcPresentation = 真故障（补丁被升级冲掉），不许静默 PASS。
+      if (gateMissing) return gateNote;
+      if (gate === null) return true; // 本机没装 dsh-ops：不适用，且上面已打印 SKIP
       const n = gate(asmNative); const b = gate(asmBoth); const pt = gate(asmPtc);
       if (n !== 'native') return '真门函数把 native 装配判成 ' + n + '：原生档队员会被塞进批量工具';
       if (b !== 'both') return '真门函数把 both 装配判成 ' + b + '：both 队员拿不到 ops_batch/ops_result（交付核心失败）';
@@ -1449,6 +1452,7 @@ async function main() {
     });
 
     check('负对照：只有 run_code、没有任何 PTC 段的装配必须判 native（门没被放到过宽）', () => {
+      if (gateMissing) return gateNote;
       if (gate === null) return true;
       const bare = { tools: [{ name: 'run_code' }], sections: [] };
       const verdict = gate(bare);
@@ -1546,6 +1550,48 @@ async function main() {
     const pass1 = planEnable(sampleProfile);
     const pass2 = planEnable(pass1.text);
     const passEmpty = planEnable('- id: agent-team\n  config:\n    a: 1\n');
+    // 用**装机的真 dsh-ops 代码**验证迁移标记（P1）：带标记 = updatedConfig 必须原样返回；
+    // 不带标记 = 它必须把 allowSystemShellFallback 翻成 false（这就是陷阱本身，负对照）。
+    let opsMigrate = null;
+    let opsMigrateNote = '';
+    let opsMigrateBroken = false;
+    {
+      // index.js 在 <pkg>/lib/ptc/ 下：往上三层才是包根（写错一次就变成 lib/lib/…）。
+      const gateDir = opsGateFile === null ? null : path.dirname(path.dirname(path.dirname(opsGateFile)));
+      if (gateDir === null) opsMigrateNote = '本机没有已安装的 dsh-ops：跳过迁移标记核对';
+      else {
+        try { opsMigrate = await import(pathToFileURL(path.join(gateDir, 'lib', 'config-updates.js')).href); }
+        catch (error) { opsMigrateNote = '载入 dsh-ops 的 config-updates.js 失败：' + (error && error.message ? error.message : String(error)); opsMigrateBroken = true; }
+      }
+    }
+    if (opsMigrate === null) console.log('  SKIP  装机 dsh-ops 的配置迁移（' + opsMigrateNote + '）');
+    const BG_ROW = { promptPolicy: true, enableShellTools: true, required: false, toolCallTimeoutMs: 300000,
+      allowSystemShellFallback: true, configUpdateVersion: 1 };
+    const BG_UNMARKED = { ...BG_ROW };
+    delete BG_UNMARKED.configUpdateVersion;
+
+    check('真 ops 的 updatedConfig：带 configUpdateVersion 的行必须**逐字节原样**返回（保住 job 工具的门槛）', () => {
+      if (opsMigrateBroken) return opsMigrateNote;
+      if (opsMigrate === null) return true;
+      const after = opsMigrate.updatedConfig(BG_ROW);
+      if (JSON.stringify(after) !== JSON.stringify(BG_ROW)) {
+        return '迁移改写了我们的 background 行：allowSystemShellFallback=' + after.allowSystemShellFallback
+          + '（四个 job 工具的发布门会失效）。修法见 ops-enable.cjs 头部注释。';
+      }
+      return true;
+    });
+
+    check('负对照：不带标记时**真 ops 代码确实会把它翻成 false**（证明上面那条不是空转）', () => {
+      if (opsMigrateBroken) return opsMigrateNote;
+      if (opsMigrate === null) return true;
+      const after = opsMigrate.updatedConfig(BG_UNMARKED);
+      if (after.allowSystemShellFallback !== false) {
+        return '未标记的行没被迁移改写（' + after.allowSystemShellFallback + '）：陷阱已消失，'
+          + '本仓库的标记要求与 drift-check 那条闸门需要重新核对（别留着误导后人）。';
+      }
+      return true;
+    });
+
     check('ops-enable.plan()：翻转 true→false、补齐缺行、二次幂等，且绝不碰别的行', () => {
       if (pass1.flipped.join(',') !== 'dsh-ops-shell') return '第一遍该翻转 shell，实得 ' + JSON.stringify(pass1.flipped);
       if (pass1.appended.join(',') !== 'dsh-ops-file,dsh-ops-background,dsh-ops-ptc') return '该补三行，实得 ' + JSON.stringify(pass1.appended);

@@ -529,7 +529,7 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
   // 判据复用 tools/ops-enable.cjs 的 plan()（同一份真值，不在这里重写一遍正则 ——
   // 两处各写一份就会各自漂，那是本仓库反复栽过的坑）。plan 报"要翻转/要补行"= 不健康。
-  const { plan } = require('./ops-enable.cjs');
+  const { plan, splitRows } = require('./ops-enable.cjs');
   const planResult = plan(fs.readFileSync(profilePatchPath, 'utf8'));
   if (planResult.flipped.length > 0) {
     return 'profile 层这些行仍是 disabled: true：' + planResult.flipped.join(', ')
@@ -538,6 +538,35 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   if (planResult.appended.length > 0) {
     return 'profile 层缺这些行：' + planResult.appended.join(', ')
       + ' —— 会退回 dsh-ops 自带默认（background/ptc 是关的）。修法：node tools/ops-enable.cjs 然后重启 DSH。';
+  }
+  // 迁移标记（P1，2026-10-15 实测）：dsh-ops 的 updatedConfig()（lib/config-updates.js:9-14）会把
+  // 「没有 configUpdateVersion 且 allowSystemShellFallback: true」的行改成 false 并**写回 profile**
+  // （mountConfigUpdates 里的 entry.parent.tree.write()）。而 background 那四个 job 工具的发布门
+  // 正好要这个 true（lib/tools.js:311-316）—— 不声明标记 = 首次启动就被静默关掉。
+  // 行块切分复用 ops-enable 的 splitRows()（同一份真值，且这里刻意不新写正则：往测试里塞
+  // 带反斜杠的正则会被多层转义吃掉，本仓库已为此返工两次）。
+  const profileLines = fs.readFileSync(profilePatchPath, 'utf8').split(String.fromCharCode(10));
+  const blockOf = (id) => {
+    const hit = splitRows(profileLines).find((row) => row.id === id);
+    return hit === undefined ? null : profileLines.slice(hit.start, hit.end + 1).join(String.fromCharCode(10));
+  };
+  for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background']) {
+    const block = blockOf(id);
+    if (block === null) return 'profile 里没有 ' + id + ' 行（上面的 plan 判据没抓到？）';
+    if (block.indexOf('configUpdateVersion: 1') < 0) {
+      return 'profile 的 ' + id + ' 行缺 configUpdateVersion: 1 —— dsh-ops 的配置迁移会改写这一行'
+        + '（background 的 allowSystemShellFallback 被翻成 false，四个 job 工具静默消失）。'
+        + '修法：node tools/ops-enable.cjs 后重启 DSH。';
+    }
+  }
+  if (blockOf('dsh-ops-background').indexOf('allowSystemShellFallback: true') < 0) {
+    return 'profile 的 dsh-ops-background 行没有 allowSystemShellFallback: true —— 它的发布门要 bash 可解析'
+      + '（dsh-ops lib/tools.js:311-316），本机没装 @dsh-ops/bash-win32-x64，缺这一条那四个 job 工具一个都不出。';
+  }
+  const ptcBlock = blockOf('dsh-ops-ptc');
+  if (ptcBlock !== null && ptcBlock.indexOf('configUpdateVersion') >= 0) {
+    return 'profile 的 dsh-ops-ptc 行带了 configUpdateVersion —— resolvePtcConfig 只认 binaryPath/required，'
+      + '多给键会抛 Unknown PTC config key、整行挂载失败（本机实测：ptcRejectsMarker）。';
   }
   // 本包不得再依赖 vendor：目录与 exports 子路径都必须不存在。
   if (fs.existsSync(path.join(PLUGIN_DIR, 'vendor'))) return 'vendor/ 目录又出现了：内嵌 ops 已按用户要求删除';
