@@ -17,6 +17,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -70,6 +71,50 @@ const dshSp = await import(libUrl('@deepseek-ai/dsh-system-prompt'));
 const ToolRuntime = dshTools.ToolRuntime ?? dshTools.default;
 const SystemPrompt = dshSp.SystemPrompt ?? dshSp.default;
 
+/** 允许被这个探针真实起的唯一可执行文件（dsh-ops 原生 worker，本工具只跑无副作用的 plan）。 */
+const OPS_WORKER_ALLOWLIST = [path.join(opsRoot, 'runtime', 'win32-x64', 'dsh-ops-worker.exe')];
+
+/**
+ * 宿主 subprocess 契约的忠实实现（argv 已由调用方按白名单校验）。
+ * 契约来自装机 dsh-ops lib/ptc/worker.js:61-66：spawn({argv,cwd,stdio,graceMs,signal})
+ *   -> { done: Promise<{exitCode,signal}>, collected:{stdout:{readFrom,lossy},stderr:{readFrom}} }。
+ * @param argv - 已校验的参数数组。
+ * @param options - 宿主的 spawn 选项。
+ * @returns 宿主契约要求的 handle。
+ */
+function spawnWorkerBridge(argv, options) {
+  const child = nodeSpawn(argv[0], argv.slice(1), { cwd: options.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const cap = (limit) => {
+    const parts = []; let size = 0; let lossy = false;
+    return {
+      push: (buf) => {
+        if (size + buf.length > limit) {
+          lossy = true;
+          const room = limit - size;
+          if (room > 0) { parts.push(buf.subarray(0, room)); size = limit; }
+          return;
+        }
+        parts.push(buf); size += buf.length;
+      },
+      readFrom: () => ({ text: Buffer.concat(parts).toString('utf8'), lossy }),
+    };
+  };
+  const out = cap((options.stdio && options.stdio.stdout && options.stdio.stdout.maxBytes) || 128 * 1024);
+  const err = cap((options.stdio && options.stdio.stderr && options.stdio.stderr.maxBytes) || 16 * 1024);
+  child.stdout.on('data', (b) => out.push(b));
+  child.stderr.on('data', (b) => err.push(b));
+  if (options.stdio && options.stdio.stdin && options.stdio.stdin.data !== undefined) child.stdin.end(options.stdio.stdin.data);
+  else child.stdin.end();
+  const done = new Promise((resolve) => {
+    child.on('close', (code, sig) => resolve({ exitCode: code, signal: sig }));
+    child.on('error', (e) => resolve({ exitCode: null, signal: String((e && e.message) || e) }));
+  });
+  if (options.signal && typeof options.signal.addEventListener === 'function') {
+    options.signal.addEventListener('abort', () => { try { child.kill(); } catch { /* 已退出 */ } }, { once: true });
+  }
+  return { done, collected: { stdout: out, stderr: err } };
+}
+
 /** 一套最小但真实的宿主：SystemPrompt + ToolRuntime + ptcRuntime + 权限/子进程替身。 */
 async function makeRoot() {
   const root = new Context();
@@ -77,7 +122,18 @@ async function makeRoot() {
   root.plugin(ToolRuntime, { mode: 'native' });
   await tick(4);
   root.provide('sandboxPolicy', { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: PROFILE }) });
-  root.provide('subprocess', { spawn: () => { throw new Error('probe: no real spawn'); } });
+  // subprocess：PTC 的 worker 桥要用它（装机 dsh-ops lib/ptc/worker.js:61）。早先这里是个「一律抛错」
+  // 的替身 —— 那样 PTC 的实调只能停在桥前（实测报 SANDBOX_UNAVAILABLE: probe: no real spawn），
+  // 验不到「这名队员真能调用 ops_batch」。现在放过一个进程：**只有**装机 dsh-ops 自己的原生 worker，
+  // 且本工具只拿它跑无副作用的 action=plan；其余 argv 一律照旧抛错，探针不因此获得随便起进程的能力。
+  const WORKER = OPS_WORKER_ALLOWLIST[0];
+  root.provide('subprocess', { spawn: (options) => {
+    const argv = Array.isArray(options && options.argv) ? options.argv : [];
+    if (argv.length === 0 || path.resolve(argv[0]) !== path.resolve(WORKER)) {
+      throw new Error('probe: 只允许起 dsh-ops 原生 worker，收到 ' + JSON.stringify(argv).slice(0, 160));
+    }
+    return spawnWorkerBridge(argv, options);
+  } });
   root.provide('jobs', { start: () => { throw new Error('probe: no jobs'); } });
   try {
     const nodePtc = await import(libUrl('@deepseek-ai/dsh-ptc-runtime-node'));
