@@ -39,7 +39,9 @@
    (b) plan：await tools.ops_batch({action: "plan", operations: [{op: "copy", path: <(a)的相对路径>, to: <同目录>/r3-probe<扩展名>}]})，报 status/id。
    (c) **真执行**：await tools.ops_batch({action: "resume", id: <(b)的 id>})，报 status/done/total/failed/unknown/error 原文。
    (d) 核实落盘：await tools.ops_glob({path: ".", pattern: [<(b)的 to 文件名>]})，报 matched 与 items —— 这一步是验 resume 真的写了盘。
-   (e) 清理：await tools.ops_batch({action: "plan", operations: [{op: "remove", path: <(b)的 to 文件名>}]}) 再 resume 那个新 id，把两步的 status 都报回来；然后再 ops_glob 一次确认 matched=0。
+   (e) 清理（**唯一有破坏性的一步，照下面逐字做**）：await tools.ops_batch({action: "plan", operations: [{op: "remove", path: <(b)的 to 文件名>}]}) 再 resume 那个新 id，把两步的 status 都报回来；然后再 ops_glob 一次确认 matched=0。
+      护栏：path 只能填**你自己在 (b) 里创建的那一个文件名**（逐字照抄，不要改、不要猜、不要用通配符）；
+      绝对不许 remove 任何原本就存在的文件；如果 (b) 或 (c) 没成功、或你对文件名没有十足把握，**直接跳过 (e)** 并写明「跳过清理，原因是……」。
    (f) 分页：用 (c) 那个 id 调 await tools.ops_result({action: "page", id: <id>, limit: 3})，报**顶层键名列表**、total、complete、items 长度。注意它**没有 status 字段**，别拿 status 判成败。
    (g) 边界：调 await tools.ops_result({action: "release", id: <id>})，把返回原文贴回来（预期是被拒，那是 ops 的设计，不是故障）。
 
@@ -51,7 +53,9 @@
    让 scout-ops3 直调 subagent 工具，派一个最简单的子任务（例如 prompt: "只回复四个字：子代理成功"）。
    把**完整返回或报错原文**贴回来，一个字都别改。
    我的预言是：它会**失败**，报的是深度上限那一类错误（官方原文形状：`subagent depth 2 exceeds maxDepth 1`），而不是真的派出一个子代理。
-（这条是**可证伪的推断**，不是我验过的事实：maxDepth 是 `.volatile()` 的用户设置，本机没有 settings.yaml 落盘，所以我按 zod 默认 1 算。）
+（这条我 15:41 已经自己复现过一次、原文见文末附录；但它当时是推断、现在是实测。
+仍请你独立验一次，因为我的子代理走 `subagent` 工具派生、你的队员走 `spawn_teammate` 派生，
+派生路径不同。maxDepth 是 `.volatile()` 的用户设置，本机没有 settings.yaml 落盘，生效值是按 zod 默认 1 推出来的。）
    如果它**成功**派出了子代理，那就是我错了，请明确写「预言被推翻：子代理真的起来了」。
 
 5. 最后给我一张表：
