@@ -662,10 +662,10 @@ disabled、把真门函数的 both 判成 native、抹掉补丁形状、摘掉�
 给 ptc 行误加标记、把真 updatedConfig 改成恒等函数 —— 每一条都让对应闸门变红（M12/M14 还
 专门验证「闸门在故障消失时也会红」，即不许静默假绿）。
 
-本机离线端到端验收（不需要重启 DSH）：`node .probe/ops-live-mount.mjs` —— 两个**互相独立**的
+本机离线端到端验收（不需要重启 DSH）：`node tools/ops-mount-check.mjs` —— 两个**互相独立**的
 真 Context，A 挂装机（已放宽）的 file+PTC 组件、B 挂补丁前备份的原版 PTC 组件，各自造一名
 both 队员：A 的 `ops_batch/ops_result` 可见且进 wire，B 两个都拿不到 ⇒ 补丁是承重环节。
-（`.probe/` 不入库：这条是本地验收工具，长期保护在 §7.11 与 drift-check 10f/10g。）
+（这条工具入库：别人装完也能跑；长期保护仍在 §7.11 与 drift-check 10f/10g。）
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
 九个工具的**蓝本是官方 0.1.7 源码**（照抄，不要自创）：
