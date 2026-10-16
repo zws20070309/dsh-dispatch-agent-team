@@ -62,7 +62,7 @@
 **验证为对、可以继续依据的条目**（本次逐条复核过）：§7.5 的 `agent/request` payload 形状与
 `mode=waterfall`、`ctx.llm` 六个方法、`ctx.webServer.register` 契约、`plugins.bundle.config` 槽位与
 `registration` 声明、`dsh-commands` 的 `COMMAND_NAME` 正则与 `normalizeResult`、
-`createUserMessage` 的 message 形状、第三方 mcp-manager 的 API 通道写法、`agent/created` 的安装时机
+`createUserMessage` 的 message 形状、第三方 `@xxxyz/dsh-mcp-manager` 的 API 通道写法、`agent/created` 的安装时机
 （0.1.7 是 `await ctx.serial(...)`，逐个 await 监听器；`create()` 的调用者要等它 resolve）。
 
 ## 0. 运行环境事实（先读，避免写错 API）
@@ -991,9 +991,9 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
   `view === 'summary'` 分支是防御性的：官方只在 `plugins.bundle.config` 槽位上以 `{ view: 'page' }` 渲染本组件。
   bundle 详情页的**基本信息（图标/标题/版本/包名/描述）由页面白送**（plugin-manager README + `:1908-1947`），
   你只做：角色列表 + 模型/强度选择 + 保存/放弃 + 状态提示。
-- 数据与写入**全部走我们自己的 host 路由**（先例：**第三方插件** mcp-manager 的 `apiCall()`，其 `lib/client.js:90-101` —— 那不是本仓库的文件；本机 `app.asar` 里**没有**这个包，只有 `@deepseek-ai/dsh-mcp-client` 与 `dsh-mcp-resources`，所以这条只作写法先例、不作可复核的官方引用）：
+- 数据与写入**全部走我们自己的 host 路由**（先例：**第三方插件** `@xxxyz/dsh-mcp-manager` v2.2.7 的 `apiCall()`，本机路径 `~/.dsh/profiles/web/node_modules/@xxxyz/dsh-mcp-manager/lib/client.js:91-101` —— 它不是官方包、也不在 `app.asar` 里，但**本机确实装着、行号可逐字复核**；官方侧对应的只有 `@deepseek-ai/dsh-mcp-client` 与 `dsh-mcp-resources`）：
   - `POST /zws-dispatch-agent-team/api`，header 必须带 `content-type: application/json`
-    与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照上面那个第三方插件的 `:94`）。
+    与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照上面那个第三方插件的 `:92-95`）。
   - ops（注意：现行实现比这里多 `revision` / `diagnostics`，见 §0.1 第 18 条）：
     `{op:'get'}` → `{ok:true, config, roles:[...], path, revision, diagnostics}`；
     `{op:'list-models'}` → `{ok:true, groups, failures}`；
@@ -1004,7 +1004,7 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     `{op:'team-conversation', args:{sessionId, targetId, limit}}` → `{ok:true, rows:[{kind,text,time}]}`
     （浮动窗口的对话尾部；targetId 不属于该团队 → `{ok:false}`）。
 - UI 要求（「原版 UI 味道」：灰阶、细边框、12–13px、克制，**不要花哨、不要浓 AI 味**）：
-  - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（第三方 mcp-manager 的 CSS 可抄）。
+  - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（第三方 `@xxxyz/dsh-mcp-manager` 的 CSS 可抄）。
   - 每个角色一行：角色名（中文）+ 角色 id（等宽小字）+ 使命一句话；「模型」下拉；「思考强度」下拉。
   - 下拉用原生 `<select>` 即可（官方等价物 `Menu` 需要 ui-primitives，本包**不注入**它以降低失败面）。
     模型选项 value 用 `provider + '\u0000' + model` 不透明键，label 用 `provider / model`；
