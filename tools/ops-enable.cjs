@@ -44,16 +44,33 @@ const os = require('node:os');
 const LF = String.fromCharCode(10);
 const MARKER = '    configUpdateVersion: 1';
 
+/**
+ * shell 段的追加指引（走 dsh-ops 自己的公开扩展点 extraGuidance，lib/config.js 接受、
+ * lib/policy.js:64 把它拼到该段末尾 —— 不改它一行源码）。
+ *
+ * 为什么需要：ops 的 shell 段会写「Prefer bash for command execution … do not switch
+ * shells」（lib/policy.js:61），与本团队 preset 给每个 agent 装的 persistent-pwsh
+ * （presets/dispatch-mode.patch.yml:114-126）矛盾，模型会在两个执行器之间摇摆。
+ * 上一版的处理是干脆不开 ops_bash（publishBashTool: false）—— 那等于少一个工具。
+ * 现在开工具 + 用官方扩展点把口径说清：默认仍是持久 PowerShell，ops_bash 只用于
+ * 一次性 POSIX 命令。实测（shell 组件真挂载 + 生产同形的 assemble 上下文）：
+ * ops_bash 可见，且这段文字确实出现在 shell 段末尾。
+ */
+const SHELL_OVERRIDE_TEXT = 'OPS-TEAM OVERRIDE: persistent PowerShell (pwsh) is this team\'s default command executor. '
+  + 'Use ops_bash for one-shot POSIX commands only; do not rewrite PowerShell scripts as bash.';
+const SHELL_GUIDANCE = '    extraGuidance: ' + JSON.stringify(SHELL_OVERRIDE_TEXT);
+
 /** 四行的完整文本（background 的 bashPath 由 rowLines 按需插入）。 */
 const ROWS = [
   { id: 'dsh-ops-shell', lines: [
-    '- id: dsh-ops-shell',
+    '- id: ' + 'dsh-ops-shell',
     '  disabled: false',
     '  config:',
     '    promptPolicy: true',
-    '    publishBashTool: false',
+    '    publishBashTool: true',
     '    shellPolicy: advise',
     '    allowSystemShellFallback: false',
+    SHELL_GUIDANCE,
     MARKER,
   ] },
   { id: 'dsh-ops-file', lines: [
@@ -177,26 +194,35 @@ function plan(text, options) {
       flipped.push(row.id);
       continue;
     }
-    // 已启用：检查该补的键是否齐（老 profile、崩溃恢复后重写会缺）。
-    const missingKeys = [];
-    if (row.id !== 'dsh-ops-ptc' && !body.some((line) => line.trim() === 'configUpdateVersion: 1')) missingKeys.push(MARKER);
-    if (row.id === 'dsh-ops-background' && bashPath !== null && !body.some((line) => line.trim().startsWith('bashPath:'))) {
-      missingKeys.push('    bashPath: ' + JSON.stringify(bashPath));
-    }
-    if (missingKeys.length === 0) { kept.push(row.id); continue; }
+    // 已启用：把这一行的 config 与 ROWS（唯一真值）**逐键对齐**。
+    // 只检查个别键是不够的 —— 上一版就因此对真 profile 报「齐备」，而 shell 行的
+    // publishBashTool 还停在 false（ROWS 改了、已有 profile 不收敛 = 静默失真）。
+    // 语义：这四行归本工具所有，所以期望键值不同时**就地改写**；用户自己加的其它键不动。
+    const wanted = rowLines(row, bashPath).filter((line) => /^\s{4}\S/.test(line));
+    const changes = [];
     working = working.slice();
-    // 追加到该块 config: 段的末尾（都是 4 空格缩进的键，YAML 合法）。
-    const cfgAt = body.findIndex((line) => /^\s*config:\s*$/u.test(line));
-    let insertAt = block.end;
-    if (cfgAt >= 0) {
-      let last = block.start + cfgAt;
-      for (let i = block.start + cfgAt + 1; i <= block.end; i += 1) {
-        if (/^\s{4}\S/.test(working[i])) last = i;
+    const keyOf = (line) => { const m = /^\s+(\S+?):\s*/.exec(line); return m === null ? null : m[1]; };
+    for (const want of wanted) {
+      const key = keyOf(want);
+      if (key === null) continue;
+      // 重新定位块尾（上一轮可能已经插过行）。
+      const blocksNow = splitRows(working);
+      const now = blocksNow.find((entry) => entry.id === row.id);
+      if (now === undefined) break;
+      const at = working.findIndex((line, index) => index >= now.start && index <= now.end && keyOf(line) === key);
+      if (at >= 0) {
+        if (working[at] !== want) { working[at] = want; changes.push(key); }
+      } else {
+        let insertAt = now.end;
+        for (let i = now.end; i > now.start; i -= 1) {
+          if (/^\s{4}\S/.test(working[i - 1])) { insertAt = i; break; }
+        }
+        working.splice(insertAt, 0, want);
+        changes.push(key);
       }
-      insertAt = last;
     }
-    working.splice(insertAt + 1, 0, ...missingKeys);
-    patched.push(row.id);
+    if (changes.length === 0) { kept.push(row.id); continue; }
+    patched.push(row.id + '(' + changes.join('+') + ')');
   }
   const missing = IDS.filter((id) => !blocks.some((entry) => entry.id === id));
   if (missing.length === 0) {
@@ -259,4 +285,4 @@ function main() {
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER };
+module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT };

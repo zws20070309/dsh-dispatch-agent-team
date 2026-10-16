@@ -1656,6 +1656,26 @@ async function main() {
       return true;
     });
 
+    check('ops-enable.plan() 逐键收敛：已有行里 publishBashTool:false 会被改成 true 并补 extraGuidance/bashPath', () => {
+      const LF2 = String.fromCharCode(10);
+      const stale = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
+        '    publishBashTool: false', '    shellPolicy: advise', '    allowSystemShellFallback: false',
+        '    configUpdateVersion: 1', '', '- id: dsh-ops-background', '  disabled: false', '  config:',
+        '    enableShellTools: true', '    allowSystemShellFallback: true', '    configUpdateVersion: 1', ''].join(LF2);
+      const once = planEnable(stale, { bashPath: 'C:/Fake/git/bin/bash.exe' });
+      if (once.patched.length !== 2) return '两行都该收敛，实得 ' + JSON.stringify(once.patched);
+      if (once.text.indexOf('publishBashTool: true') < 0) return 'publishBashTool 没被改成 true（ROWS 改了但 profile 不收敛 = 静默失真）';
+      if (once.text.indexOf('extraGuidance') < 0) return '没补 extraGuidance（ops_bash 的冲突口径就没人说了）';
+      if (once.text.indexOf('bashPath') < 0) return 'background 行没补 bashPath';
+      const twice = planEnable(once.text, { bashPath: 'C:/Fake/git/bin/bash.exe' });
+      if (twice.patched.length + twice.flipped.length + twice.appended.length !== 0) {
+        return '第二遍仍有动作 = 不幂等（每次启动都重写 profile）：' + JSON.stringify([twice.patched, twice.flipped, twice.appended]);
+      }
+      // 别人的行不许动
+      if (once.text.indexOf('shellPolicy: advise') < 0) return '改写了不该碰的键';
+      return true;
+    });
+
     check('ops-enable.plan() 对**真** profile 的判断与 drift-check 一致（本机交付态）', () => {
       // realFs 已在 §7.11 开头声明
       const candidates = [process.env.DSH_PROFILE_DIR,
