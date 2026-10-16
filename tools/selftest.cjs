@@ -2411,6 +2411,12 @@ function functionBodyOf(source, needle) {
     assert.ok(enableSrc.includes('--revert') && enableSrc.includes('pre-ops-enable'), 'ops-enable 必须可还原且写前备份');
     const driftSrc = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
     assert.ok(driftSrc.includes("require('./ops-enable.cjs')"), 'drift-check 必须复用 ops-enable 的 plan()（两处各写一份正则就会各自漂）');
+    for (const listFile of ['repair.cjs', 'sync-to-dsh.cjs']) {
+      const listSrc = readFileSync(path.join(__dirname, '..', 'tools', listFile), 'utf8');
+      assert.ok(listSrc.includes("'tools/ops-enable.cjs'"), listFile + ' 的文件清单必须含 ops-enable.cjs（漏了 = 装到别人机器上没这条修复命令）');
+      assert.ok(listSrc.includes("'tools/ops-ptc-both.cjs'"), listFile + ' 的文件清单必须含 ops-ptc-both.cjs（漏了 = PTC 放宽补丁没法施加）');
+      assert.ok(!listSrc.includes("'lib/ops-coexist.js'"), listFile + ' 不得再列已删除的 ops-coexist.js');
+    }
     // ③ PTC 补丁脚本：三态判定 + 拒绝盲改 + 可还原。
     const ptcSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-ptc-both.cjs'), 'utf8');
     assert.ok(ptcSrc.includes("function ptcPresentation(assembly)"), 'ops-ptc-both 必须有三态判定 ptcPresentation');
