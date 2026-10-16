@@ -47,7 +47,7 @@
    const keys = Object.keys(tools).filter(k => k.startsWith("ops_")).sort(); return JSON.stringify({n: keys.length, keys, hasSubagent: Object.keys(tools).includes("subagent")});
    把原文贴回来。我要数 ops_* 到底几个、有没有 subagent。
 
-4. 验我的预言（这条最重要，请如实报，不要为了顺着我而改写）：
+4. 复验一条我已经实测过的预言（请独立再验一次，如实报，不要为了顺着我而改写）：
    让 scout-ops3 直调 subagent 工具，派一个最简单的子任务（例如 prompt: "只回复四个字：子代理成功"）。
    把**完整返回或报错原文**贴回来，一个字都别改。
    我的预言是：它会**失败**，报的是深度上限那一类错误（官方原文形状：`subagent depth 2 exceeds maxDepth 1`），而不是真的派出一个子代理。
@@ -81,3 +81,26 @@ Q3：第 4 条我的预言成立还是被推翻？
 1. `resume` **会真写盘**，所以只允许在队员自己 cwd 下 copy 出一个带 `r3-probe` 名字的新文件，做完必须 `remove` 掉。
 2. `ops_replace` 一律带 `dryRun: true`，不许真改任何现有文件。
 3. 第 4 条派子代理是**故意**要它失败的一次；如果它真起来了，让它自然结束，不要递归再派。
+
+---
+
+## 附：第 4 条我已经自己复现过一次（15:41，不占你的测试）
+
+我（深度 0）用 `subagent` 派出一名深度 1 的子代理，让它在 run_code 里再调 `tools.subagent`（= 深度 2），
+要求它原样贴回返回值。实测结果逐字：
+
+```
+{ "outcome": "FAILED", "message": "subagent depth 2 exceeds maxDepth 1" }
+```
+
+与官方 `resolveChildDepth` 的抛出形状（`subagent depth ${attemptedDepth} exceeds maxDepth ${maxDepth}`）
+完全一致，`maxDepth` 生效值确实是 **1** —— 所以我上一轮那句「不是权限洞」从**推断**升级为**实测事实**：
+队员清单里那个 `subagent` 用不了，代价只是误导模型 + 白烧 token。
+
+**为什么还要你测一遍**：我那名子代理是 `subagent` 工具派出来的，而你的队员是 `spawn_teammate` 派出来的
+—— 两者深度都是 1（我读过 scout-ops2 的 `session.delegationDepth=1`），走的也是同一个深度守卫，
+但**派生路径不同**。所以第 4 条是对「队员这条路径」的直接确认，不是重复劳动。
+
+顺带一个我自己踩到的事实：我是纯 PTC 档，所以刚才**直调 `subagent` 也被拒**
+（`unknown tool "subagent": only run_code is callable directly`）—— 必须放进 run_code 里调。
+这正是本轮修掉的那句文案问题，现场又演示了一遍。
