@@ -94,8 +94,22 @@ cd <本插件目录>   # 例：git clone 出来的 dsh-dispatch-agent-team
 node tools/ops-mount-check.mjs
 ```
 
-它挂真 dsh-ops 组件 + 真宿主注册表跑 A/B/C/D 四段。今天最后一次实测结果：
+它挂真 dsh-ops 组件 + 真宿主注册表跑 A/B/C/D 四段（组件一行都不改，是装机那份原版）。2026-10-16 12:26 最后一次实测：
 `总体：通过（A 交付态，B 负对照成立，C 后台任务实测，D shell 实测）`
-—— A 段纯 PTC 档可见 `ops_batch`+`ops_result`；B 段同一份原版组件 both 档为空；C 段真起后台任务（job `j-vhs04r`，并**真调用**了一次）；D 段 `ops_bash` 已发布、口径覆盖文字确实进段。
+
+| 段 | 实测到什么 |
+|---|---|
+| A | 纯 PTC 档队员的**可见层**有 `ops_batch`+`ops_result`；并**真调一次** `ops_batch(action=plan)` → `id=j-3d5a8663… / failed=0 / logicalBytes=2163`。事后核对目标文件**没被创建**、worker 写的审计存根里 `state:"pending"` ⇒ plan 确属无副作用 |
+| B | 同一份原版组件，只差呈现档：ptc 档拿到两个、both 档拿到空 ⇒ 因果就在本包能配的「预设 ptc + 关批量调用」上 |
+| C | 真起 FastCtx 服务器 + **真调一次** `ops_run_background`（发布 ≠ 可用，bashPath 指到 Git bash） |
+| D | `ops_bash` 已发布，且 ops 原文「Prefer bash…」与本包的口径覆盖文字同时进段 |
+
+### 两个已知无害现象（别当 bug）
+
+1. 那次 plan 会在插件根目录生成 `.dsh-ops/`（dsh-ops 原生 worker 自己的 job manifest 存根，
+   `state:"pending"`、不落业务数据）—— 已进 `.gitignore`，是正常的审计产物。
+2. 插件页关掉再打开某个组件只重写 `disabled` 那一键，我们配的 `configUpdateVersion` / `bashPath` /
+   `extraGuidance` 会留着（模拟过官方 `writePluginEnabled` 的往返）。
+3. profile 目录里那几个 `.bak-*-pre-ops-enable` 是改 profile 前的备份，要不要清由你决定。
 
 另有 `.probe/preset-order-probe.mjs <队员id前缀>` 直读那名队员的日志。它对**纯 PTC 档会明确打印「这份日志判不了」**（wire 被裁成一个 run_code，见上），这是本轮刚修的一个误判点：以前它会谎报「ops 工具 = (无)」。
