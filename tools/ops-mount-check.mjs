@@ -168,6 +168,33 @@ const FILE_TOOLS = ['ops_inspect_local_file', 'ops_grep', 'ops_glob', 'ops_repla
 const OPS_ENABLE = createRequire(path.join(PLUGIN, 'tools', 'x.js'))('./ops-enable.cjs');
 const OPS_TEAM_SHELL_GUIDANCE = OPS_ENABLE.SHELL_OVERRIDE_TEXT;
 
+/**
+ * 把 ops-enable ROWS 里某一行的 config 解析成对象 —— **生产写什么，这里就挂什么**。
+ * 只认 4 空格缩进的 key: value 行；值支持 true/false/数字/带引号字符串/裸字符串。
+ * @param id - ROWS 里的行 id。
+ * @returns 配置对象（id 不存在时抛错：宁可测试崩，也不许静默用另一份配置）。
+ */
+function rowConfigOf(id) {
+  const row = OPS_ENABLE.ROWS.find((entry) => entry.id === id);
+  if (row === undefined) throw new Error('ops-enable ROWS 里没有 ' + id);
+  const bashPath = OPS_ENABLE.detectBash();
+  const out = {};
+  for (const line of OPS_ENABLE.rowLines(row, bashPath)) {
+    const m = /^\s{4}(\S+?):\s*(.*)$/u.exec(line);
+    if (m === null) continue;
+    const raw = m[2].trim();
+    let value;
+    if (raw === 'true') value = true;
+    else if (raw === 'false') value = false;
+    else if (/^-?\d+(\.\d+)?$/.test(raw)) value = Number(raw);
+    else if (raw.length > 1 && raw[0] === '"' && raw[raw.length - 1] === '"') value = JSON.parse(raw);
+    else value = raw;
+    out[m[1]] = value;
+  }
+  return out;
+}
+
+
 const declared = new Map();
 
 async function report(root, agent, label) {
@@ -370,16 +397,17 @@ say('');
 say('D) shell 组件（ops_bash + extraGuidance）：');
 let okD = null;
 try {
-  const shellBash = OPS_ENABLE.detectBash();
+  // 配置**必须来自 ROWS**，不许在这里手写 —— 2026-10-16 真机 P0 的根因就是这里手写了一份：
+  // 上一版 D 段自己塞了 `bashPath: detectBash()`，而生产 profile 的 shell 行**没有** bashPath，
+  // 于是真机上 resolveShells 解析不到 bash（@dsh-ops/bash-win32-x64 没装、fallback 我们又刻意
+  // 关成 false）→ ops_bash 从来没发布（Lead 与两名队员的 wire 里都没有它，状态文件 visibleTools
+  // 也只有 file 四件套），D 段照样打 ✓ —— 典型的「测试比生产多给一个键」造成的假绿灯。
+  // 现在两边同源：生产写什么，这里就挂什么（ROWS 是唯一真值）。
+  const shellRowConfig = rowConfigOf('dsh-ops-shell');
+  say('  shell 行配置（与 ops-enable ROWS 同源）= ' + JSON.stringify(shellRowConfig));
   const rootD = await makeRoot();
   const shellComp = await import(opsFile('lib/components/shell/index.js'));
-  shellComp.apply(rootD, {
-    promptPolicy: true, publishBashTool: true, shellPolicy: 'advise',
-    allowSystemShellFallback: shellBash === null,
-    ...(shellBash === null ? {} : { bashPath: shellBash }),
-    extraGuidance: OPS_TEAM_SHELL_GUIDANCE,
-    configUpdateVersion: 1,
-  });
+  shellComp.apply(rootD, shellRowConfig);
   await tick(12);
   const mateD = await makeMember(rootD, 'mate-shell', 'both');
   const seenD = [...rootD.get('tools').view(mateD).visible.keys()];
