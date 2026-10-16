@@ -154,7 +154,13 @@ scout-qa 若 2.1 直调成功 = 原生工具可直调；researcher-qa 若 3.2 �
    修法：runtime 记「真的合进请求对象的那份路由」（唯一写入点 noteAppliedRoute，
    覆盖失败退回原配置的那一支**不记**），list_agents 用 annotateMemberModels 只改写
    **已有的** model 字段（不新增字段 = 不动 Lead 的工具目录 = 不动缓存前缀），
-   并断言校正后的行仍过官方返回值校验器。前端画布不受影响（lib/graph.js 的 model
+    并断言校正后的行仍过官方返回值校验器。
+    **画布的边界（我先前写成「不受影响」是过度声明，这里改准）**：lib/graph.js 的节点 model 是
+    `s.model ?? meta?.model`（:536）—— `s.model` 来自该队员自己日志里的 request/context /
+    model/selection 事件（= 真模型；本轮两名队员的日志里都确有 request/context，seq14，
+    model=provider-b/model-b，所以走的是 s.model 这一支），`meta` 就是 listMembers 那一行（:580），也就是**继承来的那份**。
+    所以准确说法是：画布通常对，但当那名队员的日志读不到 model 事件时，它会退到同一个错来源。
+    本轮修的是 Lead 的 list_agents；画布那条退层级没动（要动就是改 graph，不在这次范围）。
    本来就优先取 request/context 的真值）。
    **生效时机（别当成没修好）**：账本落在 `agent/request` 拦截器里（lib/runtime.js 的
    installRouteOverride），也就是**这名队员真的发出第一个请求**之后才有；annotateMemberModels
