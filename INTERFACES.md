@@ -697,7 +697,14 @@ ops-enable --check 退化成只看两个键（M17，就是那次假绿灯的成�
 
 本机离线端到端验收（不需要重启 DSH）：`node tools/ops-mount-check.mjs` —— 四个**互相独立**的
 真 Context（共用一个 root 会互相抢注，第一版就是这么把负对照搞失效的）。A 挂**原版未改**的 file+PTC 组件
-（纯 PTC 档队员的**可见层**拿到 `ops_batch/ops_result`、批量档队员没有），
+（纯 PTC 档队员的**可见层**拿到 `ops_batch/ops_result`、批量档队员没有），并**真调一次** `ops_batch
+（action=plan，无副作用预检）` —— 可见 ≠ 可用，这一调同时穿过 execute 里的二次 ptcOnly 校验
+（装机 `lib/ptc/index.js:53`）。为此 makeRoot 的 subprocess 从「一律抛错」的替身改成按宿主契约
+（装机 `lib/ptc/worker.js:61-66`）真起进程，但**白名单只放行 dsh-ops 自己的原生 worker**，其余 argv
+照旧抛错 —— 探针不因此获得随便起进程的能力。实测 `id=j-3d5a8663… / failed=0 / logicalBytes=2163`，
+事后核对目标文件**没有被创建**、worker 写的审计存根里 `state:"pending"`（确属无副作用）。
+plan 的判据读**结构化字段**（status/failed/unknown/error.code），不拿 "error" 子串硬匹配 —— 成功的
+plan 里 `error:null` 也会被子串命中（第一版就是这么假红的）。
 B 同一份组件只差呈现档做负对照（ptc 拿到 / both 拿不到 ⇒ 因果在本包能配的那一项上），
 C 真起 FastCtx 服务器验证四个 job 工具确实发布，并**真调一次** `ops_run_background`（发布 ≠ 可用），
 D shell 组件：`ops_bash` 已发布，且 ops 原文「Prefer bash…」与本包的 OVERRIDE 同时进段。

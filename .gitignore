@@ -37,3 +37,6 @@ MAINTAINER-NOTES.md
 /docs/reviews/
 # NVIDIA 驱动日志残留（进程 cwd 落在本目录时会自动生成）
 /NVIDIA Corporation/
+# ops_batch 的审计存根：dsh-ops 原生 worker 自己写的 job manifest，由
+# tools/ops-mount-check.mjs A 段那次无副作用 plan 产生（state 一直是 pending，不落业务数据）
+/.dsh-ops/
