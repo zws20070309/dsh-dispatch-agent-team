@@ -559,6 +559,27 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
         + '修法：node tools/ops-enable.cjs 后重启 DSH。';
     }
   }
+  // bashPath（条件闸门）：没有 Git bash 的机器不该误报，但写了就必须存在 ——
+  // 一个指向不存在文件的 bashPath 比没有更糟（ops 会直接 available:false，四个 job 工具消失）。
+  {
+    const { detectBash } = require('./ops-enable.cjs');
+    const found = detectBash();
+    const bgBlock = blockOf('dsh-ops-background');
+    const declared = /bashPath:\s*(\S.*)$/m.exec(bgBlock);
+    if (found !== null && declared === null) {
+      return '本机探测到可用 bash（' + found + '）但 profile 的 dsh-ops-background 行没有 bashPath：'
+        + 'PATH 兜底会选中 WindowsApps 的 WSL 启动器（dsh-ops 只排除 System32 那个，lib/shells.js:481-487），'
+        + 'FastCtx 实测拒绝执行。修法：node tools/ops-enable.cjs 后重启 DSH。';
+    }
+    if (declared !== null) {
+      const raw = declared[1].trim().replace(/^["']|["']$/g, '');
+      if (!fs.existsSync(raw)) {
+        return 'profile 的 dsh-ops-background 行写了 bashPath 但那个文件不存在：' + raw
+          + ' —— ops 会解析成 available:false，四个 job 工具全部消失。删掉这一行或改成真实路径，然后重启。';
+      }
+    }
+  }
+
   if (blockOf('dsh-ops-background').indexOf('allowSystemShellFallback: true') < 0) {
     return 'profile 的 dsh-ops-background 行没有 allowSystemShellFallback: true —— 它的发布门要 bash 可解析'
       + '（dsh-ops lib/tools.js:311-316），本机没装 @dsh-ops/bash-win32-x64，缺这一条那四个 job 工具一个都不出。';
@@ -595,26 +616,19 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   ]) {
     if (!policy.includes(needle)) return `dsh-ops ${version} 的 ${what} 与本包适配层的名单不一致（OPS_TOOL_NAMES 需要重核）`;
   }
-  // PTC 组件的注册门：必须是本仓库 tools/ops-ptc-both.cjs 放宽后的形状（ptc + both）。
+  // 本包**不改 dsh-ops 的源码**（用户 2026-10-15 明令）。这里只核对两件事：
+  // ① 装机那份的注册门仍是原版形状（只认纯 ptc）—— 若哪天它变了，本包的
+  //    「预设 ptc + 关批量档 = 拿到 ops_batch/ops_result」这条杠杆的说明就要重核；
+  // ② 宿主侧的装配段名没漂（本包判断呈现档只用这两个公开段名）。
   const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
-  // needle 与 lib/ops-adapter.js 的 ptcGateState 用**同一串**（selftest 有交叉闸门钉住，
-  // 免得两处各写一份、其中一份漂了就出现「drift 绿而运行时判 pristine」）。
-  if (!ptcIndex.includes('function ptcPresentation(')) {
-    return `dsh-ops ${version} 的 PTC 组件注册门仍是原版（只认纯 ptc）：调度模式的队员默认是批量调用档（both），` +
-      + '拿不到 ops_batch / ops_result。修法：node tools/ops-ptc-both.cjs 然后重启 DSH。';
+  if (!ptcIndex.includes("assembly.tools.length === 1 && assembly.tools[0].name === 'run_code'")) {
+    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（只认纯 ptc 那条判据没找到）：' 
+      + '本包 INTERFACES §3.8 与 lib/ops-adapter.js 里「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
   }
-  if (!ptcIndex.includes("'tools:sdk'") || !ptcIndex.includes("'tools:ptc-only'")) {
-    return `dsh-ops ${version} 的 PTC 门不再只用公开装配段判定：适配层需要按新版重核（不许改用私有 modeFor/layers）`;
-  }
-  // 宿主侧的两条承重事实（放宽判据的依据）：both 的 wireSchemas 含全部工具 + run_code；
-  // tools:sdk 在 mode !== native 时注册、tools:ptc-only 只在 ptc 时非空。
   const toolsSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
-  if (toolsSrc === '') return '读不到 app.asar 里的 dsh-tools：无法验证 both 档的装配事实（PTC 门的判据依据）';
-  if (!/knownNames:\s*\[\.\.\.view\.knownNames,\s*RUN_CODE_NAME\]/.test(toolsSrc)) {
-    return '宿主 dsh-tools 的 both 分支不再返回「全部已知工具 + run_code」：PTC 放宽补丁的判据需要重核';
-  }
+  if (toolsSrc === '') return '读不到 app.asar 里的 dsh-tools：无法验证呈现档的装配段名';
   if (!/name:\s*"tools:sdk"/.test(toolsSrc) || !/name:\s*"tools:ptc-only"/.test(toolsSrc)) {
-    return '宿主 dsh-tools 的两个装配段名变了（tools:sdk / tools:ptc-only）：PTC 放宽补丁的判据需要重核';
+    return '宿主 dsh-tools 的装配段名变了（tools:sdk / tools:ptc-only）：本包按呈现档给的指引与检测判据需要重核';
   }
   return true;
 });

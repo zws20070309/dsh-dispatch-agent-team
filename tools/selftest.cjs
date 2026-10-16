@@ -23,7 +23,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { readFileSync, existsSync } = require('node:fs');
+const { readFileSync, existsSync, readdirSync } = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -2365,10 +2365,10 @@ function functionBodyOf(source, needle) {
     assert.ok(indexSrc.includes('healManagedBlock'), 'lib/index.js 必须调用 healManagedBlock（否则自愈形同虚设）');
   });
 
-  await check('dsh-ops 原生链接（2026-10-15 改版）：内嵌 ops 已删干净，适配层与 PTC 补丁就位', () => {
+  await check('dsh-ops 原生链接（2026-10-15 改版）：内嵌 ops 已删干净，且本包不含任何改 ops 源码的东西', () => {
     // 用户 2026-10-15 的要求：不再内嵌 —— 两插件各自安装各自启用，本包检测到 ops 就用它的工具。
     // 闸门两头都要盯：① 旧内嵌形态的任何残留（vendor/ops-file/ops-coexist）不得复活；
-    // ② 新适配层（lib/ops-adapter.js + tools/ops-ptc-both.cjs）必须齐备且接线。
+    // ② 新适配层（lib/ops-adapter.js + tools/ops-enable.cjs + tools/ops-mount-check.mjs）齐备且接线；
     const patch = readFileSync(path.join(__dirname, '..', 'cordis.patch.yml'), 'utf8');
     assert.ok(!/^-\s*id:\s*ops-file\s*$/m.test(patch) && !/dsh-dispatch-agent-team\/ops-file/.test(patch),
       'cordis.patch.yml 不得再有本包自带的 ops-file 组件行（内嵌已按用户要求删除）');
@@ -2402,6 +2402,28 @@ function functionBodyOf(source, needle) {
     assert.ok(runtimeSrc.includes('linkOpsForMember(ctx, scoped, agent, notes, disposers)'),
       'installMember 必须给每名队员接 ops 链接（Lead 不接：那是用户主会话，ops 自己全局可见）');
 
+    // ②a 纪律闸门（用户 2026-10-15 明令「别改 ops 的源码」）：本仓库不得再出现任何
+    //     修改 dsh-ops 包内文件的工具、判据字面或备份痕迹。适配只能发生在本包这一侧。
+    const repoFiles = [];
+    (function collect(dir, depth) {
+      if (depth > 3) return;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (['node_modules', '.git', '.probe-tmp', '%SystemDrive%', 'NVIDIA Corporation'].includes(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { collect(full, depth + 1); continue; }
+        if (/\.(js|cjs|mjs|json|yml|md)$/.test(entry.name)) repoFiles.push(full);
+      }
+    })(path.join(__dirname, '..'), 0);
+    // needle 用拼接写：这个闸门文件本身不该被自己的字面量命中。
+    const FORBIDDEN = ['ops' + '-ptc-both', 'ptc' + 'Presentation', 'pre-' + 'ptc-both'];
+    const offenders = [];
+    for (const file of repoFiles) {
+      const text = readFileSync(file, 'utf8');
+      for (const needle of FORBIDDEN) {
+        if (text.includes(needle)) offenders.push(path.relative(path.join(__dirname, '..'), file) + ' 含 ' + needle);
+      }
+    }
+    assert.deepEqual(offenders, [], '本仓库不得含修改 dsh-ops 源码的东西（适配只在本包这一侧）：' + offenders.join(' ; '));
     // ②b profile 启用工具：四行钉 disabled:false，且 drift-check 复用它的 plan()（单一真值）。
     const enableSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-enable.cjs'), 'utf8');
     assert.ok(enableSrc.includes('module.exports = { plan, splitRows'), 'ops-enable.cjs 必须导出 plan/splitRows（drift-check 要复用同一份判据）');
@@ -2409,16 +2431,16 @@ function functionBodyOf(source, needle) {
       assert.ok(enableSrc.includes("id: '" + id + "'"), 'ops-enable 的 ROWS 必须覆盖 ' + id);
     }
     assert.ok(enableSrc.includes('--revert') && enableSrc.includes('pre-ops-enable'), 'ops-enable 必须可还原且写前备份');
-    // 补丁生效判据只有一份字面：adapter 的 ptcGateState 与 drift-check 10g 必须同串。
-    const GATE_NEEDLE = 'function ptcPresentation(';
-    assert.ok(adapterSrc.includes(GATE_NEEDLE), 'ops-adapter 的 ptcGateState 必须用 ' + GATE_NEEDLE + ' 当判据');
-    const driftSrcHere = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
-    assert.ok(driftSrcHere.includes("includes('" + GATE_NEEDLE + "')"), 'drift-check 必须用与 adapter 同一串判据（否则 drift 绿而运行时判 pristine）');
     // 迁移标记（P1）：ops 的 updatedConfig 会把无标记行的 allowSystemShellFallback 翻成 false 并写回。
     const enableRows = enableSrc.slice(enableSrc.indexOf('const ROWS = ['));
     const rowBlockOf = (id) => { const at = enableRows.indexOf("id: '" + id + "'"); return at < 0 ? '' : enableRows.slice(at, at + 600); };
+    // 标记在实现里是一个共享常量 MARKER（单一真值），所以这里既认常量引用也认字面量。
+    assert.ok(enableSrc.includes("const MARKER = '    configUpdateVersion: 1'"),
+      'ops-enable 必须把迁移标记定义成共享常量 MARKER（值 = 四个空格 + configUpdateVersion: 1）');
     for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background']) {
-      assert.ok(rowBlockOf(id).includes('configUpdateVersion: 1'), 'ops-enable 的 ' + id + ' 行必须带 configUpdateVersion: 1（否则 ops 迁移会改写这一行）');
+      const block = rowBlockOf(id);
+      assert.ok(block.includes('MARKER,') || block.includes('configUpdateVersion: 1'),
+        'ops-enable 的 ' + id + ' 行必须带 configUpdateVersion 标记（否则 ops 迁移会改写这一行）');
     }
     assert.ok(!rowBlockOf('dsh-ops-ptc').slice(0, 300).includes('configUpdateVersion'), 'ops-enable 的 ptc 行不得带 configUpdateVersion（resolvePtcConfig 会抛 Unknown PTC config key）');
     assert.ok(rowBlockOf('dsh-ops-background').includes('allowSystemShellFallback: true'), 'ops-enable 的 background 行必须 allowSystemShellFallback: true（job 工具的发布门）');
@@ -2427,17 +2449,9 @@ function functionBodyOf(source, needle) {
     for (const listFile of ['repair.cjs', 'sync-to-dsh.cjs']) {
       const listSrc = readFileSync(path.join(__dirname, '..', 'tools', listFile), 'utf8');
       assert.ok(listSrc.includes("'tools/ops-enable.cjs'"), listFile + ' 的文件清单必须含 ops-enable.cjs（漏了 = 装到别人机器上没这条修复命令）');
-      assert.ok(listSrc.includes("'tools/ops-ptc-both.cjs'"), listFile + ' 的文件清单必须含 ops-ptc-both.cjs（漏了 = PTC 放宽补丁没法施加）');
       assert.ok(!listSrc.includes("'lib/ops-coexist.js'"), listFile + ' 不得再列已删除的 ops-coexist.js');
       assert.ok(listSrc.includes("'tools/ops-mount-check.mjs'"), listFile + ' 的文件清单必须含 ops-mount-check.mjs（离线验收工具要能随包分发）');
     }
-    // ③ PTC 补丁脚本：三态判定 + 拒绝盲改 + 可还原。
-    const ptcSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-ptc-both.cjs'), 'utf8');
-    assert.ok(ptcSrc.includes("function ptcPresentation(assembly)"), 'ops-ptc-both 必须有三态判定 ptcPresentation');
-    assert.ok(ptcSrc.includes("tools:ptc-only") && ptcSrc.includes('tools:sdk'),
-      '判定必须只用公开装配段（tools:ptc-only / tools:sdk），不碰 modeFor/layers 私有面');
-    assert.ok(ptcSrc.includes("'unknown-shape'"), '形状不匹配时必须拒绝盲改（unknown-shape）');
-    assert.ok(ptcSrc.includes('--revert'), '必须能还原成原版');
   });
   await check('托管块结构（2026-10-10 P0）：块必须在文件开头，且切片重写不得吞掉哨兵区内的外来行', async () => {
     // 用户 2026-10-10 报障的根因（已用真实 profile 复现）：托管块原本 append 在**文件末尾**，

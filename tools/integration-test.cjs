@@ -1367,15 +1367,20 @@ async function main() {
     await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
 
   }
-  // ── 7.11) ops 原生链接（2026-10-15 改版）：真装配事实 × 装机 dsh-ops 的**真**门函数 ──
+  // ── 7.11) ops 原生链接（2026-10-15 改版）：真装配事实 × 本包的合法杠杆 ──
   //
-  // 为什么这一节必须存在：整次交付的赌注是「both 档队员能拿到 ops_batch / ops_result」。
-  // 那条判定住在 dsh-ops 的 lib/ptc/index.js 里，而它读的是宿主 systemPrompt.assemble 的
-  // 公开返回值。所以这里做三件事：① 用真台架产出 native / ptc / both 三份真实装配；
-  // ② 把**装机那份文件里的 ptcPresentation 源码原文**抠出来执行（不是我在测试里重写的
-  // 等价物 —— 那测的是我自己），逐档核对判定；③ 负对照：run_code 单独出现但没有任何
-  // PTC 段时必须判 native（防门被放到过宽，让原生档队员也吃到批量工具）。
+  // 为什么这一节必须存在：交付要求「有 ops 就把它的四个组件的工具用起来」，而 ops 的 PTC
+  // 组件只服务**纯 PTC 呈现档**（dsh-ops lib/ptc/index.js:16-22 要求装配工具恰好只有 run_code）。
+  // 用户明令**不改 ops 源码**，所以适配只能在本包这一侧：角色预设 ptc + 关掉批量档 = 纯 PTC 档。
+  // 这里做三件事：① 用真台架产出 native / ptc / both 三份真实装配，把原版门的判据来源钉死；
+  // ② 走真安装路径证明那条杠杆确实产出「只有 run_code」的形状（含对照：批量档开着就不是）；
+  // ③ 检测层如实报告缺席并给出本包侧修法（两个负对照：拿得到时不催、PTC 关掉时不催）。
   {
+    // 下面几段要碰真实文件系统（临时 profile 夹具）与真 profile：用 require 的 fs/os，
+    // 不要用本文件上面那个被测试隔离改写过的 process.env.DSH_HOME。
+    const realFs = require('node:fs');
+    const realOs = require('node:os');
+
     // ops_* 由第三方插件注册。这里注册进**各自作用域自己的层**而不是全局层：
     // 全局层一旦多出两个工具，本文件后面的路由/缓存断言就不是原来的面了。
     const opsNativeKey = { name: 'ops-native-mate' };
@@ -1402,7 +1407,11 @@ async function main() {
       return String(hit.text).trim() === '' ? 'empty' : 'non-empty';
     };
 
-    check('三档装配事实（PTC 门的判据来源）：both = 全部工具+run_code+非空 SDK 段；ptc = 只剩 run_code+非空 PTC_ONLY 段', () => {
+    // 三档装配事实 = 原版 PTC 门读的**同一份**公开判据（dsh-ops lib/ptc/index.js:16-22
+    // 要求装配工具恰好只有 run_code + tools:ptc-only 段非空）。本包不改 ops，
+    // 所以「拿得到 ops_batch/ops_result」这件事只能靠把角色配成纯 PTC 档来达成 ——
+    // 下面这两条先钉住宿主侧的事实，产品侧的杠杆由 §7.11 末尾那两条真安装路径断言负责。
+    check('三档装配事实（原版 PTC 门的判据来源）：ptc 只剩 run_code+非空 PTC_ONLY 段；both 是全部+run_code+SDK 段', () => {
       if (hasTool(asmNative, 'run_code')) return 'native 档不该有 run_code：' + asmNative.tools.map((tool) => tool.name).join(', ');
       if (!hasTool(asmNative, 'ops_grep')) return 'native 档看不到自己层里的 ops_grep';
       if (!hasTool(asmBoth, 'run_code')) return 'both 档没有 run_code：批量能力无从谈起';
@@ -1411,59 +1420,9 @@ async function main() {
       if (sectionState(asmBoth, 'tools:sdk') !== 'non-empty') return 'both 档没有非空 tools:sdk 段：' + sectionState(asmBoth, 'tools:sdk');
       if (sectionState(asmBoth, 'tools:ptc-only') === 'non-empty') return 'both 档出现了非空 PTC_ONLY 段（模型会被教成只能直调 run_code）';
       if (asmPtc.tools.length !== 1 || !hasTool(asmPtc, 'run_code')) return 'ptc 档没裁成一个 run_code：' + asmPtc.tools.map((tool) => tool.name).join(', ');
-      if (sectionState(asmPtc, 'tools:ptc-only') !== 'non-empty') return 'ptc 档的 PTC_ONLY 段是空的：门的另一半判据不成立';
+      if (sectionState(asmPtc, 'tools:ptc-only') !== 'non-empty') return 'ptc 档的 PTC_ONLY 段是空的：原版门的另一半判据不成立';
       return true;
     });
-
-    // 装机 dsh-ops 的**真**门函数。候选目录刻意不看 DSH_HOME（本文件已把它指向临时目录），
-    // 直接用真实 profile 布局 —— 验的就是用户机器上那一份文件。
-    const realFs = require('node:fs');
-    const realOs = require('node:os');
-    const opsCandidates = [process.env.DSH_PROFILE_DIR,
-      path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop'),
-      path.join(realOs.homedir(), '.dsh', 'profiles', 'web')].filter(Boolean);
-    let opsGateFile = null;
-    for (const dir of opsCandidates) {
-      const candidate = path.join(dir, 'node_modules', 'dsh-ops', 'lib', 'ptc', 'index.js');
-      if (realFs.existsSync(candidate)) { opsGateFile = candidate; break; }
-    }
-    let gate = null;
-    let gateNote = '';
-    let gateMissing = false;
-    if (opsGateFile === null) {
-      gateNote = '本机没有已安装的 dsh-ops（profiles/*/node_modules/dsh-ops 解析不到）：跳过真门函数核对';
-    } else {
-      const gateSrc = realFs.readFileSync(opsGateFile, 'utf8');
-      const fnMatch = /function ptcPresentation\(assembly\) \{[\s\S]*?\n\}/.exec(gateSrc);
-      if (fnMatch === null) { gateNote = '装机 dsh-ops 的 ptc/index.js 里没有 ptcPresentation（补丁没打上或版本变了）：' + opsGateFile; gateMissing = true; }
-      else gate = (new Function(fnMatch[0] + '; return ptcPresentation;'))();
-    }
-    if (gate === null) console.log('  SKIP  装机 dsh-ops 真门函数的三档判定（' + gateNote + '）');
-
-    check('装机 dsh-ops 的**真**门函数把三份装配各判对（native / both / ptc）', () => {
-      // 装了 ops 却没有 ptcPresentation = 真故障（补丁被升级冲掉），不许静默 PASS。
-      if (gateMissing) return gateNote;
-      if (gate === null) return true; // 本机没装 dsh-ops：不适用，且上面已打印 SKIP
-      const n = gate(asmNative); const b = gate(asmBoth); const pt = gate(asmPtc);
-      if (n !== 'native') return '真门函数把 native 装配判成 ' + n + '：原生档队员会被塞进批量工具';
-      if (b !== 'both') return '真门函数把 both 装配判成 ' + b + '：both 队员拿不到 ops_batch/ops_result（交付核心失败）';
-      if (pt !== 'ptc') return '真门函数把 ptc 装配判成 ' + pt + '：原版能力被改坏';
-      return true;
-    });
-
-    check('负对照：只有 run_code、没有任何 PTC 段的装配必须判 native（门没被放到过宽）', () => {
-      if (gateMissing) return gateNote;
-      if (gate === null) return true;
-      const bare = { tools: [{ name: 'run_code' }], sections: [] };
-      const verdict = gate(bare);
-      if (verdict !== 'native') return 'run_code 单独出现就判成 ' + verdict + '：任何有 run_code 的部署都会吃到批量工具';
-      const sdkOnly = { tools: [{ name: 'run_code' }], sections: [{ name: 'tools:sdk', text: 'x' }] };
-      if (gate(sdkOnly) !== 'both') return 'SDK 段在、PTC_ONLY 段不在时应判 both（这正是放宽的目的）：实得 ' + gate(sdkOnly);
-      const ptcOnlySection = { tools: [{ name: 'run_code' }], sections: [{ name: 'tools:ptc-only', text: 'x' }] };
-      if (gate(ptcOnlySection) !== 'ptc') return 'PTC_ONLY 段非空时应判 ptc：实得 ' + gate(ptcOnlySection);
-      return true;
-    });
-
     check('ptc 档下 ops_* 仍在 view 里（程序内可调用），只是不进 wire（不送给模型）', () => {
       const visible = [...root.get('tools').view(opsPtcKey).visible.keys()];
       if (!visible.includes('ops_grep')) return 'ptc 档的 view 里没有 ops_grep：run_code 程序里调不到它，适配的前提不成立';
@@ -1556,11 +1515,11 @@ async function main() {
     let opsMigrateNote = '';
     let opsMigrateBroken = false;
     {
-      // index.js 在 <pkg>/lib/ptc/ 下：往上三层才是包根（写错一次就变成 lib/lib/…）。
-      const gateDir = opsGateFile === null ? null : path.dirname(path.dirname(path.dirname(opsGateFile)));
-      if (gateDir === null) opsMigrateNote = '本机没有已安装的 dsh-ops：跳过迁移标记核对';
+      // 包根 = resolveOpsPackage() 给的 package.json 的目录（不靠字符串切路径）。
+      const opsPkg = adapter.resolveOpsPackage();
+      if (opsPkg === null) opsMigrateNote = '本机没有已安装的 dsh-ops：跳过迁移标记核对';
       else {
-        try { opsMigrate = await import(pathToFileURL(path.join(gateDir, 'lib', 'config-updates.js')).href); }
+        try { opsMigrate = await import(pathToFileURL(path.join(path.dirname(opsPkg.path), 'lib', 'config-updates.js')).href); }
         catch (error) { opsMigrateNote = '载入 dsh-ops 的 config-updates.js 失败：' + (error && error.message ? error.message : String(error)); opsMigrateBroken = true; }
       }
     }
@@ -1592,33 +1551,60 @@ async function main() {
       return true;
     });
 
-    // ptcGateState()：PTC 注册门的状态探测（别人装了原版 ops 时，检测要能点名 + 给修法）。
-    const gateFixture = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-gate-'));
-    tempDirs.push(gateFixture);
-    realFs.mkdirSync(path.join(gateFixture, 'lib', 'ptc'), { recursive: true });
-    realFs.writeFileSync(path.join(gateFixture, 'package.json'), '{"name":"dsh-ops","version":"0.0.0-fixture"}', 'utf8');
-    const gateFile = path.join(gateFixture, 'lib', 'ptc', 'index.js');
-    realFs.writeFileSync(gateFile, 'export function ptcPresentation(assembly) { return "both"; }\n', 'utf8');
-    const patchedSeen = adapter.ptcGateState(path.join(gateFixture, 'package.json'));
-    realFs.writeFileSync(gateFile, 'async function ptcOnly(ctx, agent) { return false }\n', 'utf8');
-    const pristineSeen = adapter.ptcGateState(path.join(gateFixture, 'package.json'));
-    const absentSeen = adapter.ptcGateState(path.join(gateFixture, 'nope', 'package.json'));
-    // 真机交付态：装机那份必须是 patched（否则本机队员拿不到批量工具）。
-    const realGate = opsGateFile === null ? 'absent' : adapter.ptcGateState(path.join(path.dirname(path.dirname(path.dirname(opsGateFile))), 'package.json'));
+    // 「预设 ptc + 关批量档 = 纯 PTC 档，于是原版 ops 给 ops_batch/ops_result」这条**合法杠杆**
+    // （用户明令不改 ops 源码，所以适配只能在本包这一侧）分两半证明，各在能证的地方：
+    //   * 本包负责的那半：batch:false 时**不覆盖**预设自己的呈现档 —— §7.10 的 mateG 已断言
+    //     （关掉批量的角色，wire 里没有 run_code，也就没有被本包改成 both）。
+    //   * 官方负责的那半：ptc 预设的作用域 wire 恰好只剩 run_code —— 那是
+    //     dsh-agent-tool-presentation 的行为，本文件的 preset 组合是 mock 的（没有真挂那一行），
+    //     所以**在这里证不了**；端到端证据在 tools/ops-mount-check.mjs（真挂原版 ops 的 PTC
+    //     组件，ptc 档拿到、both 档拿不到，两个独立 Context 各测一轮）。
+    // 这里只钉住台架能证的那半：两种角色配置下，本包对 wire 的影响符合预期。
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { preset: 'ptc', batch: false } },
+    });
+    const matePtcKey = { name: 'stand-member-ptc-only' };
+    const matePtcScope = createScope(root, matePtcKey);
+    const matePtcSession = makeStandSession('stand-researcher-ptc', 'dispatch-mode', false);
+    const matePtcAgent = { id: 'stand-researcher-ptc', ctx: agentCtx(matePtcScope.ctx), options: {}, session: matePtcSession };
+    agents.push(matePtcAgent);
+    membershipById.set(matePtcAgent.id, { root: standLead, id: matePtcAgent.id, role: 'teammate', name: 'researcher' });
+    joinOrRebind(matePtcAgent.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: matePtcAgent });
+    await tick(); await tick(); await tick();
+    const ptcOnlyWire = root.get('tools').wireSchemas(matePtcKey).knownNames;
 
-    check('ptcGateState 三态判对（patched / pristine / absent），且本机装机态 = patched', () => {
-      if (patchedSeen !== 'patched') return '带 ptcPresentation 的文件被判成 ' + patchedSeen;
-      if (pristineSeen !== 'pristine') return '原版形状被判成 ' + pristineSeen + '（负对照不成立 = 这条闸门是空转的）';
-      if (absentSeen !== 'absent') return '文件不存在却判成 ' + absentSeen;
-      if (opsGateFile !== null && realGate !== 'patched') {
-        return '本机装机的 dsh-ops 门状态是 ' + realGate + '：both 队员拿不到 ops_batch/ops_result。'
-          + '修法：node tools/ops-ptc-both.cjs 后重启 DSH。';
-      }
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { preset: 'ptc' } },
+    });
+    const mateBothKey = { name: 'stand-member-ptc-batch' };
+    const mateBothScope = createScope(root, mateBothKey);
+    const mateBothSession = makeStandSession('stand-researcher-both', 'dispatch-mode', false);
+    const mateBothAgent = { id: 'stand-researcher-both', ctx: agentCtx(mateBothScope.ctx), options: {}, session: mateBothSession };
+    agents.push(mateBothAgent);
+    membershipById.set(mateBothAgent.id, { root: standLead, id: mateBothAgent.id, role: 'teammate', name: 'researcher' });
+    joinOrRebind(mateBothAgent.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateBothAgent });
+    await tick(); await tick(); await tick();
+    const ptcBatchWire = root.get('tools').wireSchemas(mateBothKey).knownNames;
+    await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
+
+    check('关批量档的角色：本包不去覆盖它的呈现档（wire 里没有 run_code，团队工具照常）', () => {
+      if (ptcOnlyWire.includes('run_code')) return 'batch:false 的角色仍被本包声明成了批量档：' + JSON.stringify(ptcOnlyWire);
+      if (!ptcOnlyWire.includes(roster.REPORT_TOOL_NAME)) return '关掉批量档把团队工具也弄丢了：' + JSON.stringify(ptcOnlyWire);
       return true;
     });
 
-    // pristine 门的**真**路径：造一份带 lib/ptc/index.js 的假 profile，两种形状各测一次。
-    // （第一版只在没有 ptc/index.js 的夹具上测，实际走的是 absent 分支 —— 假绿灯。）
+    check('同一预设但批量档开着：本包覆盖成 both（run_code + 原生工具并存）—— 两档的差别确实由这个开关决定', () => {
+      if (!ptcBatchWire.includes('run_code')) return '批量档没声明上（wire 里没有 run_code）：' + JSON.stringify(ptcBatchWire);
+      if (!ptcBatchWire.includes(roster.REPORT_TOOL_NAME)) return 'both 档丢了团队工具：' + JSON.stringify(ptcBatchWire);
+      if (ptcOnlyWire.join(',') === ptcBatchWire.join(',')) return '开与关的 wire 完全相同 = 开关没作用到这一档上';
+      return true;
+    });
+
+    // 检测层必须如实报告"PTC 组件挂着但本作用域拿不到批量工具"，并给出**本插件**的修法。
     const gateProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-gateprofile-'));
     tempDirs.push(gateProfile);
     const gatePkgDir = path.join(gateProfile, 'node_modules', 'dsh-ops');
@@ -1629,25 +1615,32 @@ async function main() {
     realFs.writeFileSync(path.join(gatePkgDir, 'package.json'), '{"name":"dsh-ops","version":"0.0.0-gate"}', 'utf8');
     const realProfileDir2 = process.env.DSH_PROFILE_DIR;
     process.env.DSH_PROFILE_DIR = gateProfile;
-    // rowsPtcOn = 四行全挂（催补丁的前提）；rowsAll = ptc 行 disabled（用户主动关，不该催）。
     const rowsPtcOn = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: false }));
-    const summaryWith = (ptcSource, rows) => {
-      realFs.writeFileSync(path.join(gatePkgDir, 'lib', 'ptc', 'index.js'), ptcSource, 'utf8');
-      return String(adapter.detectOpsComponents(fakeCtxWith(rows, ['ops_grep']), { id: 'gate' }).summary);
-    };
-    const pristineSummary = summaryWith('async function ptcOnly(ctx, agent) {\n  return false\n}\n', rowsPtcOn);
-    const pristineButOff = summaryWith('async function ptcOnly(ctx, agent) {\n  return false\n}\n', rowsAll);
-    const patchedSummary = summaryWith('function ptcPresentation(assembly) {\n  return "both"\n}\n', rowsPtcOn);
+    const detectWith = (toolNames, rows) => adapter.detectOpsComponents(fakeCtxWith(rows, toolNames), { id: 'gate' });
+    // ① PTC 挂着 + 该作用域看不到那两个工具 → missingPtcTools=true，且修法是改本插件配置
+    const nag = detectWith(['ops_grep'], rowsPtcOn);
+    // ② PTC 挂着 + 看得到（纯 PTC 档队员）→ 不催
+    const satisfied = detectWith(['ops_grep', 'ops_batch', 'ops_result'], rowsPtcOn);
+    // ③ PTC 行被用户关掉 → 根本不该提这件事
+    const ptcOff = detectWith(['ops_grep'], rowsAll);
     if (realProfileDir2 === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = realProfileDir2;
 
-    check('原版门时 summary 点名 ops_batch 缺席并给出可执行修法；已放宽时不给多余指引', () => {
-      if (pristineSummary.indexOf('ops-ptc-both') < 0) return 'pristine 的 summary 没给修法：' + pristineSummary;
-      if (pristineSummary.indexOf('ops_batch') < 0) return 'pristine 的 summary 没点名缺什么：' + pristineSummary;
-      if (patchedSummary.indexOf('ops-ptc-both') >= 0) return '已放宽却仍提示要打补丁：' + patchedSummary;
-      // PTC 组件被关掉时不许催打补丁（那扇门根本不在用）。
-      if (pristineButOff.indexOf('undefined') === 0) return 'PTC 关着时 summary 整个没了：' + pristineButOff;
-      if (pristineButOff.indexOf('ops-ptc-both') >= 0) return 'PTC 组件没挂载却催用户打补丁：' + pristineButOff;
-      if (patchedSummary.indexOf('9.9.9-test') < 0 && patchedSummary.indexOf('0.0.0-gate') < 0) return 'patched 的 summary 丢了版本：' + patchedSummary;
+    check('检测如实报告批量工具缺席，给的修法是本插件的角色配置（不是改 ops）', () => {
+      if (nag.missingPtcTools !== true) return 'PTC 挂着却看不到 ops_batch 时没报缺席：' + JSON.stringify(nag.visibleTools);
+      if (String(nag.summary).indexOf('ops_batch') < 0) return 'summary 没点名缺什么：' + nag.summary;
+      if (String(nag.summary).indexOf('batch') < 0 && String(nag.summary).indexOf('批量') < 0) {
+        return 'summary 没给出「关批量档/改角色配置」这条本包侧修法：' + nag.summary;
+      }
+      if (String(nag.summary).indexOf('dsh-ops') < 0) return 'summary 丢了版本与在场组件：' + nag.summary;
+      return true;
+    });
+
+    check('两个负对照：拿得到批量工具时不催；PTC 组件被关掉时也不催', () => {
+      if (satisfied.missingPtcTools !== false) return '明明看得到 ops_batch/ops_result 却仍报缺席';
+      if (String(satisfied.summary).indexOf('ops_batch') >= 0) return '不该出现批量工具缺席的提示：' + satisfied.summary;
+      if (ptcOff.missingPtcTools !== false) return 'PTC 行 disabled 却仍算"该给批量工具"：' + JSON.stringify(ptcOff.mounted);
+      if (String(ptcOff.summary).indexOf('ops_batch') >= 0) return 'PTC 组件没挂载却催用户改配置：' + ptcOff.summary;
+      if (String(ptcOff.summary).indexOf('0.0.0-gate') < 0) return 'summary 丢了版本：' + ptcOff.summary;
       return true;
     });
 
@@ -1664,16 +1657,16 @@ async function main() {
     });
 
     check('ops-enable.plan() 对**真** profile 的判断与 drift-check 一致（本机交付态）', () => {
-      const realFs2 = require('node:fs');
+      // realFs 已在 §7.11 开头声明
       const candidates = [process.env.DSH_PROFILE_DIR,
         path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop')].filter(Boolean);
       let file = null;
       for (const dir of candidates) {
         const candidate = path.join(dir, 'cordis.patch.yml');
-        if (realFs2.existsSync(candidate)) { file = candidate; break; }
+        if (realFs.existsSync(candidate)) { file = candidate; break; }
       }
       if (file === null) return true; // 没有 profile：本机不是交付环境，跳过不算失败
-      const result = planEnable(realFs2.readFileSync(file, 'utf8'));
+      const result = planEnable(realFs.readFileSync(file, 'utf8'));
       if (result.flipped.length + result.appended.length !== 0) {
         return '本机 profile 的四组件启用态不干净（翻转 ' + result.flipped.join(',') + ' / 缺 ' + result.appended.join(',')
           + '）：node tools/ops-enable.cjs 后重启 DSH。文件：' + file;

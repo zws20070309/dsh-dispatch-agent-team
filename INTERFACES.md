@@ -614,19 +614,20 @@ select() 是先 await recompose() 再落事件（registry :760-761），所以�
 shell 行拿到的 `runtime = undefined`（dsh-ops `lib/index.js:115`），只有 background 构造 FastCtxTools，
 两行的工具集不交（dsh-ops `lib/index.js:79` 决定谁注册什么）。
 
-**PTC 增强组件的适配（本次任务的核心）**：原版（补丁前备份实测的行号）dsh-ops `lib/ptc/index.js:16-22` 的 `ptcOnly()` 只认
-**纯 ptc**（装配工具恰好 1 个 run_code + `tools:ptc-only` 段非空）。而 §3.7 的批量档让队员是
-**both**（全部工具 + run_code），原版门把 `ops_batch`/`ops_result` 挡在每一个队员之外 ——
-「PTC 加强组件要适配到所有队员」的落点就在这。适配 = 把门放宽成三态
-（`native` / `ptc` / `both`），判据仍然**只用公开装配事实**：`run_code` 在不在 `assemble().tools` 里、
-`tools:ptc-only` 与 `tools:sdk` 两段是否非空（官方语义：both 下 PTC_ONLY 渲染为空、SDK 必注册，
-见 §3.7 的 :2725 / :2745-2757），**不碰** `modeFor`/`layers` 私有面（ops 自己的文件头注释也这么要求）。
+**PTC 增强组件（`ops_batch` / `ops_result`）—— 只在本包这一侧适配，dsh-ops 的源码一行都不改**
+（用户 2026-10-15 明令）。原版门（dsh-ops `lib/ptc/index.js:16-22`）只把这两个工具注册给
+**纯 PTC 呈现档**的作用域（装配工具恰好只有 run_code + `tools:ptc-only` 段非空）。本包队员默认是
+**批量档 both**（原生直调 + run_code 并存，§3.7），所以默认档下这两个工具不在 —— 那是 ops 自己的设计。
 
-落地方式：`tools/ops-ptc-both.cjs`（幂等、带 `.bak`、`--check`/`--revert`、形状不符就拒绝盲改）。
-本机已施加到 `profiles/desktop/node_modules/dsh-ops/lib/ptc/index.js`，**重启 DSH 后生效**。
-没打补丁的原版 ops **不坏**：both 队员只是拿不到那两个批量工具，其余 ops_* 照常；把该角色预设选成
-ptc 则原版也能拿到。ops 升级冲掉补丁 → `drift-check` 10g 变红并给出重跑命令。
+合法杠杆本来就在本包里，不需要新代码：**角色预设选 `ptc` 且把该角色的「批量调用」关掉**
+（`batch: false`）→ 那名队员就是纯 PTC 档 → 原版 ops 自己把 `ops_batch`/`ops_result` 注册给他。
+实测（`tools/ops-mount-check.mjs`，真挂原版组件 + 真宿主注册表，两个独立 Context）：
+ptc 档拿到、both 档拿不到 ⇒ 因果确实只在呈现档这一项上。§3.7 的 `batch:false` 语义
+（"完全沿用所选预设自己的档"）正是这条杠杆的前提。
 
+检测层如实报告，不假装可用：`detectOpsComponents` 在「PTC 组件挂着但该作用域看不到那两个工具」时
+把 `missingPtcTools` 置 true，summary 点名缺什么并给出**本插件**的修法（改角色配置），
+两个负对照钉住它 —— 拿得到时不催、PTC 组件被关掉时也不催（integration §7.11）。
 **profile 层的启用（本机交付）**：`profiles/desktop/package.json` 的 bundles 里加了 `dsh-ops`；
 `profiles/desktop/cordis.patch.yml` 用四行 `disabled: false` 覆盖它自带的关闭（`dsh-app-boot`
 `applyEntryPatches:104-107` 逐键赋值，profile 层在所有 bundle 层之后 → 唯一与启用顺序无关的落点）。
@@ -653,18 +654,19 @@ false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提�
 **代价**：指引段约 700 字，与队员无关、进共享前缀，按 (预设, 模型) 分组只冷读一次。
 `ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
 
-**验证**：`integration-test` §7.11（12 条）用真台架产出 native/ptc/both 三份**真实装配**，再把
-**装机那份文件里的 `ptcPresentation` 源码原文**抠出来执行逐档核对（不是测试里重写的等价物），
-含两条负对照：只有 run_code 而无任何 PTC 段必须判 `native`；四行全 disabled 时 `mounted` 必须为空
-且不许注册指引段。9/9 变异验证（M1..M9）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
+**验证**：`integration-test` §7.11 用真台架产出 native/ptc/both 三份**真实装配**（原版门的判据来源），
+并走真安装路径证明 `batch:false` 的角色不被本包覆盖成批量档（对照：开着批量档就被覆盖成 both）；
+检测层的 `missingPtcTools` 有两个负对照（拿得到时不催、PTC 关掉时也不催）。含两条负对照：
+四行全 disabled 时 `mounted` 必须为空且不许注册指引段。9/9 变异验证（M1..M9）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
 队员分叉、名单混入 `ops_run`、摘掉 `installMember` 的链接调用、复活自带 ops-file 行、把 ptc 行改回
-disabled、把真门函数的 both 判成 native、抹掉补丁形状、摘掉迁移标记、把 fallback 改成 false、
+disabled、把真 updatedConfig 改成恒等函数（模拟上游修掉陷阱）、摘掉迁移标记、把 fallback 改成 false、
 给 ptc 行误加标记、把真 updatedConfig 改成恒等函数 —— 每一条都让对应闸门变红（M12/M14 还
 专门验证「闸门在故障消失时也会红」，即不许静默假绿）。
 
 本机离线端到端验收（不需要重启 DSH）：`node tools/ops-mount-check.mjs` —— 两个**互相独立**的
-真 Context，A 挂装机（已放宽）的 file+PTC 组件、B 挂补丁前备份的原版 PTC 组件，各自造一名
-both 队员：A 的 `ops_batch/ops_result` 可见且进 wire，B 两个都拿不到 ⇒ 补丁是承重环节。
+真 Context，A 挂**原版未改**的 file+PTC 组件（纯 PTC 档队员拿到 `ops_batch/ops_result`、批量档队员没有），
+B 同一份组件只差呈现档做负对照（ptc 拿到 / both 拿不到 ⇒ 因果在本包能配的那一项上），
+C 真起 FastCtx 服务器验证四个 job 工具确实发布。
 （这条工具入库：别人装完也能跑；长期保护仍在 §7.11 与 drift-check 10f/10g。）
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 

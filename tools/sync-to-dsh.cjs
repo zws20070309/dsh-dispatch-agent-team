@@ -94,7 +94,6 @@ const FILES = [
   'lib/ops-adapter.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
-  'tools/ops-ptc-both.cjs',
   'tools/ops-enable.cjs',
   'tools/ops-mount-check.mjs',
   'tools/integration-test.cjs',
