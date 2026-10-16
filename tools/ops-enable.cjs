@@ -265,7 +265,7 @@ function main() {
   const result = plan(text, { bashPath: detectBash() });
   const need = result.flipped.length + result.appended.length + result.patched.length;
   if (need === 0) {
-    console.log('已启用且配置齐备：四行都在 profile 层，没有 disabled:true，也不缺 configUpdateVersion / bashPath（' + file + '）。');
+    console.log('已启用且配置齐备：四行都在 profile 层，没有 disabled:true，且每行的 config 与 ROWS 逐键一致（' + file + '）。');
     return 0;
   }
   if (check) {
@@ -279,7 +279,7 @@ function main() {
   console.log('已写入 ' + file);
   if (result.flipped.length > 0) console.log('  翻转 disabled: ' + result.flipped.join(', '));
   if (result.appended.length > 0) console.log('  追加行: ' + result.appended.join(', '));
-  if (result.patched.length > 0) console.log('  补齐 configUpdateVersion / bashPath: ' + result.patched.join(', '));
+  if (result.patched.length > 0) console.log('  逐键补齐/改写（与 ROWS 对齐）: ' + result.patched.join(', '));
   console.log('⚠ 需要重启 DSH 才生效（profile patch 在启动时读入）。备份在同目录 .bak-*-pre-ops-enable。');
   return 0;
 }
