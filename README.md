@@ -250,11 +250,12 @@ node tools/repair.cjs             # 安装状态体检（bundles / junction / �
 注意：除 `client-smoke-test` 外，其余脚本都需要先有安装期那个依赖 junction
 （也就是跑过 `repair.cjs --apply`），否则会报 `ERR_MODULE_NOT_FOUND` —— 那是「还没装好」，不是插件坏了。
 
-还有两个只读探针，排查问题时很有用：
+还有三个只读探针，排查问题时很有用：
 
 ```bash
 node tools/session-probe.cjs --tools --session <会话子串>          # 会话里团队工具面的真实增删
 node tools/asar-probe.cjs --grep "<字符串>" --list "dsh-llm/lib"   # 官方安装包里到底有没有这个东西
+node tools/cache-prefix-audit.cjs                                  # 提示词前缀到底能不能命中缓存（对着真实会话日志算）
 ```
 
 ## 开发者文档

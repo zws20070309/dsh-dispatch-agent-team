@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:660），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:693），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -920,8 +920,10 @@ async function main() {
     const standTools = standScope.ctx.get('tools');
     const standPrompt = standScope.ctx.get('systemPrompt');
     standTools.register(syntheticTool('stand_tool__' + id.split('-').join('_')));
-    // 每份组合都有自己的 persona：persona 是**继承面**贡献，installMember 从不覆盖它，
-    // 所以「装配出来的提示词里是哪一句 persona」能证明换的是整份组合，不只是工具表。
+    // 每份组合都有自己的 persona：persona 是**继承面**贡献，所以「装配出来的提示词里是哪一句
+    // persona」能证明换的是整份组合，不只是工具表。**2026-10-16 起注意**：真的换继承面时
+    // installMember 会在队员自己那层钉一句 persona（遮蔽继承面那句 —— 最近的一层赢），
+    // 因为 persona 排在第一屏，让它翻面就等于把这名队员的整段前缀缓存打掉。见 §7.9b。
     standPrompt.section({
       name: 'deployment:persona-prefix',
       order: standPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
@@ -1053,9 +1055,21 @@ async function main() {
     return true;
   });
 
-  check('换的是整份组合：persona 也换成新预设那一句（不是只改了工具表）', () => {
-    if (!promptA.includes('STAND PERSONA :: standard')) return '提示词里没有标准组合的 persona：' + promptA.slice(0, 160);
-    if (promptA.includes('STAND PERSONA :: dispatch-mode')) return '调度模式的 persona 还在提示词里（继承面没换掉）';
+  check('换预设的队员：persona 是本层钉住的那一句，继承面两句都不再出现在提示词里', () => {
+    // 这一条同时是「缓存断裂修复」的正例：第一屏文字与「挂哪份组合」解耦了。
+    if (!promptA.includes(roster.MEMBER_PERSONA_PIN)) {
+      return '提示词的第一屏不是钉住的那句（' + roster.MEMBER_PERSONA_PIN + '）：' + promptA.slice(0, 200);
+    }
+    for (const id of ['dispatch-mode', 'standard', 'ptc', 'minimal-grayscale']) {
+      if (promptA.includes('STAND PERSONA :: ' + id)) return '继承面的 persona 还在提示词里（第 ' + id + ' 份）：own 层没赢';
+    }
+    return true;
+  });
+
+  check('钉住只换第一屏那一句：工具表照样真的换了（不许把钉 persona 做成换预设的替代）', () => {
+    const after = visibleNames(mateA.key);
+    if (!after.includes('stand_tool__standard')) return 'persona 钉住了但组合没换：' + after.join(', ');
+    if (after.includes('stand_tool__dispatch_mode')) return '组合没真的换掉：调度模式的工具还在';
     return true;
   });
 
@@ -1083,6 +1097,92 @@ async function main() {
     return true;
   });
 
+  // 这条负对照必须**真的走过安装路径**：第一版只 spawn 了 builder 却没 emit agent/created，
+  // 于是它当然没被钉 —— 那是一条空转的门（变异 M32-b「每个队员都钉」当时没能咬住它，
+  // 是变异测试把这件事暴露出来的）。现在先装再读提示词。
+  root.emit('agent/created', { agent: mateB.agent });
+  await tick();
+  await tick();
+  await tick();
+  const promptB = await promptOf(mateB.key);
+  check('没被重绑的队员**不钉** persona：沿用继承面那一句（零行为改动，负对照）', () => {
+    if (promptB.includes(roster.MEMBER_PERSONA_PIN)) return 'builder 没配预设却被钉了 persona（本包不该管的队员被管了）';
+    if (!promptB.includes('STAND PERSONA :: dispatch-mode')) return 'builder 的继承面 persona 没出现：' + promptB.slice(0, 160);
+    return true;
+  });
+
+  // ── 7.9b) persona 翻面的那笔账（2026-10-16 缓存前缀断裂修复的机制证明）───────────
+  //
+  // 真机数字（读 ~/.dsh/sessions 里 143 个插件队员会话的 session.v4.jsonl.zstd）：队员第一次
+  // 请求渲染「跟随 Lead」的 persona，异步重绑落地后第二次换成角色预设那一份 —— 两版 system
+  // 只有第一屏那一行不同，**最长公共前缀因此只有 60 字节**，后面 68,016~75,892 字节的 system、
+  // 2,126~59,492 字节的工具清单和已经跑出来的整段历史全部不计入缓存（DeepSeek 只认「完整匹配
+  // 一个已落盘的缓存前缀单元」）。这里用**真的 dsh-scope + 真的 dsh-system-prompt**把同一件事
+  // 做到最小：同一条作用域链，换一次父，看装配出来的提示词从哪儿开始分叉。
+  const lcpOf = (a, b) => {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.codePointAt(i) === b.codePointAt(i)) i += 1;
+    return i;
+  };
+  /** ownPersona=false → 复刻缺陷（persona 由继承面给）；true → 走本包的钉法。 */
+  const personaFlipCase = async (ownPersona) => {
+    const caseKey = { name: ownPersona === true ? 'stand-pin-on' : 'stand-pin-off' };
+    const caseScope = createScope(root, caseKey);
+    const caseCtx = agentCtx(caseScope.ctx);
+    if (ownPersona === true) {
+      // 与 lib/runtime.js 的 pinMemberPersona 同一形状：本层、同名、官方那个 order。
+      caseCtx.systemPrompt.section({
+        name: roster.MEMBER_PERSONA_SECTION,
+        order: roster.MEMBER_PERSONA_ORDER,
+        text: roster.MEMBER_PERSONA_PIN,
+      });
+    }
+    joinOrRebind(caseCtx, 'dispatch-mode');
+    const beforeSwap = await promptOf(caseKey);
+    joinOrRebind(caseCtx, 'standard'); // = 真机里「异步重绑落地」那一步
+    const afterSwap = await promptOf(caseKey);
+    return { beforeSwap, afterSwap };
+  };
+  const flipOff = await personaFlipCase(false);
+  const flipOn = await personaFlipCase(true);
+
+  check('不钉住（修复前的形状）：换继承面让第一屏就分叉，公共前缀只剩身份那一句', () => {
+    if (!flipOff.beforeSwap.includes('STAND PERSONA :: dispatch-mode')) return '基线没拿到继承面的 persona';
+    if (!flipOff.afterSwap.includes('STAND PERSONA :: standard')) return '换父后 persona 没跟着换（这份夹具失效了）';
+    // 判据是「分叉发生在**第一屏之内**」，不是「分叉正好落在 persona 开头」：
+    // 两份夹具 persona 共用 "STAND PERSONA :: " 这 17 个字符，所以公共前缀天然会越过
+    // indexOf(persona) —— 第一版把门写成 at > cut，自己咬自己（真机那次红就是这么来的）。
+    const cut = flipOff.beforeSwap.indexOf('STAND PERSONA :: dispatch-mode');
+    if (cut < 0) return '夹具形状变了：找不到 persona 那一段';
+    // 边界取「persona 那段文字的末尾」，不取行尾：这个夹具作用域不是队员（installMember
+    // 没跑过），persona 可能正是装配结果的最后一段，没有行尾可找 —— 第一版就是这么咬到自己的。
+    const personaEnd = cut + 'STAND PERSONA :: dispatch-mode'.length;
+    const at = lcpOf(flipOff.beforeSwap, flipOff.afterSwap);
+    if (at >= personaEnd) return '公共前缀越过了 persona 全文（' + at + ' >= ' + personaEnd + '）：第一屏断裂复现不了，本包的依据要重读';
+    if (at >= flipOff.beforeSwap.length) return '两版提示词竟然完全相同：这份夹具根本没换继承面';
+    if (at < 20) return '公共前缀短得不合理（' + at + '）：连身份段都没对齐，夹具形状变了';
+    return true;
+  });
+
+  check('钉住（本包的修法）：同一份作用域链换父，装配出来的 system 逐字节相同', () => {
+    if (!flipOn.beforeSwap.includes(roster.MEMBER_PERSONA_PIN)) return '本层钉的那句没出现在换父之前：' + flipOn.beforeSwap.slice(0, 160);
+    if (flipOn.beforeSwap !== flipOn.afterSwap) {
+      return '换父后 system 变了（公共前缀 ' + lcpOf(flipOn.beforeSwap, flipOn.afterSwap)
+        + ' / 全长 ' + flipOn.beforeSwap.length + '）：own 层没赢过继承面';
+    }
+    if (flipOn.beforeSwap.includes('STAND PERSONA ::')) return '继承面的 persona 漏进来了（同名段没被遮蔽）';
+    return true;
+  });
+
+  check('钉住的代价是可算的：修复前公共前缀 60 量级，修复后 = 全长', () => {
+    const offAt = lcpOf(flipOff.beforeSwap, flipOff.afterSwap);
+    const onAt = lcpOf(flipOn.beforeSwap, flipOn.afterSwap);
+    if (!(offAt < onAt)) return '修复没有把断裂点往后推：off=' + offAt + ' on=' + onAt;
+    if (onAt !== flipOn.beforeSwap.length) return '钉住后不是整段相同：' + onAt + ' != ' + flipOn.beforeSwap.length;
+    return true;
+  });
+
   // 已开播的队员（宿主重启后恢复的那一类）：官方 select() 会抛 agent-preset/locked，
   // 我们**不许**绕过它去改历史会话的记录 —— 只把活体作用域对齐到日志说的那一份。
   const mateCKey = { name: 'stand-member-c' };
@@ -1102,6 +1202,15 @@ async function main() {
     if (selectedOf(mateCSession).length !== 0) return '给已开播的会话补写了 agent-preset/selected（历史被改写）';
     const tail = runtime.notes().slice(notesBefore).join(' | ');
     if (!/stand-tester/.test(tail) || !/ptc/.test(tail)) return '没有一条说明「哪个队员、哪个预设、为什么没生效」的记录：' + tail.slice(-260);
+    return true;
+  });
+
+  const promptC = await promptOf(mateCKey);
+  check('官方锁住（换不成继承面）的队员也不钉：钉了就是凭空多造一次翻面', () => {
+    if (promptC.includes(roster.MEMBER_PERSONA_PIN)) {
+      return '已开播、重绑必然失败的队员被钉了 persona（memberSessionStarted 那道预判没生效）：' + promptC.slice(0, 160);
+    }
+    if (!promptC.includes('STAND PERSONA :: dispatch-mode')) return '锁住的队员连继承面 persona 都没了（作用域形状变了）';
     return true;
   });
 
@@ -1128,6 +1237,16 @@ async function main() {
     if (selectedOf(mateDSession).length !== 0) return '重绑失败还给会话写了切换事件';
     const tail = runtime.notes().slice(notesBefore).join(' | ');
     if (!/stand-verify/.test(tail) || !/minimal-grayscale/.test(tail)) return '诊断里点不出「哪个队员、哪个预设」：' + tail.slice(-260);
+    return true;
+  });
+
+  const promptD = await promptOf(mateDKey);
+  check('注册表里没这一份组合：钉住照旧生效（这一种失败预判不了），队员只是没换成组合', () => {
+    // 设计上的不对称，写清楚：「会话已开播」能同步预判（官方那道闸的判据我们镜像了），
+    // 「这个 id 本机没装」只能等 select() 抛出来 —— 而钉必须在 await 之前才赶得上第一次装配。
+    // 少钉的代价是这名队员整段前缀重算，多钉的代价只是第一屏那一句身份文字，所以选多钉。
+    if (!promptD.includes(roster.MEMBER_PERSONA_PIN)) return '拿不到组合的队员连钉住都没生效：' + promptD.slice(0, 160);
+    if (promptD.includes('STAND PERSONA ::')) return '钉住没盖住继承面的 persona（own 层没赢）';
     return true;
   });
 
@@ -1181,13 +1300,21 @@ async function main() {
       && (/^(DSH 主目录|配置文件)[:：]/u.test(line) || line.startsWith('团队已')));
     if (leaked.length > 0) return `正常事实漏进故障通道：${leaked.join(' | ')}`;
     const hostNotes = got.payload.notes;
-    if (!Array.isArray(hostNotes) || hostNotes.length === 0) return `notes 为空：${JSON.stringify(hostNotes)}`;
-    if (!hostNotes.some((line) => typeof line === 'string' && line.startsWith('配置文件：'))) {
-      return `notes 里没有配置文件路径：${hostNotes.join(' | ')}`;
-    }
-    if (!hostNotes.some((line) => typeof line === 'string' && line.startsWith('团队已开启'))) {
-      return `notes 里没有「团队已开启」这条回执：${hostNotes.join(' | ')}`;
-    }
+    if (!Array.isArray(hostNotes) || hostNotes.length === 0) return 'notes 为空：' + JSON.stringify(hostNotes);
+    // 回执断言的形状必须是「在，或者环已满」：runtime 的 push() 是只留最后
+    // DIAGNOSTIC_CAP 条的环形缓冲。本轮测试装了 4 名队员，最早的「配置文件：」
+    // 「团队已开启」两条被挤出去是设计行为。写成「一定在」的话，谁多派一名队员
+    // 这条门就假红（2026-10-16 加 persona 负对照时就是这么红的 —— 那次红的是门，不是代码）。
+    const receipt = (prefix) => {
+      if (hostNotes.some((line) => typeof line === 'string' && line.startsWith(prefix))) return '';
+      if (hostNotes.length === runtime.DIAGNOSTIC_CAP) return '';
+      return 'notes 里没有「' + prefix + '」这条回执，而环又没满（' + hostNotes.length
+        + ' < ' + runtime.DIAGNOSTIC_CAP + '）= 它根本没被记过：' + hostNotes.join(' | ').slice(0, 300);
+    };
+    const missConfig = receipt('配置文件：');
+    if (missConfig !== '') return missConfig;
+    const missTeam = receipt('团队已开启');
+    if (missTeam !== '') return missTeam;
     return true;
   });
 

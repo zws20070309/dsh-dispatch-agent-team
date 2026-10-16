@@ -387,6 +387,9 @@ function functionBodyOf(source, needle) {
     assert.equal(hasTemplateBraces(playbook.PLAYBOOK), false, 'PLAYBOOK 里出现了 {{…}} 变量语法');
     assert.equal(hasTemplateBraces(playbook.TEAM_POLICY), false, 'TEAM_POLICY 里出现了 {{…}} 变量语法');
     assert.equal(hasTemplateBraces(playbook.TEAMMATE_CARD), false, 'TEAMMATE_CARD 里出现了 {{…}} 变量语法');
+    // 钉给队员的 persona 是**模型可见文本**，而且它会送进官方那个严格插值的槽位：
+    // 一句带 {{…}} 的文本会让每次装配都尝试解一个不存在的变量。
+    assert.equal(hasTemplateBraces(roster.MEMBER_PERSONA_PIN), false, 'MEMBER_PERSONA_PIN 里出现了 {{…}} 变量语法');
     for (const roleId of roster.ROLE_IDS) {
       assert.equal(hasTemplateBraces(playbook.teammateBrief(roleId, roleId)), false, `角色简报 ${roleId} 里出现了 {{…}} 变量语法`);
     }
@@ -870,6 +873,108 @@ function functionBodyOf(source, needle) {
       '纯 PTC 那一档的角色集合变了：' + JSON.stringify(pure));
     assert.deepEqual(both.slice().sort(), ['builder', 'integrator', 'refiner', 'scribe', 'tester'],
       '保留批量调用那一档的角色集合变了：' + JSON.stringify(both));
+  });
+
+  await check('persona 钉住的取值形状：槽位名/排序值钉死，句子单行、无变量、无模型名、不按角色分叉', async () => {
+    // 为什么钉这一条：这三样是「装配出来的第一屏对所有队员逐字节相同」的全部条件。
+    // 槽位名写错 = 注册出一个新段，persona 照旧翻面（还会多出一段废话）；order 写错 =
+    // 这句跑到别的位置上去，遮蔽关系不变但前缀形状变了；带模型名 = 换模型即翻面（正是
+    // 这次要修的第二条断裂源）；按角色分叉 = 把 §0.1 第 3 条「全队一份前缀」直接切碎。
+    const roster = await load('roster.js');
+    assert.equal(roster.MEMBER_PERSONA_SECTION, 'deployment:persona-prefix',
+      'persona 槽位名与官方 PERSONA_PREFIX_SECTION 不再一致（dsh-persona/lib/index.js:2、dsh-system-prompt/lib/index.js:55）');
+    assert.equal(roster.MEMBER_PERSONA_ORDER, 0,
+      'persona 的排序值不再是官方 DEPLOYMENT_PERSONA_PREFIX 那一个（由 drift-check 对着 asar 钉）');
+    const pin = roster.MEMBER_PERSONA_PIN;
+    assert.equal(typeof pin, 'string', 'persona 不是字符串');
+    assert.equal(pin.includes('\n'), false, '钉住的 persona 必须是单行（多行会把后面的段顶开）');
+    assert.equal(pin.trim(), pin, 'persona 首尾不许留空白（装配时按段拼接，空白会落进前缀）');
+    assert.equal(/[{}]/.test(pin), false, 'persona 里不许出现花括号（官方插值是严格变量制）');
+    const lowered = pin.toLowerCase();
+    for (const word of ['model', 'qwen', 'deepseek', 'gpt', 'claude', 'gemini']) {
+      assert.equal(lowered.includes(word), false, 'persona 里出现了模型字样「' + word + '」：换模型就会翻面，这条正是要修的');
+    }
+    for (const roleId of roster.ROLE_IDS) {
+      assert.equal(lowered.includes(roleId), false, 'persona 里出现了角色名 ' + roleId + '：按角色分叉会把队员的共享前缀切碎');
+    }
+  });
+
+  await check('钉 persona 必须排在换继承面的 await 之前（晚一句就赶不上这名队员的第一次装配）', () => {
+    // 官方没有「装配前」钩子：systemPrompt.assemble（dsh-agent-loop/lib/index.js:907）前面没有
+    // await 点，而 installMember 不 await 重绑。所以唯一能保证「第一次请求就用上钉好的
+    // persona」的做法，是把注册写在 select/mount 这两个 await **之前**。
+    // 这一条是纯静态门：把注释剥掉再看代码顺序，注释里出现「await」不算。
+    const strip = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const src = strip(readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8'));
+    const start = src.indexOf('async function rebindMemberPreset');
+    assert.ok(start >= 0, '读不到 rebindMemberPreset：换预设的机制变了，这条门要重读');
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end < 0 ? src.length : end);
+    const swaps = [...body.matchAll(/await\s+agentPresets\.(select|mount)\(/g)].map((m) => m.index);
+    assert.equal(swaps.length, 2, '换继承面的两处 await 数量变了（实得 ' + swaps.length + '）：本门的判据要重读');
+    const pins = [...body.matchAll(/pinMemberPersona\(/g)].map((m) => m.index);
+    assert.ok(pins.length >= 2, '两处换预设前都要钉一句，实得 ' + pins.length + ' 处');
+    for (const pinAt of pins) {
+      const nextSwap = swaps.find((at) => at > pinAt);
+      assert.notEqual(nextSwap, undefined, '有一句 pinMemberPersona 落在两处换继承面之后（等于永远赶不上第一次装配）');
+      const between = body.slice(pinAt, nextSwap);
+      assert.equal(/await\s+agentPresets\./.test(between.replace(/pinMemberPersona\([^)]*\)/, '')), false,
+        '钉住与它对应的那次换预设之间还夹了一个 await：那一步已经把装配让出去了');
+    }
+  });
+
+  await check('官方锁判据的镜像必须逐字对齐，且只有真会换继承面才钉（锁住的队员不许多钉一句）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    assert.ok(/boundary\.openTurnStartSeq !== null \|\| boundary\.lastTurn > 0/.test(src),
+      'memberSessionStarted 与官方 select() 的锁判据不再同形（dsh-agent-preset-registry/lib/index.js:755-759）—— 预判会把该钉的队员漏掉或不该钉的钉了');
+    assert.ok(/if \(!memberSessionStarted\(projections, session\)\) pinMemberPersona\(agent, notes, disposers\);/.test(src),
+      '线 1（select 支）的钉住没有走「会话已开播就不钉」预判：官方必然拒绝的队员被凭空多换了一次第一屏');
+    assert.ok(/\n\s+pinMemberPersona\(agent, notes, disposers\);/.test(src),
+      '线 2（mount 恢复支）没有无条件钉：恢复的老队员每次冷重启都要整段前缀重算');
+  });
+
+  await check('钉住的注册必须可回卷、绝不外抛，而且只管队员（Lead 的 persona 一个字节都不许动）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    const start = src.indexOf('function pinMemberPersona');
+    assert.ok(start >= 0, '读不到 pinMemberPersona');
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end);
+    assert.ok(body.includes('keepDisposer('), '注册没走 keepDisposer：卸载时回卷不掉，队员死了那段作用域还留着一句 persona');
+    assert.equal(/\bthrow\b/.test(body), false, 'pinMemberPersona 里出现了 throw：钉不住就该记诊断，不许把这名队员打掉');
+    assert.equal(/catch \(error\)/.test(body), true, '没有 try/catch：同名段撞车会把这名队员打掉');
+    assert.equal(body.includes('MEMBER_PERSONA_PIN'), true, '钉的文本必须来自 roster 那一份真值');
+    // Lead 侧：installRoot 这条路径一次都不许调用它。
+    const rootStart = src.indexOf('function installRoot');
+    const rootEnd = src.indexOf('\n}', rootStart);
+    assert.ok(rootStart >= 0 && rootEnd > rootStart, '读不到 installRoot，这条反向门没意义');
+    assert.equal(/pinMemberPersona\(/.test(src.slice(rootStart, rootEnd)), false,
+      'Lead 的安装路径里出现了 pinMemberPersona：用户主会话的 persona 被本包改了');
+    // 调用点必须在 rebindMemberPreset 内（只有它知道「要不要换继承面」）。
+    const rebindStart = src.indexOf('async function rebindMemberPreset');
+    const rebindEnd = src.indexOf('\n}', rebindStart);
+    const inRebind = src.slice(rebindStart, rebindEnd);
+    // 只数**调用**（后面跟分号）；函数定义那一行 'pinMemberPersona(agent, notes, disposers) {'
+    // 长得一样，第一版把它也数进来了 —— 那是闸门自己咬错，不是代码有问题。
+    const outCalls = [...src.matchAll(/pinMemberPersona\(agent, notes, disposers\);/g)]
+      .filter((m) => !(m.index > rebindStart && m.index < rebindEnd));
+    assert.equal(outCalls.length, 0, '有 ' + outCalls.length + ' 处钉 persona 落在 rebindMemberPreset 之外（判据失控）');
+    assert.ok(inRebind.includes('pinMemberPersona(agent, notes, disposers)'), 'rebindMemberPreset 里反倒没有钉住调用（上一条门的意义就没了）');
+  });
+
+  await check('全仓 systemPrompt.section 注册的 text 只能是常量标识符或字面量（禁止实时状态进段）', () => {
+    // 为什么：段文本每轮都重算 = 每轮翻面 = 前缀缓存归零。这是 §0.1 第 3 条「全队一份前缀」
+    // 的机读版本；把它做成反向门，而不是写在注释里。
+    const files = ['runtime.js', 'ops-adapter.js', 'preset.js', 'playbook.js', 'roster.js'];
+    const offenders = [];
+    for (const file of files) {
+      const src = readFileSync(path.join(LIB, file), 'utf8');
+      for (const m of src.matchAll(/section\(\{[^}]*?text:\s*([^,}\n]+)/g)) {
+        const value = m[1].trim();
+        const ok = /^[A-Za-z_$][A-Za-z0-9_$.]*$/.test(value) || /^''/.test(value) || /^'[^']*'$/.test(value);
+        if (!ok) offenders.push(file + ' -> ' + value.slice(0, 60));
+      }
+    }
+    assert.deepEqual(offenders, [], '这些段的 text 不是标识符/字面量（实时状态进 system = 每轮翻面）：' + offenders.join(' | '));
   });
 
   await check('路由账本写入点：脏值不进账本、空对象不进、读口返回副本（宁缺毋滥）', async () => {
@@ -3740,6 +3845,7 @@ function visibleModelTexts(playbook, roster) {
     ['PLAYBOOK', playbook.PLAYBOOK],
     ['TEAM_POLICY', playbook.TEAM_POLICY],
     ['TEAMMATE_CARD', playbook.TEAMMATE_CARD],
+    ['MEMBER_PERSONA_PIN', roster.MEMBER_PERSONA_PIN],
     ['wakeInstruction', playbook.wakeInstruction('scout', '只做调研')],
     ['teamCommandLine', playbook.teamCommandLine('x')],
   ];
