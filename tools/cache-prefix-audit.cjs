@@ -174,6 +174,44 @@ function summarizeSession(events) {
   return { requests, headers, usageMissing };
 }
 
+/** 「一个钉住的会话都没看到」时，到底是哪一种原因？纯函数，selftest 直接断言三个分支。
+ *
+ *   not-restarted   —— 本包代码比本进程还新：改完还没重启，进程里跑的是旧代码。
+ *   not-dispatched  —— 代码已生效，但重启后还没有队员跑过（现有日志都早于本进程启动）。
+ *   stale-members   —— 有比本进程还新的队员会话却没钉住：那才是真的没生效，要去查。
+ *   三个时刻任一读不到 → 'unknown'（不猜）。
+ *
+ * 为什么要有这个函数：第一版把「没看到钉住」一律说成「跑的还是旧代码，要重启」，
+ * 实测在「改完 → 重启 → 还没派队员」这个最常见的情况下会误导人再白重启一次（2026-10-17）。
+ * @param {{codeMs:number|null, bootMs:number|null, newestMemberMs:number|null}} at - 三个时刻。
+ * @returns {'not-restarted'|'not-dispatched'|'stale-members'|'unknown'}
+ */
+function pinHintBranch(at) {
+  const { codeMs, bootMs, newestMemberMs } = at;
+  if (codeMs === null || bootMs === null) return 'unknown';
+  if (bootMs < codeMs) return 'not-restarted';
+  if (newestMemberMs !== null && newestMemberMs > bootMs) return 'stale-members';
+  return 'not-dispatched';
+}
+
+/** 文件 mtime（毫秒）；读不到回 null（宁缺毋滥，不猜）。 */
+function mtimeOf(file) {
+  try { return fs.statSync(file).mtimeMs; } catch (error) { return null; }
+}
+
+/** 本进程的启动时刻 —— 读本插件状态文件的 generatedAt（每次 boot 重写）。
+ *  读不到回 null：那种情况下不打印「已生效」这种断言。 */
+function bootTimeFromStatus() {
+  const home = process.env.DSH_HOME !== undefined && process.env.DSH_HOME.trim() !== ''
+    ? process.env.DSH_HOME.trim()
+    : path.join(os.homedir(), '.dsh');
+  try {
+    const raw = fs.readFileSync(path.join(home, 'dispatch-agent-team-status.json'), 'utf8');
+    const at = Date.parse(JSON.parse(raw).generatedAt);
+    return Number.isFinite(at) ? at : null;
+  } catch (error) { return null; }
+}
+
 /** 扫描 + 汇报。包成函数是为了让本文件能被 require 而不产生副作用（selftest 只取纯函数）。 */
 function main() {
   const args = process.argv.slice(2);
@@ -309,9 +347,31 @@ for (const s of perSession.slice(0, 25)) {
     + '  完整复用=' + s.full + '  断裂=' + s.breaks + '  system=' + s.systemBytes + 'B  persona钉住=' + (s.pinned ? '是' : '否'));
 }
 if (pinnedSessions === 0 && !all) {
+  // 提示必须分清两种原因，否则会把人引到错的方向（2026-10-17 实测踩过）：
+  //   a) 改完还没重启 → 进程里跑的还是旧代码；
+  //   b) 重启了但**还没派过新队员** → 日志里当然一个钉住的会话都没有。
+  // 判据：拿钉住这句的**宿主半文件**（lib/roster.js，MEMBER_PERSONA_PIN 的真值所在）的 mtime
+  // 与「最近一个队员会话」的 mtime 比。日志比代码新 = 代码已生效但还没有新队员跑过。
   console.log('');
-    console.log('提示：没有一个会话的 system 里出现钉住的那句 persona —— 说明跑这些队员的还是旧代码。');
+  // 判据用**进程启动时刻**，不用「会话 vs 代码」的 mtime —— 后者会给出错答案：
+  // 我第一版就是这么写的，实测在「改完代码 → 重启 → 还没派队员」这个最常见的情况下
+  // 它照样打印「跑的还是旧代码」，把人引去再重启一次。
+  //   进程启动时刻 = 本插件状态文件的 generatedAt（每次 boot 重写，见 lib/index.js 的状态写入）。
+  const codeMs = mtimeOf(path.join(__dirname, '..', 'lib', 'roster.js'));
+  const bootMs = bootTimeFromStatus();
+  const newestMemberMs = rows.length > 0 ? rows[0].mtime : null;
+  const why = pinHintBranch({ codeMs, bootMs, newestMemberMs });
+  if (why === 'not-dispatched') {
+    console.log('提示：代码已生效（本进程启动于 ' + new Date(bootMs).toLocaleString('zh-CN') + '，晚于本包最后一次改动），');
+    console.log('      但**重启之后还没有任何队员跑过** —— 现有队员日志都早于这次启动，所以看不到钉住的 persona。');
+    console.log('      派一名队员、让它跑起来，再跑一次本命令即可看到 persona钉住=是。');
+  } else if (why === 'not-restarted') {
+    console.log('提示：没有一个会话的 system 里出现钉住的那句 persona —— 本包代码比本进程还新，说明**还没重启**。');
     console.log('      本包改的是宿主半（lib/*.js），要**重启 DSH** 才生效；重启后重派队员再看这里。');
+  } else {
+    console.log('提示：没有一个会话的 system 里出现钉住的那句 persona。');
+    console.log('      本包改的是宿主半（lib/*.js），要**重启 DSH** 才生效；重启后重派队员再看这里。');
+  }
   }
 }
 
@@ -320,4 +380,4 @@ if (require.main === module) main();
 // 纯函数导出：selftest 直接调它们做行为断言。
 // 为什么必须导出：第一版的闸门是扫源码文本（"有没有出现 cacheReadTokens"），我把它保护的那句
 // `const u = usageOf(event)` 改成 `const u = undefined` 后闸门照样绿 —— 文本门会被「读了但没用」骗过。
-module.exports = { usageOf, hitRateOf, summarizeSession, lcpBytes, textOf, decodeSessionLog };
+module.exports = { usageOf, hitRateOf, summarizeSession, lcpBytes, textOf, decodeSessionLog, pinHintBranch };
