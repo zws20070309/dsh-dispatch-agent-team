@@ -572,6 +572,7 @@ dsh-scope 的「最近一层赢 / 同层同名抛错」、以及官方两份 per
 | **实测命中率**（读 `assistant/message.usage`；公式同 `lib/cache.js:262-264`） | `node tools/cache-prefix-audit.cjs --tail 0`（全部 **143** 个队员会话、**8,603** 次带 usage 的请求）= **94.9%**（命中 1,209,119,372 / 未命中 64,552,053）。分档：首次请求 **21.2%**（142 次）、**前缀变了的那一次 46.3%**（19 次）、其余 **95.1%**（8,442 次）。不加 `--tail` 时只看最近 40 个会话：**96.8%**（835 次请求）—— 两个数都对，区别只在样本范围 |
 | 两版 system 的最长公共前缀 | **60 字节**（官方 harness:identity 那一句）—— persona 是**第一处**分叉 |
 | 钉住 persona **之后**的最长公共前缀 | **1,442 ~ 3,033 字节**（同一批 12 个会话逐对实测）—— 只抬到第一处**工具文档段**的差异处，**不是**整段相同 |
+| 钉住之后**真机验收**（2026-10-17 用户那轮 `session-00001002`，3 名新队员、8 个装配） | persona **真的钉住了**：三名队员的两版 system 里 `You are a coding agent.` 都在**第 50 字节**，不再翻面。**但 system 仍然会换版**：第一处分叉从第 60 字节被抬到 **3,105 字节**（researcher `acdebc16`）/ **2,946**（builder `00001015`），断点落在**工具文档段**（`Non-zero exits are reported…` 这段第一次请求里没有、第二次才有）。因此验收的正确写法是「**persona 不再翻面 + 断裂点后移**」，**不是**「system 版本 = 1 / 断裂 = 0」 |
 | 装配对模型（**定位用，不是命中率**） | 最近 40 个会话的 21 对相邻**装配**：完整复用 5（23.8%）、system 断裂 16（76.2%）、字节加权复用率 27.6%、单次最大损失 152,576 字符 |
 | 全部 61 个 ≥2 装配的队员会话 | 完整复用 96/116（82.8%）、字节加权复用率 93.6% |
 | 冷重启恢复的队员 | 4da2b02d 四次请求是 短(76 工具)→长(1)→短(76)→长(1)：**每次 resume 翻两次** |
@@ -617,10 +618,42 @@ set，最近的一层赢」，所以本层一句就压得住部署级与预设�
    注册的 `text` 只允许标识符或字面量，谁把实时状态塞进段里（那会让**每一轮**都翻面）当场红
    （变异 M30-k 验过它咬得住）。
 
+**第四处断裂源（工具文档段）判定为不在本包修的范围，理由是实测不是推断**：钉住之后两版 system 仍会在
+**工具文档段**分叉（本机逐对实测公共前缀 1,442~3,033 字节；`session-00001002` 里 3,105 / 2,946 字节）。
+造成它的是宿主按**当次请求的真实工具集**渲染工具文档：官方 `dsh-system-prompt` 的 `TOOLS_SDK` 段 order 是
+5000（`dsh-system-prompt/lib/index.js:37`），内容随可见工具变化，而这些工具是**异步**装进作用域的 ——
+`session-00001002` 的 builder `00001015` 在两次请求之间收到 `tool-addition: subagent` / `web_fetch`
+（`developer/message` 里的 `tool-addition` 块，header 工具数 78 → 80），文档段随之重排。
+本包能让它稳定的唯一办法是自己接管工具文档的渲染，那等于改写宿主提示词、**违反「别改 ops/宿主源码」那条硬约束**；
+所以这里只做两件事：① 把自己的段全部写成**逐字节常量**（M30-k 门守着）；② 如实记下这条边界，
+不把「system 版本 = 1」写进验收标准。
+
 **代价（如实）**：队员不再从 persona 那一句读到「我用的是哪个模型」；模型信息不参与任何行为
 （工具目录、能力说明、任务边界都在后面的段里）。官方两份 persona 本来就不一致
 （`minimal.patch.yml:14` 与 `ptc.patch.yml:15`），所以钉的是第三句中性的文本，不是替某一方改口；
 Lead 与用户主会话一个字节都没改。
+
+**两处已修的真机 P1（2026-10-17，`session-00001002` 那轮验收测试抓出来，都有变异门）**
+
+1. **队员结束后 `list_agents` 报错模型**。可续期子代理**每一轮结束**都会触发 `agent/disposed`
+   （官方 `dsh-subagent/lib/index.js:1176-1179` 的 `finishDisposal` 结算后调 `activation.handle.dispose()`，
+   `dsh-agent/lib/index.js:543-544` 的 `detachEntered` 随即 `emitDisposed`），于是本包的
+   `disposeInstalled` 被调用；旧实现里它 `clearAppliedRoute`，账本一清，`list_agents` 就退回官方那份
+   **继承自 Lead 的** `options.model`。实测同一行数据里 `running` 的队员对、`inactive` 的全错
+   （seq 62 `researcher` 就已是错的）。修法：**卸载单个队员时不再清路由账本**（账本按 agent id 存，
+   永不重用；插件整体卸载时由 `disposeAll` 的 `appliedRoutes.clear()` 统一回收）。门：
+   `integration-test` §7.9c「队员结束（agent/disposed）之后，list_agents 仍报它真用过的模型」；
+   旧闸门（要求 `disposeInstalled` 必须清账本）**本身写错了**，已一并改成反向断言。
+2. **`subagent` 摘不掉、还漏进模型清单**。`tools.restrict` 只遮**继承面**
+   （`dsh-tools/lib/index.js:2891` 注释「scope-local names … fail」、实现 `:2970-2978`：own 层只进
+   `visible`、永不受限），而官方 `dsh-tool-subagent` 把 `subagent` 注册进**每个 agent 自己的层**
+   （`dsh-tool-subagent/lib/index.js:648-659`）。本机 299 个队员会话里 **21 个**中招（7 个是重绑后又被
+   装回来，14 个从头就带着；`ask_user_question` 也在其中）。修法：在队员作用域装 `tools.guard`
+   （官方原话 `dsh-tools/lib/index.js:2911-2926`：注册在 `agent.ctx` 上就只对这名 agent 生效；
+   `:2928-2936` 的 `guardReason` 在**执行前**统一判定，own 层躲不过）。门：
+   `integration-test` §6.1「注册在队员 own 层的工具也要被拦住」；变异 M35-a / M35-b。
+   附带说明：这条同时是**工具文档段断裂**的一条因果链 —— 漏进来的 `subagent` 会进 system 的工具文档，
+   把提示词重排一次；堵住它不改变上一条「文档段随真实工具集变化」的结论，但减少了触发面。
 
 ### 3.7 队员的批量调用档（both，2026-10-15 用户选路径 1）
 
