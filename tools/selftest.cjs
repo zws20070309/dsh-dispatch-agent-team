@@ -1056,6 +1056,31 @@ function functionBodyOf(source, needle) {
       'README 的探针清单里没有 cache-prefix-audit.cjs：用户不知道有这个核对命令');
   });
 
+  await check('cache-prefix-audit 的「没看到钉住」提示必须分清两种原因（没重启 / 重启了但没派队员）', () => {
+    // 起因（2026-10-17 真机踩到）：用户重启 DSH 后我跑这个脚本，它照样打印
+    // 「跑这些队员的还是旧代码，要重启才生效」—— 那是**错的**：进程启动于 08:02:03，
+    // 晚于代码最后一次改动，只是重启后还没有队员跑过。这条提示会把人引去白重启一次。
+    // 所以判据改用**进程启动时刻**（状态文件的 generatedAt），三个分支各自有断言。
+    const audit = require(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'));
+    assert.equal(typeof audit.pinHintBranch, 'function', '脚本不再导出 pinHintBranch：这条提示又变成不可断言的了');
+    const b = audit.pinHintBranch;
+    assert.equal(b({ codeMs: 100, bootMs: 200, newestMemberMs: 50 }), 'not-dispatched',
+      '代码旧、进程新、没有新队员 → 应判「重启了但还没派队员」');
+    assert.equal(b({ codeMs: 300, bootMs: 200, newestMemberMs: 50 }), 'not-restarted',
+      '代码比进程新 → 应判「还没重启」');
+    assert.equal(b({ codeMs: 100, bootMs: 200, newestMemberMs: 250 }), 'stale-members',
+      '有比进程还新的队员会话却没钉住 → 那才是真的没生效，不能报成「没派队员」');
+    assert.equal(b({ codeMs: null, bootMs: 200, newestMemberMs: 50 }), 'unknown',
+      '读不到代码时刻时必须回 unknown（不猜）');
+    assert.equal(b({ codeMs: 100, bootMs: null, newestMemberMs: 50 }), 'unknown',
+      '读不到进程启动时刻时必须回 unknown（不猜）');
+    // 文案侧：三支都必须存在，否则两个原因又会被合并成一句。
+    const src2 = readFileSync(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'), 'utf8');
+    assert.ok(src2.includes('重启之后还没有任何队员跑过'), '缺「重启了但还没派队员」那一支的文案');
+    assert.ok(src2.includes('还没重启'), '缺「代码比进程新 = 还没重启」那一支的文案');
+    assert.ok(src2.includes('generatedAt'), '启动时刻不是读状态文件的 generatedAt');
+  });
+
   await check('路由账本写入点：脏值不进账本、空对象不进、读口返回副本（宁缺毋滥）', async () => {
     // 为什么单独测写入点：annotateMemberModels 自己也会拦脏 model（纵深防御的第二道），
     // 于是「noteAppliedRoute 不校验 model 空串」这种变异会被下游吸收、集成测试照样绿 ——
