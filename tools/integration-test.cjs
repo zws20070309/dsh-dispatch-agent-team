@@ -421,6 +421,47 @@ async function main() {
     return true;
   });
 
+  // ── 6.1) own 层工具也要拦得住（2026-10-17 真机 P1：subagent 摘不掉、还漏进了模型清单）────
+  // 官方事实（从 0.2.0-rc.2 的 app.asar 实读）：
+  //   * restrict 只遮**继承面** —— dsh-tools/lib/index.js:2891「scope-local names … fail」的注释原话，
+  //     实现见 :2970-2978：先按继承面建 restrictableNames 与 visible，own 层只往 visible 里塞、永不受限；
+  //   * 而 dsh-tool-subagent 恰恰把 subagent 注册进**每个 agent 自己的层**
+  //     （dsh-tool-subagent/lib/index.js:648-659 的 installScoped + ctx.on('agent/created')）。
+  // 真机后果：本机 299 个队员会话里 **21 个**的工具清单里出现被 deny 的名字（7 个是重绑后又被装回来，
+  // 14 个从头就带着），而且它会跟着整段工具文档进 system，重排提示词。
+  // 唯一能按 agent 生效、又拦得住 own 层的官方口子是 tools.guard
+  // （dsh-tools/lib/index.js:2911-2926 注释 + :2928-2936 的 guardReason 在**执行前**统一判定）。
+  check('注册在队员 own 层的工具也要被拦住（restrict 管不到 own 层，guard 兜底）', () => {
+    const own = scoutScope.ctx.get('tools');
+    if (typeof own.guard !== 'function') return '本版 dsh-tools 没有 tools.guard，无法验证兜底路径';
+    // 夹具：把 subagent 注册进队员**自己的层**，复刻官方 dsh-tool-subagent 的做法。
+    const disposer = own.register(syntheticTool('subagent'));
+    if (typeof disposer !== 'function') return '夹具注册失败';
+    try {
+      // 先确认「restrict 真的管不到 own 层」这条官方语义还成立（否则本用例的前提变了）。
+      // 必须先记下 disposer 再判定：restrict 挂的是**永久生效**的作用域过滤器，
+      // 不复位就会把 scout 后面的用例全污染（2026-10-17 实测：那条 'disable 后队员的工具目录退回
+      // preset 面' 就是被这里漏掉的 deny 打红的，与本用例无关）。
+      let restrictThrew = false;
+      let restrictDisposer;
+      try { restrictDisposer = own.restrict({ deny: ['subagent'] }); } catch { restrictThrew = true; }
+      try { if (typeof restrictDisposer === 'function') restrictDisposer(); } catch { /* 回卷失败不影响判定 */ }
+      const stillVisible = root.get('tools').view(KEY.scout).visible.has('subagent');
+      if (restrictThrew && !stillVisible) return '夹具自检不成立：restrict 这次真的摘掉了 own 层工具，说明官方语义变了，本用例要重写';
+      if (!stillVisible) return 'own 层的 subagent 没进 visible —— 夹具没生效，断言无意义';
+      // 真正的断言：这一版的队员身上必须有拦截守卫，且它认得出 subagent。
+      // guardReason 的 agent 参数是**作用域 key**（dsh-tools/lib/index.js:2932 直接把它喂给
+      // chainLayers(exec.agent)），不是 agent 对象 —— 传对象会静默变成 undefined（台架实测）。
+      const reason = root.get('tools').guardReason({ name: 'subagent', agent: KEY.scout });
+      if (typeof reason !== 'string' || !reason.includes('subagent')) {
+        return 'own 层的 subagent 没有被守卫拦住（guardReason=' + String(reason) + '）：队员能调用一个策略上不给它的工具';
+      }
+      return true;
+    } finally {
+      disposer();
+    }
+  });
+
   const runPreStep = async (agent) => {
     const controller = new AbortController();
     return root.waterfall(
@@ -2621,6 +2662,54 @@ async function main() {
     if (violations.length > 0) return '校正后的行过不了官方 schema：' + JSON.stringify(violations).slice(0, 200);
     return true;
   });
+
+  // ── 7.9c) 队员「结束」之后，list_agents 仍须报出它真的用过的模型 ──────────────────────
+  // 真机起因（2026-10-17 session-d7eb7e28，用户那轮验收测试）：同一次 list_agents 里，
+  //   running 的 builder/verify → model=step-5-preview（对）
+  //   inactive 的 researcher   → model=deepseek-v4.1-flash（= Lead 的模型，错）
+  // 根因：可续期子代理**每一轮结束**都会触发 agent/disposed（官方 dsh-subagent 的 finishDisposal
+  // 结算后调 activation.handle.dispose()，dsh-agent 的 detachEntered 随即 emit），于是本包的
+  // disposeInstalled 被调用，而它当时会 clearAppliedRoute —— 账本一清，list_agents 就退回官方那份
+  // 继承自 Lead 的 options.model。这正是 2026-10-16 那条修复要消灭的错数据，只是延后到
+  // 「队员结束之后」这个最常见的询问时刻才冒出来。
+  // 这条用例走**生产路径**：真 runtime.enable → 真 agent/created → 真 agent/disposed → 真 list_agents。
+  {
+    const dKey = { name: 'stand-dispose-member' };
+    const dScope = createScope(root, dKey);
+    const dSession = makeStandSession('stand-dispose', 'dispatch-mode', false);
+    const dMate = { id: 'stand-dispose', ctx: agentCtx(dScope.ctx), options: {}, session: dSession };
+    agents.push(dMate);
+    membershipById.set(dMate.id, { root: standLead, id: dMate.id, role: 'teammate', name: 'tester' });
+    joinOrRebind(dMate.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: dMate });
+    await tick();
+    await tick();
+    // 模拟「它真的发过一次请求，宿主上报了 workbuddy/step-5-preview」—— 这正是 installRouteOverride
+    // 在覆盖合进请求对象之后调的那个唯一写入点。
+    runtime.noteAppliedRoute('stand-dispose', { provider: 'workbuddy', model: 'step-5-preview' });
+    const dList = toolsModule.teamToolDefinitions({
+      runtime: { ...runtime, appliedMemberRoutes: () => runtime.appliedMemberRoutes() },
+      agentTeams: { listMembers: () => [{ id: 'stand-dispose', name: 'tester', role: 'teammate', status: 'inactive', diagnostics: [], model: 'deepseek-v4.1-flash' }], tryMembership: () => undefined },
+      include: roster.MEMBER_TEAM_TOOL_NAMES,
+    }).find((definition) => definition.name === 'list_agents');
+    const beforeDispose = await dList.execute({}, { agent: standLead, signal: new AbortController().signal });
+    // 队员结束（真机就是这一步把账本抹掉的）
+    root.emit('agent/disposed', { agent: dMate });
+    await tick();
+    const afterDispose = await dList.execute({}, { agent: standLead, signal: new AbortController().signal });
+    check('队员结束（agent/disposed）之后，list_agents 仍报它真用过的模型，不退回继承值', () => {
+      const pick = (rows) => rows.find((row) => row.target === 'tester');
+      const before = pick(beforeDispose);
+      const after = pick(afterDispose);
+      if (before === undefined || after === undefined) return '夹具没拿到 tester 行';
+      if (before.model !== 'step-5-preview') return '前提不成立：结束前的 model 就不对（' + String(before.model) + '）';
+      if (after.model !== 'step-5-preview') {
+        return '队员一结束就退回继承模型（' + String(after.model) + '）：账本被 agent/disposed 清掉了 —— '
+          + '真机表现就是 list_agents 对已完成的队员报 Lead 的模型';
+      }
+      return true;
+    });
+  }
 
   // ── 工具返回值的**形状**校验（官方同一个校验器）────────────────────────────────────
   // 为什么单列一段：上面所有断言都是直调 definition.execute(...)，而**生产路径**上

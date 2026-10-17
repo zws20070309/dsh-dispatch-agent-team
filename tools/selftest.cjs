@@ -2776,9 +2776,23 @@ function functionBodyOf(source, needle) {
     assert.ok(/export function clearAppliedRoute\(agentId\)/.test(rtForModel), '必须有唯一作废点 clearAppliedRoute');
     assert.ok(!/function installRouteOverride[\s\S]{0,3000}appliedRoutes\.set/.test(rtForModel),
       'installRouteOverride 里不许绕过写入点直接 set 账本');
-    assert.ok(rtForModel.includes('clearAppliedRoute(agentId);'), 'disposeInstalled 必须作废该队员的记账');
+    // 2026-10-17 更正：旧断言要求 disposeInstalled **必须**清掉路由账本 —— 那条断言本身是错的。
+    // 真机 session-d7eb7e28 实测：可续期子代理每轮结束都触发 agent/disposed，清了账本之后
+    // list_agents 对 inactive 队员退回「继承自 Lead 的模型」（同一次调用里 running 的对、inactive 的全错）。
+    // 现在的要求反过来：**不许**在 disposeInstalled 里清，只允许在插件整体卸载（disposeAll）时清。
+    const disposeBody = rtForModel.slice(rtForModel.indexOf('function disposeInstalled'), rtForModel.indexOf('function disposeInstalled') + 1200);
+    assert.ok(!disposeBody.includes('clearAppliedRoute('),
+      'disposeInstalled 不许清路由账本：可续期子代理每轮结束都触发 agent/disposed，清了就会让 list_agents 对已结束的队员报回继承模型（2026-10-17 真机 P1）');
+    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账（插件整体卸载时才回收）');
     assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账');
     assert.ok(/export function appliedMemberRoutes\(\) \{/ .test(rtForModel), 'runtime 必须导出 appliedMemberRoutes()');
+    // ── 2026-10-17 更正：账本必须在「队员结束」之后仍然存在 ──────────────────────
+    // 起因（真机 session-d7eb7e28）：可续期子代理每轮结束都会触发 agent/disposed
+    // （官方 dsh-subagent 的 finishDisposal 结算后调 activation.handle.dispose()，
+    //  dsh-agent 的 detachEntered 随即 emit agent/disposed），于是 disposeInstalled 被调用。
+    // 旧实现里它 clearAppliedRoute —— 结果 list_agents 对**已结束**的队员退回继承模型：
+    // 实测同一次 list_agents 里 running 的 builder/verify = step-5-preview（对），
+    // inactive 的 researcher = deepseek-v4.1-flash（= Lead 的模型，错）。
     assert.ok(/appliedMemberRoutes,\n/.test(rtForModel), 'appliedMemberRoutes 必须进 runtimeApi');
     const toolsSrc = readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8');
     assert.ok(toolsSrc.includes("annotateMemberModels(withRetries, runtime?.appliedMemberRoutes?.() ?? new Map())"),
