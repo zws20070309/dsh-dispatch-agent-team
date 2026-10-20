@@ -3041,6 +3041,33 @@ function functionBodyOf(source, needle) {
       '展开层正文没走等宽字体（用户要「展开后就能看到代码」）');
   });
 
+  await check('批量调用（both）档必须探测宿主还认不认这一档（DSH 0.2.1-rc.2 把它删了）', () => {
+    // 2026-10-21 复核：DSH 0.2.1-rc.2 的 tools 行把呈现档从 native|ptc|both 收窄成 native|ptc。
+    // 台架实测（宿主真身 dsh-tools/lib/index.js 解出来后直接喂 Config）：
+    //   Config({mode:'native'}) ok / Config({mode:'ptc'}) ok / Config({mode:'both'}) 抛
+    //   "$.mode expected \"native\" | \"ptc\" but got \"both\""。
+    // 而 presentAs() **不校验取值**（只把字符串写进 layer.mode），所以旧代码不会在这一步抛错：
+    // 开关拨了、诊断写着「已开启」，实际装配行为两边都不匹配 —— 静默退化。
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    const at = runtimeSrc.indexOf('function presentationModeSupported');
+    assert.ok(at >= 0, 'runtime.js 必须有 presentationModeSupported（问注册表自己认不认这一档）');
+    const body = runtimeSrc.slice(at, at + 1200);
+    // 判据必须是「喂给 Config schema」：那是官方对合法取值的唯一声明。
+    assert.ok(/schema\(\{ mode \}\)/.test(body), '探测必须把候选值喂给 tools 行的 Config schema');
+    assert.ok(/constructor\?\.Config/.test(body), 'schema 要从 tools 服务的构造函数上取（实例上没有 Config）');
+    // 取不到 schema 时必须返回 undefined（不知道），让调用方退回老行为 —— 不许当成 false 把功能关掉。
+    assert.ok(/return undefined;/.test(body), '取不到 schema 必须返回 undefined（不知道），不能当成不支持');
+    // 守卫必须在 presentAs('both') **之前**，且失败时如实记一条「看得见」的说明。
+    const gate = runtimeSrc.indexOf("presentationModeSupported(ctx, 'both')");
+    const call = runtimeSrc.indexOf("tools.presentAs('both')");
+    assert.ok(gate >= 0 && call > gate, "both 的能力探测必须排在 presentAs('both') 之前");
+    assert.ok(runtimeSrc.slice(gate, call).includes('noteCapabilityOnce('),
+      '不支持时必须让用户看得见（否则开关拨了没反应，与旧缺陷一模一样）');
+    // 客户端那格开关的说明也要跟着说准：它现在只在「宿主支持 both」时才有意义。
+    const clientSrc = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(clientSrc.includes('batchTip'), '批量开关的说明文案必须仍在（配置页那一格）');
+  });
+
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
     // 用户 2026-10-09：「一定要正确，和我用官方的对话框没太大区别」。
     // 官方真值来自 dsh-client-ui-conversation/lib/client.js 的 locale 块，
