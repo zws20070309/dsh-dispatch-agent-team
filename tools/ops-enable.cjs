@@ -42,7 +42,54 @@ const path = require('node:path');
 const os = require('node:os');
 
 const LF = String.fromCharCode(10);
-const MARKER = '    configUpdateVersion: 1';
+
+/**
+ * dsh-ops 的**迁移版本号**，从装机那份源码读，不自带一份。
+ *
+ * 2026-10-21 真事故：这里原来写死 `configUpdateVersion: 1`。dsh-ops 0.3.2 把
+ * CONFIG_UPDATE_VERSION 升到了 **2**（lib/config-updates.js:7），于是本脚本的 `plan()`
+ * 对一份**已经迁移好**的 profile 判决「需要补齐」，随后把它**降级**写回 1 ——
+ * 修法反而造成了损坏。同时 dsh-ops 自己下次启动又会把它迁回 2，两边来回改同一个文件。
+ * 判据必须来自上游：读不到就**拒绝行动**（退出码 2），绝不猜一个数字写进用户配置。
+ * @returns {number|null} 迁移版本号；读不到时 null。
+ */
+function detectConfigVersion() {
+  const pkg = resolveOpsPackageJson();
+  if (pkg === null) return null;
+  try {
+    const src = fs.readFileSync(path.join(path.dirname(pkg), 'lib', 'config-updates.js'), 'utf8');
+    const match = /export const CONFIG_UPDATE_VERSION = (\d+)/u.exec(src);
+    if (match === null) return null;
+    const value = Number.parseInt(match[1], 10);
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * profile 目录候选（与 locatePatch 同一条链，顺序一致：显式 > desktop > web）。
+ * @returns {string[]}
+ */
+function profileCandidates() {
+  const dirs = [];
+  if (process.env.DSH_PROFILE_DIR) dirs.push(process.env.DSH_PROFILE_DIR);
+  const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  dirs.push(path.join(home, 'profiles', 'desktop'), path.join(home, 'profiles', 'web'));
+  return dirs;
+}
+
+/** 装机 dsh-ops 的 package.json 路径；没装返回 null（本包不依赖它）。 */
+function resolveOpsPackageJson() {
+  for (const dir of profileCandidates()) {
+    const candidate = path.join(dir, 'node_modules', 'dsh-ops', 'package.json');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+const CONFIG_UPDATE_VERSION = detectConfigVersion();
+const MARKER = CONFIG_UPDATE_VERSION === null ? null : ('    configUpdateVersion: ' + CONFIG_UPDATE_VERSION);
 
 /**
  * shell 段的追加指引（走 dsh-ops 自己的公开扩展点 extraGuidance，lib/config.js 接受、
@@ -73,17 +120,26 @@ const ROWS = [
     SHELL_GUIDANCE,
     MARKER,
   ] },
+  // 2026-10-21：**不再写 enableShellTools / toolCallTimeoutMs**。
+  // dsh-ops 0.3.2 的 lib/config.js:20 把这两个键列进 LEGACY_FASTCTX_KEYS，
+  // 迁移第 2 步（config-updates.js:17）会把它们**从配置里删掉**。
+  // 我们继续写 = 每次 plan() 都判「缺键」、补上、对方下次启动又删掉，来回改同一个文件；
+  // 而且 `--check` 永远报一条假的「需要处理」。file 组件现在读的是 required 等键。
   { id: 'dsh-ops-file', lines: [
     '- id: dsh-ops-file',
     '  disabled: false',
     '  config:',
     '    promptPolicy: true',
-    '    enableShellTools: false',
     '    required: false',
-    '    toolCallTimeoutMs: 300000',
     MARKER,
   ] },
-  { id: 'dsh-ops-background', lines: [
+  // ⚠️ 2026-10-21：background 行**故意不带 MARKER**。
+  // dsh-ops 0.3.2 的 config-updates.js:22 原话：
+  //   `dsh-ops/background` is a no-op stub that reads no config, so it needs no migration.
+  // 该组件已被移除（只剩一个只 warn 一次的空壳），它**不读任何配置**。
+  // 我们仍替它写 configUpdateVersion 会造成两件事：plan() 对它报「缺迁移标记」的假缺失，
+  // 而那个数字在上游没有任何语义。行留着只为兼容老 profile（老版本的 background 真的读配置）。
+  { id: 'dsh-ops-background', noMarker: true, staleKeys: ['configUpdateVersion'], lines: [
     '- id: dsh-ops-background',
     '  disabled: false',
     '  config:',
@@ -92,7 +148,6 @@ const ROWS = [
     '    required: false',
     '    toolCallTimeoutMs: 300000',
     '    allowSystemShellFallback: true',
-    MARKER,
   ] },
   { id: 'dsh-ops-ptc', lines: [
     '- id: dsh-ops-ptc',
@@ -152,7 +207,15 @@ function detectBash(options) {
  */
 function rowLines(row, bashPath) {
   if (typeof bashPath !== 'string' || bashPath === '') return row.lines;
-  const line = '    bashPath: ' + JSON.stringify(bashPath);
+  // ⚠️ 2026-10-21：**不能**用 JSON.stringify 拼 YAML 标量。
+  // JSON.stringify('C:\\Program Files\\Git\\bin\\bash.exe') 得到的是
+  //   "C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe"   （带双引号、反斜杠被转义两遍）
+  // YAML 双引号标量里 `\\\\` 表示**一个字面反斜杠**，解析出来仍是同一个路径，所以功能没坏；
+  // 但它是**与 profile 里那行不同的文本**（profile 写的是裸 `C:\Program Files\...`），
+  // 于是「按值比较」永远不相等 → 每次 --check 都报「补齐 bashPath」并把那一行重写一遍，
+  // 与 dsh-plugin-manager 的 YAML AST 重写互相来回改同一个文件。
+  // 正确写法：YAML 里含空格/冒号的标量用**单引号**包裹（单引号内反斜杠是字面量，不做转义）。
+  const line = '    bashPath: ' + yamlScalar(bashPath);
   if (row.id === 'dsh-ops-shell') {
     const at = row.lines.indexOf('    allowSystemShellFallback: false');
     if (at < 0) return row.lines;
@@ -166,6 +229,23 @@ function rowLines(row, bashPath) {
   const next = row.lines.slice();
   next.splice(at + 1, 0, line);
   return next;
+}
+
+/**
+ * 把一个字符串渲染成安全的 YAML 单行标量。
+ *
+ * 规则（只覆盖本脚本真正会写的那几类值）：
+ *   * 不需要引号就能安全表示（无空格、无 `:#`、首字符不是 `-?&*!|>%@` 之类）→ 裸写；
+ *   * 其余 → **单引号**包裹，并把值里已有的单引号按 YAML 规则写成两个单引号。
+ * 单引号标量内反斜杠是字面量，所以 Windows 路径原样保留、不需要转义 ——
+ * 这正是 JSON.stringify 那条路错掉的地方（它会产出 `\\\\`）。
+ * @param {string} value - 原始值。
+ * @returns {string} 单行 YAML 文本。
+ */
+function yamlScalar(value) {
+  const text = String(value);
+  const plainSafe = text !== '' && !/[\s:#'"\\]/u.test(text) && !/^[-?&*!|>%@`{[]/u.test(text);
+  return plainSafe ? text : ("'" + text.replace(/'/gu, "''") + "'");
 }
 
 /** 与 lib/self-heal.js 同源的 profile 定位链。 */
@@ -232,6 +312,23 @@ function scalarValue(lines, span) {
   return parts.join(' ').replace(/\s+/gu, ' ').trim();
 }
 
+/**
+ * 路径类标量的归一化：去包裹引号、反斜杠统一成正斜杠、去尾斜杠。
+ *
+ * 只用于 bashPath 这类**文件路径**键 —— 它们的值里空格是数据的一部分，
+ * 不能用「把连续空白压成一个」的规则比（那会把 `Program Files` 与 `Program  Files`
+ * 判成相等，也会让带引号与不带的两种写法永远不相等）。
+ * @param {string} value - 归一化前的值文本。
+ * @returns {string}
+ */
+function normalizePathValue(value) {
+  let text = String(value).trim();
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    text = text.slice(1, -1);
+  }
+  return text.replace(/\\/gu, '/').replace(/\/+$/u, '');
+}
+
 /** 把 ROWS 里期望的那一行拆成同样的"值文本"（与 scalarValue 同一套归一化）。 */
 function wantedValue(wantLine) {
   const m = /: (.*)$/u.exec(wantLine);
@@ -286,8 +383,17 @@ function plan(text, options) {
         // 更要紧的是它会**把折行改回单行**，与宿主互相改写。现在读值时把折叠的续行也吃进来，
         // 归一化空白后比对：值相同就什么都不做（幂等），值真不同才重写（重写时顺手清掉续行）。
         const span = scalarSpan(working, at, now.end);
-        const current = scalarValue(working, span);
-        if (current !== wantedValue(want)) {
+        // bashPath 这类**含空格的路径**不能用「空白归一化」比较：
+        // 期望值 `C:\Program Files\Git\bin\bash.exe` 归一化后变成 `C:\Program Files\Git\bin\bash.exe`
+        // 的空格被压成一个，而 profile 里那份是带引号/未引号的原样文本 —— 两边永远不相等，
+        // 于是每次 --check 都报「补齐 bashPath」并把同一行重写一遍（2026-10-21 真机实测到这条）。
+        // 路径键按**去引号 + 反斜杠归一**比较，其余标量仍走原来的空白归一化（extraGuidance 折行要靠它）。
+        const isPathKey = key === 'bashPath';
+        const current = isPathKey
+          ? normalizePathValue(scalarValue(working, span))
+          : scalarValue(working, span);
+        const wanted = isPathKey ? normalizePathValue(wantedValue(want)) : wantedValue(want);
+        if (current !== wanted) {
           working.splice(span.start, span.end - span.start + 1, want);
           changes.push(key);
         }
@@ -299,6 +405,21 @@ function plan(text, options) {
         working.splice(insertAt, 0, want);
         changes.push(key);
       }
+    }
+    // 这一行**不该有**的键要清掉（2026-10-21）：plan 原来只会补/改，不会删，
+    // 于是「早先版本写进去的 configUpdateVersion」会永远留在 background 行上，
+    // 而 dsh-ops 0.3.2 明说该行不读任何配置、不需要迁移（config-updates.js:22）。
+    // 只删我们**自己曾经写过**、且已经不该存在的键 —— 用户手加的其它键一律不动。
+    for (const staleKey of (row.staleKeys ?? [])) {
+      const blocksNow = splitRows(working);
+      const now = blocksNow.find((entry) => entry.id === row.id);
+      if (now === undefined) break;
+      const at = working.findIndex((line, index) => index >= now.start && index <= now.end
+        && new RegExp('^\\s+' + staleKey + ':\\s*').test(line));
+      if (at < 0) continue;
+      const span = scalarSpan(working, at, now.end);
+      working.splice(span.start, span.end - span.start + 1);
+      changes.push('-' + staleKey);
     }
     if (changes.length === 0) { kept.push(row.id); continue; }
     patched.push(row.id + '(' + changes.join('+') + ')');
@@ -319,9 +440,46 @@ function plan(text, options) {
   return { text: next, flipped, patched, appended: missing, kept };
 }
 
+/**
+ * 只认识的三个开关。**任何别的参数一律拒绝**（2026-10-21 真事故）。
+ *
+ * 原实现只做 `includes('--check')` / `includes('--revert')`：于是 `--help`、`--dry-run`、
+ * 手滑的 `--c heck` 全都**静默落进默认动作 = 写盘**。我当天就是这么踩的：
+ * 想先看用法，结果它把用户的 profile patch 改了两行（configUpdateVersion 2→1），
+ * 还顺手把 dsh-ops 的 shell 段降级。一个会改用户配置的脚本，绝不能把「不认识的参数」
+ * 当成「按默认执行」。
+ * @param {string[]} argv - process.argv（含 node 与脚本路径）。
+ * @returns {string[]} 不认识的参数（空 = 全部认识）。
+ */
+function unknownArgs(argv) {
+  const known = new Set(['--check', '--revert', '--apply', '--help', '-h']);
+  return argv.slice(2).filter((arg) => !known.has(arg));
+}
+
 function main() {
-  const check = process.argv.includes('--check');
-  const revert = process.argv.includes('--revert');
+  const argv = process.argv;
+  // 读不到 dsh-ops 的迁移版本号就不动手：写死一个数字等于赌上游没升过版，
+  // 2026-10-21 就是这么把 2 降成 1 的（见 detectConfigVersion 的注释）。
+  if (MARKER === null) {
+    console.error('定位不到装机 dsh-ops 的 lib/config-updates.js（或里面没有 CONFIG_UPDATE_VERSION）。');
+    console.error('本脚本要靠它决定写哪个迁移版本号；读不到就拒绝改用户配置。先确认 dsh-ops 装好了，或用 --check 看现状。');
+    return 2;
+  }
+  const bad = unknownArgs(argv);
+  if (bad.length > 0) {
+    console.error('不认识的参数：' + bad.join(' ') + '（本脚本会改 profile 配置，未知参数一律不执行）');
+    console.error('用法：node tools/ops-enable.cjs [--check | --revert]   # 不带参数 = 补齐/翻转并写盘');
+    return 2;
+  }
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log('用法：node tools/ops-enable.cjs [--check | --revert]');
+    console.log('  （不带参数）  需要时补齐/翻转这四行并写盘；重启 DSH 生效');
+    console.log('  --check      只报告，不写盘（退出码 1 = 需要处理）');
+    console.log('  --revert     删掉这四行（回到 dsh-ops 自带默认）');
+    return 0;
+  }
+  const check = argv.includes('--check');
+  const revert = argv.includes('--revert');
   const file = locatePatch();
   if (file === null) {
     console.error('定位不到 profile 的 cordis.patch.yml（试过 DSH_PROFILE_DIR / DSH_HOME/profiles/{desktop,web}）。');
@@ -364,4 +522,4 @@ function main() {
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT };
+module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT, yamlScalar, normalizePathValue };
