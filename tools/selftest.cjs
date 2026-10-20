@@ -489,7 +489,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2678）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2700）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -2994,7 +2994,9 @@ function functionBodyOf(source, needle) {
   await check('抽屉工具调用「放大查看」：面板随视口自适应，展开层高度不再写死（用户 2026-10-15 报「固定容器太窄」）', () => {
     const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
     // ① 展开层高度必须**随视口**，旧的写死值不许回来（写死 260px 就是这次报障的正面原因）。
-    assert.ok(src.includes('max-height:min(52vh,480px)'), '展开层高度没改成随视口自适应（仍是固定 px）');
+    // 展开层高度必须随视口（2026-10-21 从 min(52vh,480px) 改成 70vh：用户要「展开即见代码」，
+    // 52vh 在一个 760px 高的窗口里只有 ~395px，长输出的后半段仍要另开面板才读得到）。
+    assert.ok(src.includes('max-height:70vh'), '展开层高度没随视口自适应（仍是写死的 px）');
     assert.ok(!src.includes('max-height:260px'), '旧的写死高度 max-height:260px 又回来了');
     // ② 面板本体：CSS 与三个函数都必须在。
     assert.ok(src.includes('.dat-ws .ws-zoom{'), '缺少放大面板的 CSS（.ws-zoom）');
@@ -3020,6 +3022,23 @@ function functionBodyOf(source, needle) {
     const closeAt = src.indexOf('function wsCloseDrawer(state) {');
     assert.ok(closeAt >= 0 && src.slice(closeAt, closeAt + 400).includes('wsCloseDetailZoom(state)'),
       '关抽屉没顺手关掉放大面板');
+  });
+
+  await check('抽屉展开层不许被 flex 列压扁成一条缝（用户 2026-10-21 报「展开是一条缝」）', () => {
+    // 症状与根因（真机 + headless Chrome 实测）：.cv 是 display:flex;flex-direction:column 的
+    // 滚动容器，子项默认 flex-shrink:1。展开一层会往这一列里塞两个子项（.trow + .dbox），
+    // 总高超过可视高时浏览器按比例压扁它们 —— 8 个展开时每个 .dbox 只剩 **27px**（用户看到的缝）。
+    // 实测对照（同一份 CSS、1400×760）：flex:none 后 8 个展开全是 149~155px，滚动交给 .cv。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/\.dat-ws \.dbox\{flex:none;/.test(src), '.dbox 没有 flex:none —— 展开层会被 flex 列压扁成一条缝');
+    assert.ok(/\.dat-ws \.trow\{flex:none\}/.test(src), '.trow 没有 flex:none —— 行高塌陷会连带把正文压没');
+    // 只要 .cv 仍是 flex 列（这条是它的定义），上面两条就是必需的；它若改回普通块级流，
+    // 这两条 flex:none 变成无害冗余，但断言仍成立，不会假红。
+    assert.ok(/\.dat-ws \.cv\{[^}]*display:flex;flex-direction:column/.test(src),
+      '.cv 不再是 flex 列 —— 失效的收缩前提变了，请重跑 .probe/deep/asar-test/height3.mjs 重新取值');
+    // 展开文本用等宽字体：工具输入是 JSON、输出是命令回显，比例字体下引号/花括号对不齐。
+    assert.ok(/\.dat-ws \.dbox pre\{[^}]*font-family:var\(--dsw-font-family-mono/.test(src),
+      '展开层正文没走等宽字体（用户要「展开后就能看到代码」）');
   });
 
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
