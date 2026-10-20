@@ -188,6 +188,11 @@ function rowConfigOf(id) {
     else if (raw === 'false') value = false;
     else if (/^-?\d+(\.\d+)?$/.test(raw)) value = Number(raw);
     else if (raw.length > 1 && raw[0] === '"' && raw[raw.length - 1] === '"') value = JSON.parse(raw);
+    // 单引号 YAML 标量：ops-enable 从 2026-10-21 起用**单引号**写 bashPath
+    // （JSON.stringify 会产出双反斜杠转义，与 profile 里的裸路径永不相等 -> 每次 --check 重写）。
+    // YAML 单引号内不做反斜杠转义，用 ' 表示一个单引号。这里必须跟着认，
+    // 否则 bashPath 会被当成字面量 "'C:\\...'"（带引号的假路径），D 段整段假红。
+    else if (raw.length > 1 && raw[0] === "'" && raw[raw.length - 1] === "'") value = raw.slice(1, -1).replace(/''/gu, "'");
     else value = raw;
     out[m[1]] = value;
   }
@@ -314,6 +319,19 @@ let okB = null;
 say('C) background 组件（真起 FastCtx 服务器）：');
 let okC = null;
 try {
+  // 2026-10-21：dsh-ops 0.3.2 **整体移除**了 background 组件（FastCtx）。
+  // lib/binary.js 也已经不在了，所以这一段原本只会抛「Cannot find module」。
+  // 判据改成：装机那份里还有没有 background 的真实实现 —— 没有就如实跳过，
+  // 并说明为什么跳过（而不是把「模块没了」当成一次失败挂在报告里）。
+  if (!fs.existsSync(opsFile('lib/components/background/worker/index.js'))
+    && !fs.existsSync(opsFile('lib/binary.js'))) {
+    say('  判定 C = 跳过（dsh-ops ' + (JSON.parse(fs.readFileSync(path.join(opsRoot, 'package.json'), 'utf8')).version ?? '?') + ' 已移除 background / FastCtx 组件：'
+      + 'lib/components/background/index.js 只剩一个只 warn 一次的空壳，不再发布 ops_run_background / ops_job_*）');
+    // 用 okC = null 表示「跳过」（总体判定接受 null），**不能抛对象** ——
+    // 下面那个 catch 会把任何抛出的东西都记成「挂载失败」，于是跳过会显示成失败。
+    okC = null;
+    throw new Error('__OPS_C_SKIPPED__');
+  }
   const { resolveBinary, probeBinary } = await import(opsFile('lib/binary.js'));
   const { resolveShells } = await import(opsFile('lib/shells.js'));
   const rt = resolveBinary({ packageRoot: opsRoot });
@@ -332,7 +350,7 @@ try {
     const rootC = await makeRoot();
     const bgComp = await import(opsFile('lib/components/background/index.js'));
     bgComp.apply(rootC, { promptPolicy: true, enableShellTools: true, required: false, toolCallTimeoutMs: 300000,
-      allowSystemShellFallback: bashPath === null, ...(bashPath === null ? {} : { bashPath }), configUpdateVersion: 1 });
+      allowSystemShellFallback: bashPath === null, ...(bashPath === null ? {} : { bashPath }), configUpdateVersion: OPS_ENABLE.CONFIG_UPDATE_VERSION });
     const jobTools = ['ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill'];
     // 后台工具注册在**这名队员自己的层**上（dsh-ops lib/tools.js:358-366），而注册动作发生在
     // attachAgent → refreshAgents；FastCtx 握手（spawn + initialize + listTools，约 4-6s）完成前
@@ -381,7 +399,10 @@ try {
     if (typeof rootC.dispose === 'function') rootC.dispose();
   }
 } catch (error) {
-  say('  判定 C = 挂载失败：' + (error && error.message ? error.message : String(error)));
+  if (error && error.message === '__OPS_C_SKIPPED__') {
+    // 上面那条「已移除 background」的说明已经打印过了，这里不再重复一条失败。
+    okC = null;
+  } else say('  判定 C = 挂载失败：' + (error && error.message ? error.message : String(error)));
 }
 say('');
 
