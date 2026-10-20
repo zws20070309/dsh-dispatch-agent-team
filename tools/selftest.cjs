@@ -3103,6 +3103,28 @@ function functionBodyOf(source, needle) {
     assert.ok(/argv\.includes\('--help'\)[\s\S]{0,600}return 0;/u.test(src), '--help 必须单独走「只打印、直接返回」');
   });
 
+  await check('both 不被宿主支持时，预设 ptc 的队员仍必须同步声明 ptc（不许退回到 2026-10-16 的 P0）', () => {
+    // 这条是给 2026-10-21 那次修复补的**回归闸门**：加「both 能力探测」时，我曾让
+    // 「不支持 both」那一支直接 return —— 而它与「批量档关着」那一支本该**完全对称**。
+    // 差别只在预设是 ptc 的角色身上：不补 presentAs('ptc')，它第一次请求就跑在继承来的
+    // native 组合上（预设重绑是异步的，赶不上首次装配），于是队员把「没有 run_code」
+    // 当成事实报给 Lead，白跑一轮（session-00001005 的 researcher-ops 就是这样）。
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    const gate = runtimeSrc.indexOf("presentationModeSupported(ctx, 'both')");
+    assert.ok(gate >= 0, '缺少 both 能力探测');
+    // 探测之后的这一段里，必须同时出现「return」和「declareMemberMode(... 'ptc' ...)」，
+    // 且声明排在 return 之前（否则就是死代码）。
+    const tail = runtimeSrc.slice(gate, gate + 1600);
+    const decl = tail.indexOf("declareMemberMode(ctx, agent, 'ptc'");
+    const ret = tail.indexOf('return;');
+    assert.ok(decl > 0, 'both 不支持的那一支必须给预设 ptc 的队员同步声明 ptc —— 否则退回真机那个 P0');
+    assert.ok(ret < 0 || decl < ret, 'ptc 声明必须排在 return 之前（排在后面就是永不执行的死代码）');
+    // 与「批量档关着」那一支保持同一句式（两处漂了就会只修一边）。
+    const offBranch = runtimeSrc.indexOf('roleBatchOn(peekConfig(), role) === false');
+    assert.ok(offBranch >= 0 && runtimeSrc.slice(offBranch, offBranch + 1800).includes("declareMemberMode(ctx, agent, 'ptc'"),
+      '批量档关着那一支也要有同一句（两边必须对称）');
+  });
+
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
     // 用户 2026-10-09：「一定要正确，和我用官方的对话框没太大区别」。
     // 官方真值来自 dsh-client-ui-conversation/lib/client.js 的 locale 块，
