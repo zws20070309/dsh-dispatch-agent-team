@@ -1705,9 +1705,15 @@ async function main() {
       return true;
     });
 
-    check('检测表与 ops 0.3.0 的注册面对齐：四组件行名 + 11 个公开工具名 + 无 ops_run', () => {
+    check('检测表与装机 ops 的注册面对齐：四组件行名 + 18 个公开工具名 + 无 ops_run', () => {
       if (adapter.OPS_ROWS.length !== 4) return 'OPS_ROWS 不是四行：' + adapter.OPS_ROWS.map((row) => row.id).join(', ');
-      if (adapter.OPS_TOOL_NAMES.length !== 11) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      // 2026-10-21：11 → 18。ops 0.3.2 的 file 组件发布 **11** 个工具
+      // （lib/policy.js:7 的 FILE_TOOLS：inspect_local_file/grep/glob/replace/write_file/edit_file/diff/stat/copy/move/remove），
+      // 而本包原来只列了 0.3.0 时代的前四个 —— 七个真在跑的工具从来没进过能力盘点。
+      // 11(file) + 1(bash) + 4(background，0.3.2 已移除但保留兼容) + 2(ptc) = 18。
+      if (adapter.OPS_FILE_TOOL_NAMES.length !== 11) return 'OPS_FILE_TOOL_NAMES 数量变了（' + adapter.OPS_FILE_TOOL_NAMES.length + '）：与 ops 的 FILE_TOOLS 不再一致';
+      if (adapter.OPS_TOOL_NAMES.length !== 18) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      if (!adapter.OPS_REMOVED_COMPONENTS.includes('background')) return 'OPS_REMOVED_COMPONENTS 必须含 background（0.3.2 已移除该组件）';
       if (adapter.OPS_TOOL_NAMES.indexOf('ops_run') >= 0) return '名单里出现了 ops_run：0.3.0 任何组合都不发布它（docs/manual-validation.md:17）';
       const probe = probeRows;
       if (probe.mounted.length !== 3) return 'disabled 的那一行不该算挂载：' + probe.mounted.join(', ');
@@ -1718,7 +1724,8 @@ async function main() {
     });
 
     // ops-enable.cjs 的 plan()：四组件启用的唯一真值（drift-check 复用它）。
-    const { plan: planEnable, SHELL_OVERRIDE_TEXT } = require('./ops-enable.cjs');
+    const enable = require('./ops-enable.cjs');
+    const { plan: planEnable, SHELL_OVERRIDE_TEXT } = enable;
     const sampleProfile = '- id: agent-team\n  config:\n    maxMembers: 48\n\n'
       + '- id: dsh-ops-shell\n  disabled: true\n\n- id: llm-deepseek\n  name: x\n';
     const pass1 = planEnable(sampleProfile);
@@ -1922,7 +1929,10 @@ async function main() {
       '    extraGuidance: "' + foldedChunks[0],
       '      ' + foldedChunks[1],
       '      ' + foldedChunks[2] + '"',
-      '    bashPath: ' + JSON.stringify(FAKE_BASH)].join(LF3);
+      // 2026-10-21：夹具改用**正确的 YAML 标量写法**（单引号）。原来这里跟着实现一起用了
+      // JSON.stringify —— 那会写出 "C:\\\\Program Files\\\\..."（反斜杠转义两遍），
+      // 既是错的 YAML 写法，也让「按值比较」永远不相等（每次 --check 都重写那一行）。
+      '    bashPath: ' + enable.yamlScalar(FAKE_BASH)].join(LF3);
     const foldedOnce = planEnable(foldedRow, { bashPath: FAKE_BASH });
     check('宿主把 extraGuidance 折行后：--check 不许误报，值真改了仍要报（2026-10-16 真机）', () => {
       if (foldedOnce.patched.length !== 0) return '折行被当成缺键（每次启动都要重写 profile = 与宿主互相改写）：' + JSON.stringify(foldedOnce.patched);

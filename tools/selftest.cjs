@@ -2741,8 +2741,12 @@ function functionBodyOf(source, needle) {
     assert.ok(indexSrc.includes('status.opsIntegration = detectOpsComponents('), 'writeStatusFile 必须落盘 opsIntegration（状态文件是唯一真值来源）');
     // 告警判据必须由**调用方按该作用域的呈现档**给，不许 detectOpsComponents 自己凭可见性猜：
     // 猜了就会给 Lead（原生档）和 both 队员（批量档）误报「拿不到 ops_batch 需要处理」，而那是设计使然。
-    assert.ok(/purePtc === true && mounted\.includes\('ptc'\)/.test(adapterSrc),
+    // 2026-10-21：判据从 mounted 改成 **liveMounted**（剔除 0.3.2 已移除的 background 组件）。
+    // 断言的**意图**不变：missingPtc 必须由调用方给的呈现档决定，不许凭可见性猜。
+    assert.ok(/purePtc === true && liveMounted\.includes\('ptc'\)/.test(adapterSrc),
       'ops-adapter 的 missingPtc 必须以 purePtc === true 为前提（否则按可见性误报）');
+    assert.ok(/OPS_REMOVED_COMPONENTS/.test(adapterSrc),
+      'ops-adapter 必须知道 dsh-ops 0.3.2 已移除 background 组件（否则会报假的缺失）');
     assert.ok(/!purePtc && mounted\.includes\('ptc'\)/.test(adapterSrc) === false,
       'ops-adapter 里不得出现引用未定义变量 mounted 的判据（linkOpsForMember 作用域只有 probe.mounted）');
     assert.ok(/probe\.mounted\.includes\('ptc'\)/.test(adapterSrc),
@@ -2844,14 +2848,23 @@ function functionBodyOf(source, needle) {
     // 迁移标记（P1）：ops 的 updatedConfig 会把无标记行的 allowSystemShellFallback 翻成 false 并写回。
     const enableRows = enableSrc.slice(enableSrc.indexOf('const ROWS = ['));
     const rowBlockOf = (id) => { const at = enableRows.indexOf("id: '" + id + "'"); return at < 0 ? '' : enableRows.slice(at, at + 600); };
-    // 标记在实现里是一个共享常量 MARKER（单一真值），所以这里既认常量引用也认字面量。
-    assert.ok(enableSrc.includes("const MARKER = '    configUpdateVersion: 1'"),
-      'ops-enable 必须把迁移标记定义成共享常量 MARKER（值 = 四个空格 + configUpdateVersion: 1）');
-    for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background']) {
+    // 2026-10-21 改判据：MARKER 的**值**不再写死 1，而是从装机 dsh-ops 的
+    // lib/config-updates.js 读 CONFIG_UPDATE_VERSION（0.3.2 已是 2）。
+    // 原来这里断言字面量 `configUpdateVersion: 1` —— 那条断言本身就是在保护那个 bug：
+    // 它逼着实现写死 1，于是 ops 升到 2 之后本脚本会把用户的**已迁移**配置降级写回 1。
+    assert.ok(enableSrc.includes('CONFIG_UPDATE_VERSION') && enableSrc.includes('detectConfigVersion'),
+      'ops-enable 必须从装机 dsh-ops 读 CONFIG_UPDATE_VERSION（不许写死迁移版本号）');
+    assert.ok(!/configUpdateVersion: 1'/u.test(enableSrc),
+      'ops-enable 里又出现了写死的 configUpdateVersion: 1（上游升到 2 时会把用户配置降级）');
+    // shell / file 两行要带标记；background **不许带**（0.3.2 的 config-updates.js:22 明写
+    // 「`dsh-ops/background` is a no-op stub that reads no config, so it needs no migration」）。
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file']) {
       const block = rowBlockOf(id);
-      assert.ok(block.includes('MARKER,') || block.includes('configUpdateVersion: 1'),
-        'ops-enable 的 ' + id + ' 行必须带 configUpdateVersion 标记（否则 ops 迁移会改写这一行）');
+      assert.ok(block.includes('MARKER,'),
+        'ops-enable 的 ' + id + ' 行必须带迁移标记（否则 ops 迁移会改写这一行）');
     }
+    assert.ok(!rowBlockOf('dsh-ops-background').includes('MARKER,'),
+      '背景行不许带迁移标记：0.3.2 已移除该组件，它不读任何配置，标记只会制造假缺失');
     assert.ok(!rowBlockOf('dsh-ops-ptc').slice(0, 300).includes('configUpdateVersion'), 'ops-enable 的 ptc 行不得带 configUpdateVersion（resolvePtcConfig 会抛 Unknown PTC config key）');
     assert.ok(rowBlockOf('dsh-ops-background').includes('allowSystemShellFallback: true'), 'ops-enable 的 background 行必须 allowSystemShellFallback: true（job 工具的发布门）');
     const driftSrc = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
@@ -3066,6 +3079,28 @@ function functionBodyOf(source, needle) {
     // 客户端那格开关的说明也要跟着说准：它现在只在「宿主支持 both」时才有意义。
     const clientSrc = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
     assert.ok(clientSrc.includes('batchTip'), '批量开关的说明文案必须仍在（配置页那一格）');
+  });
+
+  await check('会改用户配置的脚本：不认识的参数必须拒绝，不许落进默认写盘动作（2026-10-21 真事故）', () => {
+    // 事故原貌：想先看用法，跑了 `node tools/ops-enable.cjs --help` —— 它只做 includes('--check')/
+    // includes('--revert')，于是 --help 静默落进**默认动作 = 写盘**，把用户 profile 里两行
+    // configUpdateVersion 从 2 改回 1、并把 dsh-ops 的 shell 段降级。
+    // 判据：未知参数一律退出码 2 且不写；--help 打印用法且不写。这里只做静态断言
+    // （真跑一次要动用户 profile，放进 run 里跑会污染环境），行为验证见提交说明里的实测输出。
+    const src = readFileSync(path.join(__dirname, 'ops-enable.cjs'), 'utf8');
+    const at = src.indexOf('function unknownArgs');
+    assert.ok(at >= 0, 'ops-enable.cjs 必须有 unknownArgs 白名单校验');
+    const body = src.slice(at, at + 900);
+    for (const known of ["'--check'", "'--revert'", "'--help'", "'-h'"]) {
+      assert.ok(body.includes(known), '白名单少了 ' + known);
+    }
+    // 拒绝分支必须 return 2（不是 undefined = 继续往下写盘）且排在默认动作之前。
+    const guard = src.indexOf('if (bad.length > 0)');
+    const checkAt = src.indexOf("const check = argv.includes('--check')");
+    assert.ok(guard >= 0 && checkAt > guard, '未知参数守卫必须排在默认动作之前');
+    assert.ok(/if \(bad\.length > 0\)[\s\S]{0,400}return 2;/u.test(src), '未知参数必须以退出码 2 拒绝');
+    // --help 必须自己开一条只打印的分支，不能靠「没有 --check」落到写盘。
+    assert.ok(/argv\.includes\('--help'\)[\s\S]{0,600}return 0;/u.test(src), '--help 必须单独走「只打印、直接返回」');
   });
 
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
