@@ -984,7 +984,7 @@ function functionBodyOf(source, needle) {
     // 背景：脚本第一版只有「前缀是否逐字节相同」的推算模型，我据此在会话里对用户说过「会话日志里
     // 没有 usage 字段，拿不到实测命中率，只能做理论分析」—— 那是**假话**：assistant/message.data.usage
     // 一直带 cacheReadTokens（本机 143 个队员会话 8603 条 assistant/message 全部带 usage、8041 条带
-    // cacheReadTokens），本包 lib/graph.js:168 与 lib/cache.js:240 也一直在读它。
+    // cacheReadTokens），本包 lib/graph.js:265 与 lib/cache.js:240 也一直在读它。
     const audit = require(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'));
     assert.equal(typeof audit.usageOf, 'function', '脚本不再导出 usageOf：实测口径又变成不可断言的了');
     assert.equal(typeof audit.summarizeSession, 'function', '脚本不再导出 summarizeSession');
@@ -3254,6 +3254,83 @@ function functionBodyOf(source, needle) {
     assert.equal(statsOf(expired), 55000, '窗口过期后必须回落到「最后事件时间 − 起点」');
     // now 早于最后事件时不得倒退
     assert.equal(graph.effectiveRuntimeMs(open, now - 60000), 55000, 'now 早于最后事件时取两者较大，不得倒退');
+  });
+
+  await check('tps 的分母必须扣掉工具调用时长（用户 2026-10-21 的口径）', () => {
+    // 用户原话：「tps 似乎是总 token/对话时长，但应该为 总token/(对话时长-工具调用时长)」。
+    // 现象核验（真机 session-0000100d，32 轮 / 1132 次工具调用）：
+    //   turn 累计 75,609 秒，其中工具占用 61,165 秒（81%）⇒ 旧口径 5.95 tps、新口径 31.14 tps。
+    // 一个把 81% 时间花在等工具上的会话，「输出速度」显示 5.95 是在量「含工具等待的吞吐」。
+    const s = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 1000, data: { turn: 1, step: 1, callId: 'a', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 2, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'a', content: [], isError: false } } },
+      { type: 'assistant/message', seq: 3, time: 10000, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 300, cacheReadTokens: 0, cacheWriteTokens: 0 } } },
+      { type: 'turn/end', seq: 4, time: 10000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    assert.equal(graph.effectiveRuntimeMs(s), 10000, '前提：回合 0→10000 = 10 秒');
+    assert.equal(graph.toolBusyMs(s), 8000, '前提：一次工具调用占了 8 秒');
+    assert.equal(graph.generatingMs(s), 2000, '生成时长必须 = 10000 − 8000');
+    const g = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s]]), tasks: [] });
+    const node = g.nodes[0];
+    assert.equal(node.toolBusyMs, 8000, '节点要把工具占用如实带给前端（悬停解释分母用）');
+    assert.equal(node.generatingMs, 2000, '节点要把生成时长带给前端');
+    // 300 token / 2 秒 = 150 tps；旧口径会是 300/10 = 30 tps。
+    assert.ok(Math.abs(node.tps - 150) < 1e-6, `tps 应按生成时长算 = 150，实际 ${node.tps}`);
+    // 底栏两档只统计**队员**（Lead 自己单列）：夹具里是 Lead，所以这里断言的是「不被误算进去」，
+    // 再由下一个断言核对：把同一份统计挂到队员名下时，两个口径必须都给出 150。
+    assert.equal(g.totals.avgTps, 0, '底栏均值只统计队员，Lead 不参与');
+    const asMember = graph.buildGraph({
+      leadId: 'L', leadName: 'lead', members: [{ id: 'M', name: 'builder-a', role: 'teammate', status: 'active' }],
+      statsBySession: new Map([['L', graph.emptyStats()], ['M', s]]), tasks: [],
+    });
+    assert.ok(Math.abs(asMember.totals.avgTps - 150) < 1e-6, '底栏均值同口径（队员档）');
+    assert.ok(Math.abs(asMember.totals.tps - 150) < 1e-6, '底栏全队速度同口径（token 合计 ÷ 生成时长合计）');
+    assert.equal(asMember.totals.toolBusyMs, 8000, '底栏要带工具占用（与节点同口径）');
+  });
+
+  await check('tps 的工具时长必须**合并重叠**（并行工具不能扣两遍，否则分母会被扣成负数）', () => {
+    // 官方 maxParallelToolCalls 默认 10：同一 step 里并发发的工具调用时间区间互相重叠，
+    // 「把每次调用时长相加」会把同一段时间扣 10 次。实测 session-0000100d 的重叠只有 2 秒，
+    // 但这笔账没有上限 —— 一批并行调用就能把生成时长算成负数，tps 变成无穷大。
+    const s = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 1000, data: { turn: 1, step: 1, callId: 'a', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/call', seq: 2, time: 2000, data: { turn: 1, step: 1, callId: 'b', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/call', seq: 3, time: 3000, data: { turn: 1, step: 1, callId: 'c', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 4, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'a', content: [], isError: false } } },
+      { type: 'tool/result', seq: 5, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'b', content: [], isError: false } } },
+      { type: 'tool/result', seq: 6, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'c', content: [], isError: false } } },
+      { type: 'turn/end', seq: 7, time: 10000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    // 三次调用区间 [1000,9000] × 3：合并后是 8000，相加会是 24000（比回合还长）。
+    assert.equal(graph.toolBusyMs(s), 8000, `合并后应为 8000ms，实际 ${graph.toolBusyMs(s)}`);
+    assert.equal(graph.generatingMs(s), 2000, '生成时长不能为负');
+    // 不相邻的两段必须分开算（中间那段是模型在生成，不能被吞掉）。
+    const split = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 1000, data: { turn: 1, step: 1, callId: 'x', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 2, time: 4000, data: { turn: 1, step: 1, message: { toolCallId: 'x', content: [], isError: false } } },
+      { type: 'tool/call', seq: 3, time: 6000, data: { turn: 1, step: 1, callId: 'y', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 4, time: 7000, data: { turn: 1, step: 1, message: { toolCallId: 'y', content: [], isError: false } } },
+      { type: 'turn/end', seq: 5, time: 10000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    assert.equal(graph.toolBusyMs(split), 4000, '3000 + 1000 两段，中间 2 秒是生成时间');
+    assert.equal(graph.generatingMs(split), 6000, '10000 − 4000');
+  });
+
+  await check('tps 口径的三处消费方必须同源（节点 / 底栏 / 悬停说明）', () => {
+    // 口径改了一半最糟：卡片按旧口径、浮窗按新口径，两个数字互相打架且都没法核对。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/tps\.title = wsTpsTip\(node\)/.test(src), '卡片上的 tps 必须挂分母说明');
+    assert.ok(/footCells\[1\]\.title !== tpsTip/.test(src), '刷新路径也要更新说明（冷启动与轮询两条路）');
+    assert.ok(/function wsTpsTip\(/.test(src), '说明必须只有一个来源（wsTpsTip）');
+    assert.ok(src.includes('wsTpsFormula'), '文案键要在字典里');
+    const graphSrc = readFileSync(path.join(__dirname, '..', 'lib', 'graph.js'), 'utf8');
+    assert.ok(/const generating = Math\.max\(0, runtimeMs - busyMs\)/.test(graphSrc),
+      'tps 的分母必须是 runtimeMs − busyMs');
+    assert.ok(!/const tps = runtimeSec > 0\.5 \? s\.usage\.outputTokens \/ runtimeSec/.test(graphSrc),
+      '旧的「总 token ÷ 对话总时长」口径必须已经删掉');
   });
 
   await check('工作区实时刷新：浮窗打开不得冻结卡片与浮窗指标（用户 2026-10-12 报「弹窗一开就不更新」）', () => {
