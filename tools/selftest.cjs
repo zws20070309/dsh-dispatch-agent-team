@@ -2767,14 +2767,17 @@ function functionBodyOf(source, needle) {
     const dmAt = runtimeSrc.indexOf('function declareMemberMode');
     assert.ok(dmAt >= 0, 'runtime.js 必须有 declareMemberMode（纯 PTC 档的同步声明口）');
     const dmBody = runtimeSrc.slice(dmAt, dmAt + 2200);
-    assert.ok(/pick\(ctx, 'ptcRuntime'\) === undefined/.test(dmBody) && /presentAs\(mode\)/.test(dmBody),
-      'declareMemberMode 必须先探 ptcRuntime 再声明：modeFor 解析成 ptc 时装配会走 requirePtcRuntime（dsh-tools:2863-2865），拿不到就抛 —— 那会让这名队员每一次请求都失败');
-    const branchRe = /if \(resolveRolePreset\(peekConfig\(\), role\) === 'ptc'\) declareMemberMode\(ctx, agent, 'ptc', who, notes, disposers\);/;
-    assert.ok(branchRe.test(runtimeSrc),
-      'applyMemberBatch 关掉批量的那一支必须给预设 ptc 的队员同步声明 ptc 档（否则第一次请求跑在旧组合上 = 真机那个 P0）');
+    // 2026-10-21：ptcRuntime 守卫只对**非 native** 档有意义（官方 requirePtcRuntime 在
+    // wireSchemas 的 `if (mode === "native") return …` 之后才调用）。断言改成认这个条件。
+    assert.ok(/mode !== 'native' && pick\(ctx, 'ptcRuntime'\) === undefined/.test(dmBody) && /presentAs\(mode\)/.test(dmBody),
+      'declareMemberMode 必须只在非 native 档探 ptcRuntime（native 装配根本不碰它），然后再 presentAs');
+    // 关掉批量 = 明确钉 native（2026-10-21 第二次修正：不再是「沿用预设」。
+    // 交付态里 12 个角色全是 preset ptc，沿用预设会让开关两端都是 ptc = 拨了没反应）。
+    assert.ok(/declareMemberMode\(ctx, agent, 'native', who, notes, disposers\);/.test(runtimeSrc),
+      'applyMemberBatch 关掉批量的那一支必须**明确声明 native**（否则开关拨到「关」与「开」没有可观测差异）');
     const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
     assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes('return true;'),
-      'applyMemberBatch 成功路径必须 return true（purePtc 判据依赖这个返回值）');
+      'applyMemberBatch 的 both 成功路径必须 return true（purePtc 判据依赖这个返回值）');
 
     // ②c 队员 model 显示链路（2026-10-16 session-00001005 P1 的形状闸门）：
     //     runtime 必须在**真的把覆盖写进请求对象之后**才记账（记早了会把「解析出但没采用」的写进去），
@@ -3119,10 +3122,15 @@ function functionBodyOf(source, needle) {
     const ret = tail.indexOf('return;');
     assert.ok(decl > 0, 'both 不支持的那一支必须给预设 ptc 的队员同步声明 ptc —— 否则退回真机那个 P0');
     assert.ok(ret < 0 || decl < ret, 'ptc 声明必须排在 return 之前（排在后面就是永不执行的死代码）');
-    // 与「批量档关着」那一支保持同一句式（两处漂了就会只修一边）。
-    const offBranch = runtimeSrc.indexOf('roleBatchOn(peekConfig(), role) === false');
-    assert.ok(offBranch >= 0 && runtimeSrc.slice(offBranch, offBranch + 1800).includes("declareMemberMode(ctx, agent, 'ptc'"),
-      '批量档关着那一支也要有同一句（两边必须对称）');
+    // 2026-10-21：对称性换了对象 —— 现在两端都由**开关**决定，且必须是**不同的档**：
+    // 开 -> ptc（拿 run_code），关 -> native（拿全套原生工具）。两边都只声明、都不等异步重绑。
+    const offAt = runtimeSrc.indexOf('wantRunCode === false');
+    assert.ok(offAt >= 0, 'applyMemberBatch 关门那一支必须由 wantRunCode 判据控制');
+    assert.ok(runtimeSrc.slice(offAt, offAt + 700).includes("declareMemberMode(ctx, agent, 'native'"),
+      '关掉批量必须钉 native（与「开 -> ptc」形成真实差异）');
+    const onAt = runtimeSrc.indexOf('presentationModeSupported(ctx, \'both\')');
+    assert.ok(onAt >= 0 && runtimeSrc.slice(onAt, onAt + 1400).includes("declareMemberMode(ctx, agent, 'ptc'"),
+      '开批量（宿主无 both 时）必须钉 ptc');
   });
 
   await check('工具行标签：本机工具面里的工具都必须有官方同类词，不许退成泛泛的「工具调用」（2026-10-21 真机）', () => {
