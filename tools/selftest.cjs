@@ -23,7 +23,8 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { readFileSync, existsSync } = require('node:fs');
+const { readFileSync, existsSync, readdirSync } = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -36,7 +37,11 @@ let envSkipped = 0;
 
 async function check(name, fn) {
   try {
-    await fn();
+    const outcome = await fn();
+    // 返回**非空字符串**也算失败（与 tools/drift-check.cjs 的报告器同一契约）。
+    // 旧写法只看「有没有抛错」，于是用 return 原因字符串 表达的断言**永远绿** —— 2026-10-15
+    // 新加的两条预设闸门就是这么空转了一轮，靠变异测试（把被检代码改坏、看闸门咬不咬）才抓出来。
+    if (typeof outcome === 'string' && outcome !== '') throw new Error(outcome);
     passed += 1;
     console.log(`  PASS  ${name}`);
   } catch (error) {
@@ -277,6 +282,96 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.resolveRoleRoute(withEffort, 'builder').reasoningEffort, 'low');
   });
 
+  await check('角色预设配置：sanitizeConfig 允许「只配预设不配模型」，resolveRolePreset 只认白名单', () => {
+    const logs = [];
+    const log = (message) => logs.push(message);
+    const onlyPreset = roster.sanitizeConfig({ version: 1, roles: { scout: { preset: 'standard' } } }, log);
+    if (onlyPreset.roles.scout === undefined) return '只配预设的角色被整条丢掉了（旧实现 provider/model 不配对就 continue）：' + JSON.stringify(onlyPreset.roles);
+    if (onlyPreset.roles.scout.preset !== 'standard') return 'preset 没被留下：' + JSON.stringify(onlyPreset.roles.scout);
+    if (roster.resolveRolePreset(onlyPreset, 'scout') !== 'standard') return 'resolveRolePreset 读不回 standard';
+    // 白名单外：丢字段 + 记一条诊断，绝不静默接受（也不抛错）。
+    const bogus = roster.sanitizeConfig({ version: 1, roles: { scout: { preset: 'cordis' } } }, log);
+    if (bogus.roles.scout !== undefined) return '白名单外的预设竟然留下了：' + JSON.stringify(bogus.roles.scout);
+    if (!logs.some((line) => /cordis/.test(line))) return '丢掉白名单外的预设时没留下任何诊断：' + logs.join(' | ');
+    // 空串 = 跟随 Lead：不落键（这样「取消某角色的预设」与「从没配过」在磁盘上是同一个形状）。
+    const cleared = roster.sanitizeConfig({ version: 1, roles: { scout: { preset: '' } } }, log);
+    if (cleared.roles.scout !== undefined) return '空串预设应该等于跟随 Lead（不落键）：' + JSON.stringify(cleared.roles.scout);
+    if (roster.resolveRolePreset(cleared, 'scout') !== undefined) return 'resolveRolePreset 对未配置的角色必须回 undefined';
+    // 未净化的对象也不能被信任（防调用方把 raw 传进来）。
+    if (roster.resolveRolePreset({ roles: { scout: { preset: 'evil' } } }, 'scout') !== undefined) return 'resolveRolePreset 没再挡一次白名单';
+    // 三个 id 是用户点名要的那三个，顺序即下拉顺序；改动会同时影响配置页与运行时。
+    if (JSON.stringify(roster.TEAMMATE_PRESET_IDS) !== JSON.stringify(['ptc', 'standard', 'minimal-grayscale'])) {
+      return 'TEAMMATE_PRESET_IDS 与用户定案的名单不一致：' + roster.TEAMMATE_PRESET_IDS.join(', ');
+    }
+    return true;
+  });
+
+  await check('草稿行只有一个构造口 makeRow，四个维度（模型/强度/预设/批量）都在里面', () => {
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
+    // 2026-10-15 加预设列时踩过「十几处各自写字面量、漏一处就静默丢配置」；同日加第四维（batch）
+    // 时把构造口收成一个 makeRow。所以这条闸门从「禁两字段形状」升级成**禁任何绕过 makeRow 的
+    // 行字面量** —— 判据用真实文本，不用正则（上一版写正则，转义在多层 here-string 里被吃掉，
+    // 闸门空转了一整轮才由变异测试抓出来）。
+    if (!cli.includes('function makeRow(key, effort, preset, batch)')) return 'makeRow 构造口没了（回到十几处字面量 = 老坑复发）';
+    if (!cli.includes('batch: batch !== false,')) return 'makeRow 不再把 batch 归一成布尔（默认开 = 只有显式 false 才关）';
+    const forbidden = [
+      '{ key: row.key, effort: row.effort }',
+      "{ key: '', effort: '' } : draft[role.id]",
+      '{ key: row.key, effort: row.effort, preset:',
+      '{ key: row.key, effort, preset:',
+      '{ key, effort, preset }',
+      "{ key: '', effort: '', preset }",
+      "{ key: '', effort: '', preset: keep }",
+      'out[roleId] = { key: row.key',
+      'next[roleId] = { key',
+      'draft[roleId] = { key',
+    ];
+    const hits = forbidden.filter((needle) => cli.includes(needle));
+    if (hits.length > 0) return '这些草稿行绕过了 makeRow：' + hits.join(' ; ');
+    if (cli.includes("if (key === '') delete next[roleId]")) return 'changeModel 清模型时连带删掉整行';
+    for (const needle of ['changePreset', 'changeAllPresets', 'renderPreset', 'normalizePresets',
+      'changeBatch', 'changeAllBatch', 'entry.batch = false', 'rowIsEmpty(nextRow)']) {
+      if (!cli.includes(needle)) return '客户端少了 ' + needle + '（批量调用那一维被删了？）';
+    }
+    // 第四维必须进指纹：否则「只拨开关」永远不算未保存改动，用户以为保存过了。
+    if (!cli.includes("row.batch === false ? '0' : '1'")) return 'draftSignature 没带上 batch 维度';
+    return true;
+  });
+
+  await check('统一选择那一排的 CSS：顶对齐 + 恒定提示槽 + 勾选格与下拉格等高', () => {
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8')
+    // 版面 bug 的另一半在 CSS 里，结构闸门看不见（把 align-items 改回 flex-end，67 条冒烟全绿），
+    // 所以这里钉住三条**决定对齐**的声明。改布局的人要同时改这里，改不动就说明对齐被破坏了。
+    if (cli.includes('.dat-bulk-ctl{display:flex;gap:8px 14px;flex-wrap:wrap;align-items:flex-start}')) {
+      // 现状
+    } else if (cli.includes('align-items:flex-end')) {
+      return '.dat-bulk-ctl 又回到底对齐了：带提示语的那一格会把整排顶歪（2026-10-15 用户第二次报版面）';
+    } else {
+      return '.dat-bulk-ctl 的声明形状变了，本条判据要按新 CSS 重写';
+    }
+    if (!cli.includes('.dat-hintslot{display:block;min-height:16px')) return '提示槽的恒定行高没了（没话时那一格会矮一截）';
+    if (!cli.includes('.dat-checkline{display:flex;align-items:center;gap:7px;height:24px')) return '勾选格不再与下拉格等高（24px 那条）';
+    return true;
+  });
+  await check('批量调用档（roster 层）：默认开，只有显式 false 才关，非布尔不猜意图', () => {
+    const logs = [];
+    const log = (line) => logs.push(line);
+    assert.equal(roster.roleBatchOn(roster.defaultConfig(), 'scout'), true, '空配置默认应为开');
+    assert.equal(roster.roleBatchOn(void 0, 'scout'), true, '连配置都没有时也应为开');
+    assert.equal(roster.roleBatchOn({ roles: { scout: { batch: false } } }, 'scout'), false, '显式 false 应为关');
+    assert.equal(roster.roleBatchOn({ roles: { scout: { batch: true } } }, 'scout'), true, '显式 true 应为开');
+    assert.equal(roster.roleBatchOn({ roles: { builder: { batch: false } } }, 'scout'), true, '别的角色关掉不该牵连 scout');
+    const only = roster.sanitizeConfig({ roles: { scout: { batch: false } } }, log);
+    assert.deepEqual(only.roles.scout, { batch: false }, '只配 batch:false 的行被整条丢掉了（等于关不掉）');
+    const on = roster.sanitizeConfig({ roles: { scout: { batch: true, preset: 'ptc' } } }, log);
+    assert.deepEqual(on.roles.scout, { preset: 'ptc' }, 'batch:true 与不写等价，不该落键：' + JSON.stringify(on.roles.scout));
+    logs.length = 0;
+    const junk = roster.sanitizeConfig({ roles: { scout: { batch: 'no' } } }, log);
+    assert.equal(junk.roles.scout, void 0, '非布尔 batch 不该落盘：' + JSON.stringify(junk.roles));
+    assert.equal(logs.length, 1, '非布尔 batch 必须留下一条诊断：' + JSON.stringify(logs));
+    const pair = roster.sanitizeConfig({ roles: { scout: { provider: 'p', model: 'm', batch: false } } }, log);
+    assert.deepEqual(pair.roles.scout, { provider: 'p', model: 'm', batch: false }, '模型与 batch 互相挤掉了：' + JSON.stringify(pair.roles.scout));
+  });
   await check('configuredRoleCount：数被覆盖的角色', () => {
     assert.equal(roster.configuredRoleCount(roster.defaultConfig()), 0);
     assert.equal(
@@ -292,6 +387,9 @@ function functionBodyOf(source, needle) {
     assert.equal(hasTemplateBraces(playbook.PLAYBOOK), false, 'PLAYBOOK 里出现了 {{…}} 变量语法');
     assert.equal(hasTemplateBraces(playbook.TEAM_POLICY), false, 'TEAM_POLICY 里出现了 {{…}} 变量语法');
     assert.equal(hasTemplateBraces(playbook.TEAMMATE_CARD), false, 'TEAMMATE_CARD 里出现了 {{…}} 变量语法');
+    // 钉给队员的 persona 是**模型可见文本**，而且它会送进官方那个严格插值的槽位：
+    // 一句带 {{…}} 的文本会让每次装配都尝试解一个不存在的变量。
+    assert.equal(hasTemplateBraces(roster.MEMBER_PERSONA_PIN), false, 'MEMBER_PERSONA_PIN 里出现了 {{…}} 变量语法');
     for (const roleId of roster.ROLE_IDS) {
       assert.equal(hasTemplateBraces(playbook.teammateBrief(roleId, roleId)), false, `角色简报 ${roleId} 里出现了 {{…}} 变量语法`);
     }
@@ -379,6 +477,48 @@ function functionBodyOf(source, needle) {
     assert.equal(playbook.teammateCard, undefined, 'teammateCard 又回来了：队员卡必须与角色无关');
   });
 
+  await check('派活简报不再中英同框：模型只读一份（英文角色名 = id 的重述，零新增信息）', () => {
+    // 用户 2026-10-15 明确选了「去掉英文侧」，理由是他自己提出的：双语会让模型
+    // 「读一遍中文，读一遍英文」。本轮实跑量了账（不是估的）：
+    //   * 12 个角色的 labelEn 里 **11 个就是 role.id 的 Title-Case 改写**
+    //     （scout→Scout、plan-critic→Plan Critic、red-team→Red Team…），
+    //     唯一不同的 verify→Verifier 也只是同词形变化；
+    //   * 而 id 在同一行里**已经用反引号给了**，所以英文侧对模型是纯粹的重述 ——
+    //     删掉不丢任何信息；
+    //   * 承载区分度的是中文 label：五个审查类角色（前沿/计划/逻辑/对抗/美术审查）
+    //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
+    //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
+    //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
+    // labelEn **不删**：配置页（lib/client.js:2700）与 ROLES 契约（INTERFACES §1）
+    // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
+    const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
+    for (const role of roster.ROLES) {
+      const brief = playbook.teammateBrief(role.id, role.id);
+      assert.ok(brief.includes(role.label), role.id + ' 的简报丢了中文 label（那才是给人和模型看的分工名）');
+      assert.ok(!brief.includes(role.labelEn),
+        role.id + ' 的简报里又出现英文角色名 ' + role.labelEn + '（模型每轮多读一份重述）');
+      // 首行形状：角色 id 必须还在（模型要靠它对齐工具面与角色表）。
+      assert.ok(brief.includes('角色 ' + String.fromCharCode(96) + role.id + String.fromCharCode(96)),
+        role.id + ' 的简报首行不再带角色 id（删英文侧时把 id 一起删了）');
+    }
+    // 三个常量是 Lead 与队员每轮都读的前缀，同样不许夹英文角色名。
+    for (const role of roster.ROLES) {
+      assert.ok(!leadText.includes(role.labelEn),
+        '常量里夹了英文角色名 ' + role.labelEn + '（PLAYBOOK / TEAM_POLICY / TEAMMATE_CARD 是每轮前缀）');
+    }
+    // 兜住这条改动的真正风险：**角色区分**。删错一侧（删中文留英文）会当场失去区分度，
+    // 而 12 个英文侧几乎同形（五个都是 …Auditor/Critic），比中文更难分。
+    const briefs = roster.ROLES.map((role) => playbook.teammateBrief(role.id, role.id));
+    assert.equal(new Set(briefs).size, roster.ROLES.length, '删英文侧后有两个角色的简报变得完全相同');
+    assert.equal(new Set(roster.ROLES.map((role) => role.label)).size, roster.ROLES.length,
+      '中文 label 出现重名（那才是简报里的角色区分来源）');
+    // 配置页那半边必须照旧拿得到英文名（删的是提示词，不是字段）。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/role\.labelEn === '' \? null : React\.createElement/.test(cli),
+      '配置页的角色英文名渲染点变了：labelEn 若真没人用就该整条删掉，而不是留个死字段');
+    assert.ok(roster.ROLES.every((role) => typeof role.labelEn === 'string' && role.labelEn !== ''),
+      'ROLES 里有角色的 labelEn 空了（配置页会显示空白）');
+  });
   await check('teammateBrief：每个角色都有使命/纪律/写权限，且角色之间确实不同', () => {
     const seen = new Map();
     for (const role of roster.ROLES) {
@@ -670,6 +810,354 @@ function functionBodyOf(source, needle) {
     assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
   });
 
+  await check('队员 model 校正：官方给的是继承模型，必须换成请求真正用的那份（session-00001005 的 P1）', () => {
+    // 现场（2026-10-16 session-00001005，逐条从会话日志核出）：两名队员的 list_agents 行都写
+    // model=model-a（= Lead 自己的模型），而它们的 request/header.header.config 与 request/context
+    // 全是 provider-b/model-b（角色配置里的模型）。根因是官方 listMembers 取
+    // live?.options.model ?? root.options.model（dsh-experimental-agent-team/lib/index.js:698、:449），
+    // options.model 是继承来的那份；本包的角色覆盖发生在 agent/request 拦截器（installRouteOverride），
+    // 不回写 options.model —— 所以 Lead 问到的是**错的数据**，不是显示滞后。
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', model: 'model-a', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'inactive', model: 'model-a', diagnostics: [] },
+      { id: 'b-id', name: 'scout', role: 'teammate', status: 'inactive', model: 'model-a', diagnostics: [] },
+    ];
+    const fixed = roster.annotateMemberModels(rows, new Map([['a-id', { provider: 'provider-b', model: 'model-b' }]]));
+    assert.equal(fixed[1].model, 'model-b', '记到路由的队员要显示真模型');
+    assert.equal(fixed[0], rows[0], 'Lead 行不许动（它没有覆盖，官方那份就是它的真值）');
+    assert.equal(fixed[2], rows[2], '没记账的队员不许猜：保持官方原值，也别产生新对象');
+    assert.equal(rows[1].model, 'model-a', '入参必须不被修改');
+    assert.equal(roster.annotateMemberModels(fixed, new Map([['a-id', { model: 'model-b' }]]))[1], fixed[1], '已经对了就不重建对象（幂等）');
+    // 空账本 = 零副作用。
+    assert.equal(roster.annotateMemberModels(rows, new Map())[1], rows[1]);
+    assert.equal(roster.annotateMemberModels(rows, {})[1], rows[1]);
+    assert.equal(roster.annotateMemberModels(rows, null)[2], rows[2]);
+    assert.equal(roster.annotateMemberModels(null, new Map([['a-id', { model: 'm' }]])).length, 0, 'rows 不是数组时退化成空表，不抛');
+    // 记到了但 model 是脏值：一律不动那一行（宁可退回官方那份）。
+    assert.equal(roster.annotateMemberModels(rows, new Map([['a-id', {}]]))[1], rows[1], '没有 model 就不校正');
+    assert.equal(roster.annotateMemberModels(rows, new Map([['a-id', { model: '' }]]))[1], rows[1], '空串 model 不校正');
+    assert.equal(roster.annotateMemberModels(rows, new Map([['a-id', { model: 42 }]]))[1], rows[1], '非字符串 model 不校正');
+    // 只改 model 这一个已有字段：不许新增字段（新增 = 改 Lead 工具目录 = 动缓存前缀）。
+    const only = roster.annotateMemberModels(rows, new Map([['a-id', { provider: 'p', model: 'm', reasoningEffort: 'high' }]]))[1];
+    assert.deepEqual(Object.keys(only).sort(), ['diagnostics', 'id', 'model', 'name', 'role', 'status'], '校正只写 model 一个已有字段');
+  });
+
+  await check('「推荐」表：恰好覆盖全部角色、预设 id 在白名单里、batch 是布尔（按钮的取值真值）', async () => {
+    // 为什么钉这条：配置页那个「推荐」按钮的取值来自 lib/roster.js，页面只照抄。
+    // 漏一个角色 = 那个角色**静默不被填**（按钮看起来生效了，实际少改一行）；
+    // 预设 id 写错 = 派队员时拿到官方的 agent-preset/not-found，退回跟随 Lead。
+    // 两者都不会在页面上报错，所以必须在这里钉住。
+    const roster = await load('roster.js');
+    const rec = roster.ROLE_RECOMMENDATIONS;
+    const ids = roster.ROLE_IDS;
+    assert.deepEqual(Object.keys(rec).slice().sort(), ids.slice().sort(),
+      '推荐表与角色表不是同一批角色（漏 = 静默不填，多 = 死条目）');
+    for (const roleId of ids) {
+      const item = rec[roleId];
+      assert.equal(typeof item, 'object', roleId + ' 没有推荐条目');
+      assert.ok(roster.TEAMMATE_PRESET_IDS.includes(item.preset),
+        roleId + ' 的推荐预设 ' + item.preset + ' 不在可指派白名单里（派出来会 not-found 退回跟随 Lead）');
+      assert.equal(typeof item.batch, 'boolean', roleId + ' 的推荐 batch 不是布尔');
+      // 推荐值必须能被 recommendedRoleConfig 原样取回（它是页面/路由唯一的取值口）
+      assert.deepEqual(roster.recommendedRoleConfig(roleId), { preset: item.preset, batch: item.batch },
+        roleId + ' 经 recommendedRoleConfig 取回的值与表里不一致');
+    }
+    assert.equal(roster.recommendedRoleConfig('no-such-role'), undefined, '不存在的角色必须回 undefined');
+    assert.equal(roster.recommendedRoleConfig('__proto__'), undefined, '原型键不许被当成有推荐（hasOwnProperty 守卫）');
+    // 2026-10-21：规则文本随语义改写（不再出现「纯 PTC」这个词，改用「ptc 呈现档」）。
+    // 判据的**意图**不变：必须说清「动了哪两格」与「哪一格不动」。
+    assert.ok(roster.RECOMMENDATION_RULE.includes('批量调用') && roster.RECOMMENDATION_RULE.includes('ptc')
+      && roster.RECOMMENDATION_RULE.includes('模型'),
+      '规则文本要同时说清「填什么」与「不填什么」，否则用户不知道按钮动了哪几格');
+    // 分组本身也是判据（这条划分是这张表的全部理由）。
+    // ⚠️ 2026-10-21 档名对调：宿主删掉 both 后，本包把开关改成「开=ptc / 关=native」，
+    // 所以现在 **只读/汇报型 = batch 开（ptc，省 53KB/轮）**，
+    // **写域型 = batch 关（native，原生 edit/write 直调）**。
+    // 旧表的划分在新语义下会让写域型拿到它最不需要的那一档（只有 run_code，改文件要拼字符串），
+    // 与 roster.js 里第 3 条论证直接冲突。
+    const ptcRoles = ids.filter((roleId) => rec[roleId].batch === true);
+    const nativeRoles = ids.filter((roleId) => rec[roleId].batch === false);
+    assert.deepEqual(nativeRoles.slice().sort(), ['builder', 'integrator', 'refiner', 'scribe', 'tester'],
+      '写域型（batch 关 -> native，原生 edit/write 直调）的角色集合变了：' + JSON.stringify(nativeRoles));
+    assert.deepEqual(ptcRoles.slice().sort(), ['frontier-auditor', 'plan-critic', 'red-team', 'researcher', 'scout', 'verify', 'visual-critic'],
+      '只读/汇报型（batch 开 -> ptc，只有 run_code）的角色集合变了：' + JSON.stringify(ptcRoles));
+  });
+
+  await check('persona 钉住的取值形状：槽位名/排序值钉死，句子单行、无变量、无模型名、不按角色分叉', async () => {
+    // 为什么钉这一条：这三样是「装配出来的第一屏对所有队员逐字节相同」的全部条件。
+    // 槽位名写错 = 注册出一个新段，persona 照旧翻面（还会多出一段废话）；order 写错 =
+    // 这句跑到别的位置上去，遮蔽关系不变但前缀形状变了；带模型名 = 换模型即翻面（正是
+    // 这次要修的第二条断裂源）；按角色分叉 = 把 §0.1 第 3 条「全队一份前缀」直接切碎。
+    const roster = await load('roster.js');
+    assert.equal(roster.MEMBER_PERSONA_SECTION, 'deployment:persona-prefix',
+      'persona 槽位名与官方 PERSONA_PREFIX_SECTION 不再一致（dsh-persona/lib/index.js:2、dsh-system-prompt/lib/index.js:55）');
+    assert.equal(roster.MEMBER_PERSONA_ORDER, 0,
+      'persona 的排序值不再是官方 DEPLOYMENT_PERSONA_PREFIX 那一个（由 drift-check 对着 asar 钉）');
+    const pin = roster.MEMBER_PERSONA_PIN;
+    assert.equal(typeof pin, 'string', 'persona 不是字符串');
+    assert.equal(pin.includes('\n'), false, '钉住的 persona 必须是单行（多行会把后面的段顶开）');
+    assert.equal(pin.trim(), pin, 'persona 首尾不许留空白（装配时按段拼接，空白会落进前缀）');
+    assert.equal(/[{}]/.test(pin), false, 'persona 里不许出现花括号（官方插值是严格变量制）');
+    const lowered = pin.toLowerCase();
+    for (const word of ['model', 'qwen', 'deepseek', 'gpt', 'claude', 'gemini']) {
+      assert.equal(lowered.includes(word), false, 'persona 里出现了模型字样「' + word + '」：换模型就会翻面，这条正是要修的');
+    }
+    for (const roleId of roster.ROLE_IDS) {
+      assert.equal(lowered.includes(roleId), false, 'persona 里出现了角色名 ' + roleId + '：按角色分叉会把队员的共享前缀切碎');
+    }
+  });
+
+  await check('钉 persona 必须排在换继承面的 await 之前（晚一句就赶不上这名队员的第一次装配）', () => {
+    // 官方没有「装配前」钩子：systemPrompt.assemble（dsh-agent-loop/lib/index.js:907）前面没有
+    // await 点，而 installMember 不 await 重绑。所以唯一能保证「第一次请求就用上钉好的
+    // persona」的做法，是把注册写在 select/mount 这两个 await **之前**。
+    // 这一条是纯静态门：把注释剥掉再看代码顺序，注释里出现「await」不算。
+    const strip = (text) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    const src = strip(readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8'));
+    const start = src.indexOf('async function rebindMemberPreset');
+    assert.ok(start >= 0, '读不到 rebindMemberPreset：换预设的机制变了，这条门要重读');
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end < 0 ? src.length : end);
+    const swaps = [...body.matchAll(/await\s+agentPresets\.(select|mount)\(/g)].map((m) => m.index);
+    assert.equal(swaps.length, 2, '换继承面的两处 await 数量变了（实得 ' + swaps.length + '）：本门的判据要重读');
+    const pins = [...body.matchAll(/pinMemberPersona\(/g)].map((m) => m.index);
+    assert.ok(pins.length >= 2, '两处换预设前都要钉一句，实得 ' + pins.length + ' 处');
+    for (const pinAt of pins) {
+      const nextSwap = swaps.find((at) => at > pinAt);
+      assert.notEqual(nextSwap, undefined, '有一句 pinMemberPersona 落在两处换继承面之后（等于永远赶不上第一次装配）');
+      const between = body.slice(pinAt, nextSwap);
+      assert.equal(/await\s+agentPresets\./.test(between.replace(/pinMemberPersona\([^)]*\)/, '')), false,
+        '钉住与它对应的那次换预设之间还夹了一个 await：那一步已经把装配让出去了');
+    }
+  });
+
+  await check('官方锁判据的镜像必须逐字对齐，且只有真会换继承面才钉（锁住的队员不许多钉一句）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    assert.ok(/boundary\.openTurnStartSeq !== null \|\| boundary\.lastTurn > 0/.test(src),
+      'memberSessionStarted 与官方 select() 的锁判据不再同形（dsh-agent-preset-registry/lib/index.js:755-759）—— 预判会把该钉的队员漏掉或不该钉的钉了');
+    assert.ok(/if \(!memberSessionStarted\(projections, session\)\) pinMemberPersona\(agent, notes, disposers\);/.test(src),
+      '线 1（select 支）的钉住没有走「会话已开播就不钉」预判：官方必然拒绝的队员被凭空多换了一次第一屏');
+    assert.ok(/\n\s+pinMemberPersona\(agent, notes, disposers\);/.test(src),
+      '线 2（mount 恢复支）没有无条件钉：恢复的老队员每次冷重启都要整段前缀重算');
+  });
+
+  await check('钉住的注册必须可回卷、绝不外抛，而且只管队员（Lead 的 persona 一个字节都不许动）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    const start = src.indexOf('function pinMemberPersona');
+    assert.ok(start >= 0, '读不到 pinMemberPersona');
+    const end = src.indexOf('\n}', start);
+    const body = src.slice(start, end);
+    assert.ok(body.includes('keepDisposer('), '注册没走 keepDisposer：卸载时回卷不掉，队员死了那段作用域还留着一句 persona');
+    assert.equal(/\bthrow\b/.test(body), false, 'pinMemberPersona 里出现了 throw：钉不住就该记诊断，不许把这名队员打掉');
+    assert.equal(/catch \(error\)/.test(body), true, '没有 try/catch：同名段撞车会把这名队员打掉');
+    assert.equal(body.includes('MEMBER_PERSONA_PIN'), true, '钉的文本必须来自 roster 那一份真值');
+    // Lead 侧：installRoot 这条路径一次都不许调用它。
+    const rootStart = src.indexOf('function installRoot');
+    const rootEnd = src.indexOf('\n}', rootStart);
+    assert.ok(rootStart >= 0 && rootEnd > rootStart, '读不到 installRoot，这条反向门没意义');
+    assert.equal(/pinMemberPersona\(/.test(src.slice(rootStart, rootEnd)), false,
+      'Lead 的安装路径里出现了 pinMemberPersona：用户主会话的 persona 被本包改了');
+    // 调用点必须在 rebindMemberPreset 内（只有它知道「要不要换继承面」）。
+    const rebindStart = src.indexOf('async function rebindMemberPreset');
+    const rebindEnd = src.indexOf('\n}', rebindStart);
+    const inRebind = src.slice(rebindStart, rebindEnd);
+    // 只数**调用**（后面跟分号）；函数定义那一行 'pinMemberPersona(agent, notes, disposers) {'
+    // 长得一样，第一版把它也数进来了 —— 那是闸门自己咬错，不是代码有问题。
+    const outCalls = [...src.matchAll(/pinMemberPersona\(agent, notes, disposers\);/g)]
+      .filter((m) => !(m.index > rebindStart && m.index < rebindEnd));
+    assert.equal(outCalls.length, 0, '有 ' + outCalls.length + ' 处钉 persona 落在 rebindMemberPreset 之外（判据失控）');
+    assert.ok(inRebind.includes('pinMemberPersona(agent, notes, disposers)'), 'rebindMemberPreset 里反倒没有钉住调用（上一条门的意义就没了）');
+  });
+
+  await check('全仓 systemPrompt.section 注册的 text 只能是常量标识符或字面量（禁止实时状态进段）', () => {
+    // 为什么：段文本每轮都重算 = 每轮翻面 = 前缀缓存归零。这是 §0.1 第 3 条「全队一份前缀」
+    // 的机读版本；把它做成反向门，而不是写在注释里。
+    const files = ['runtime.js', 'ops-adapter.js', 'preset.js', 'playbook.js', 'roster.js'];
+    const offenders = [];
+    for (const file of files) {
+      const src = readFileSync(path.join(LIB, file), 'utf8');
+      for (const m of src.matchAll(/section\(\{[^}]*?text:\s*([^,}\n]+)/g)) {
+        const value = m[1].trim();
+        const ok = /^[A-Za-z_$][A-Za-z0-9_$.]*$/.test(value) || /^''/.test(value) || /^'[^']*'$/.test(value);
+        if (!ok) offenders.push(file + ' -> ' + value.slice(0, 60));
+      }
+    }
+    assert.deepEqual(offenders, [], '这些段的 text 不是标识符/字面量（实时状态进 system = 每轮翻面）：' + offenders.join(' | '));
+  });
+
+  await check('cache-prefix-audit 的实测口径必须真的能算：喂真形状事件，命中率算得对（行为门）', () => {
+    // 为什么是行为门而不是扫源码：第一版我写的是文本门（"源码里有没有出现 cacheReadTokens"），
+    // 然后把被保护的那句 `const u = usageOf(event)` 改成 `const u = undefined` —— 文本门照样绿。
+    // 那条变异把「读了但没用」这种假绿暴露了出来，所以这里改成**直接调用导出的纯函数**。
+    // 背景：脚本第一版只有「前缀是否逐字节相同」的推算模型，我据此在会话里对用户说过「会话日志里
+    // 没有 usage 字段，拿不到实测命中率，只能做理论分析」—— 那是**假话**：assistant/message.data.usage
+    // 一直带 cacheReadTokens（本机 143 个队员会话 8603 条 assistant/message 全部带 usage、8041 条带
+    // cacheReadTokens），本包 lib/graph.js:265 与 lib/cache.js:240 也一直在读它。
+    const audit = require(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'));
+    assert.equal(typeof audit.usageOf, 'function', '脚本不再导出 usageOf：实测口径又变成不可断言的了');
+    assert.equal(typeof audit.summarizeSession, 'function', '脚本不再导出 summarizeSession');
+    // ① usageOf：字段读对，缺字段按 0，没有 usage 时 undefined。
+    assert.deepEqual(audit.usageOf({ data: { usage: { cacheReadTokens: 900, inputTokens: 100 } } }), { hit: 900, miss: 100 });
+    assert.deepEqual(audit.usageOf({ data: { usage: { inputTokens: 50 } } }), { hit: 0, miss: 50 }, '没有 cacheReadTokens 时要按 0，不是 NaN');
+    assert.equal(audit.usageOf({ data: {} }), undefined, '没有 usage 必须回 undefined（不能编一个 0 命中）');
+    assert.equal(audit.usageOf({}), undefined);
+    // ② hitRateOf：与 lib/cache.js:262-264 同式，分母 0 时 null。
+    assert.equal(audit.hitRateOf({ hit: 900, miss: 100 }), 90);
+    assert.equal(audit.hitRateOf({ hit: 0, miss: 0 }), null, '分母为 0 时必须回 null（渲染成「—」），不许编 0%');
+    // ③ 端到端：一个两请求的会话 —— 第 1 次 system 变了、第 2 次没变，两档要分得开。
+    const events = [
+      { type: 'system/message', seq: 1, data: { message: { content: [{ type: 'text', text: 'AAA' }] } } },
+      { type: 'user/message', seq: 2, data: { message: { content: [{ type: 'text', text: 'hi' }] } } },
+      { type: 'request/header', seq: 3, data: { reason: 'initial', header: { config: { model: 'm' }, tools: [{ name: 'a' }] } } },
+      { type: 'assistant/message', seq: 4, data: { usage: { cacheReadTokens: 100, inputTokens: 900 } } },
+      { type: 'system/message', seq: 5, data: { message: { content: [{ type: 'text', text: 'BBB' }] } } },
+      { type: 'request/header', seq: 6, data: { reason: 'change', header: { config: { model: 'm' }, tools: [{ name: 'a' }] } } },
+      { type: 'assistant/message', seq: 7, data: { usage: { cacheReadTokens: 0, inputTokens: 1000 } } },
+      { type: 'assistant/message', seq: 8, data: { usage: { cacheReadTokens: 800, inputTokens: 200 } } },
+    ];
+    const s = audit.summarizeSession(events);
+    assert.equal(s.requests.length, 3, '三次带 usage 的 assistant/message 要折成三条请求，实得 ' + s.requests.length);
+    assert.equal(s.headers.length, 2, '两次 request/header 要折成两条装配，实得 ' + s.headers.length);
+    assert.equal(s.requests[0].afterSystemChange, true, '第一条请求前面有 system 快照，要标成「前缀变了」');
+    assert.equal(s.requests[1].afterSystemChange, true, '第二条请求前面 system 变过，要标成「前缀变了」');
+    assert.equal(s.requests[2].afterSystemChange, false, '第三条请求前 system 没变，要标成「前缀没变」');
+    assert.equal(s.requests[0].hit, 100);
+    assert.equal(s.requests[0].miss, 900);
+    assert.equal(s.requests[1].hit, 0, '翻面那一次必须如实记 0 命中（这是本门要保的事实）');
+    assert.equal(s.requests[2].hit, 800);
+    // ④ 公式与 lib/cache.js 同式（那边是 cacheReadTokens / (cacheReadTokens + uncachedInputTokens)）。
+    const cacheSrc = readFileSync(path.join(LIB, 'cache.js'), 'utf8');
+    assert.ok(/stats\.cacheReadTokens \+ stats\.uncachedInputTokens/.test(cacheSrc),
+      'lib/cache.js 的命中率公式变了：本脚本的公式要跟着重读（两者必须同式）');
+    // ⑤ 两个口径在输出里必须分开命名（读的人会把推算模型当现状 —— 这正是我犯的错）。
+    const src = readFileSync(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'), 'utf8');
+    assert.ok(src.includes('实测命中率'), '脚本输出里没有「实测命中率」这个口径名：读的人会把推算模型当现状');
+    assert.ok(src.includes('装配对') && src.includes('不是命中率'),
+      '脚本没有把「装配对模型」与「命中率」分开标注');
+    // ⑥ 而且 `usageOf` 真的被扫描路径用上了（不是导出给人看、内部却不用）。
+    // 判据必须带**解构前缀**：第一版写成 /summarizeSession\(events\)/，结果匹配到的是
+    // `function summarizeSession(events) {` 这个**定义头** —— 把调用整行删掉它照样绿（M33-e 咬出来的）。
+    // 判据写成「const { … } = summarizeSession(events);」：解构里多一个字段（比如 usageMissing）
+    // 不该把门判红（2026-10-17 我自己加字段时就红了一次），但**必须**是解构赋值而不是定义头。
+    assert.ok(/const \{[^}]*\} = summarizeSession\(events\);/.test(src),
+      '扫描路径没有调用 summarizeSession 折表：实测口径又空了');
+  });
+
+  await check('文档必须写明**实测**命中率，不许退回「日志没有 usage / 只能理论分析」那套陈述', () => {
+    // 这是上一条的文档侧：代码报得对、文档还写着旧结论，等于没改。
+    // 判据取正向（必须出现实测口径与那个数），不用反向禁词 —— 因为**更正的文字里会引用旧错话**，
+    // 反向禁词会把更正本身判红（第一版就这么咬过自己）。
+    const interfaces = readFileSync(path.join(PLUGIN_DIR, 'INTERFACES.md'), 'utf8');
+    assert.ok(interfaces.includes('实测命中率'),
+      'INTERFACES.md 里没有「实测命中率」：缓存这一节又只剩推算模型了');
+    // 数字必须与 `node tools/cache-prefix-audit.cjs` 的默认输出一致（全部 143 个会话那一档）。
+    // 判据只钉「94.9%」这个可复现的总数 + 两个分档名；不钉最近 40 个会话那一档（它会随日志增长漂）。
+    assert.ok(interfaces.includes('94.9%'),
+      'INTERFACES.md 没写实测总数 94.9%（`node tools/cache-prefix-audit.cjs --tail 0` 的输出）；'
+      + '把推算模型当现状汇报正是上一轮那个错，数字必须能一眼对上');
+    assert.ok(interfaces.includes('前缀变了的那一次'),
+      'INTERFACES.md 没写「前缀变了的那一次」这一档：读者会以为实测命中率是均匀的');
+    assert.ok(/cacheReadTokens/.test(interfaces),
+      'INTERFACES.md 没写实测命中率的来源字段 cacheReadTokens：读者无法复核');
+    const readme = readFileSync(path.join(PLUGIN_DIR, 'README.md'), 'utf8');
+    assert.ok(readme.includes('cache-prefix-audit.cjs'),
+      'README 的探针清单里没有 cache-prefix-audit.cjs：用户不知道有这个核对命令');
+  });
+
+  await check('cache-prefix-audit 的「没看到钉住」提示必须分清两种原因（没重启 / 重启了但没派队员）', () => {
+    // 起因（2026-10-17 真机踩到）：用户重启 DSH 后我跑这个脚本，它照样打印
+    // 「跑这些队员的还是旧代码，要重启才生效」—— 那是**错的**：进程启动于 08:02:03，
+    // 晚于代码最后一次改动，只是重启后还没有队员跑过。这条提示会把人引去白重启一次。
+    // 所以判据改用**进程启动时刻**（状态文件的 generatedAt），三个分支各自有断言。
+    const audit = require(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'));
+    assert.equal(typeof audit.pinHintBranch, 'function', '脚本不再导出 pinHintBranch：这条提示又变成不可断言的了');
+    const b = audit.pinHintBranch;
+    assert.equal(b({ codeMs: 100, bootMs: 200, newestMemberMs: 50 }), 'not-dispatched',
+      '代码旧、进程新、没有新队员 → 应判「重启了但还没派队员」');
+    assert.equal(b({ codeMs: 300, bootMs: 200, newestMemberMs: 50 }), 'not-restarted',
+      '代码比进程新 → 应判「还没重启」');
+    assert.equal(b({ codeMs: 100, bootMs: 200, newestMemberMs: 250 }), 'stale-members',
+      '有比进程还新的队员会话却没钉住 → 那才是真的没生效，不能报成「没派队员」');
+    assert.equal(b({ codeMs: null, bootMs: 200, newestMemberMs: 50 }), 'unknown',
+      '读不到代码时刻时必须回 unknown（不猜）');
+    assert.equal(b({ codeMs: 100, bootMs: null, newestMemberMs: 50 }), 'unknown',
+      '读不到进程启动时刻时必须回 unknown（不猜）');
+    // 文案侧：三支都必须存在，否则两个原因又会被合并成一句。
+    const src2 = readFileSync(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'), 'utf8');
+    assert.ok(src2.includes('重启之后还没有任何队员跑过'), '缺「重启了但还没派队员」那一支的文案');
+    assert.ok(src2.includes('还没重启'), '缺「代码比进程新 = 还没重启」那一支的文案');
+    assert.ok(src2.includes('generatedAt'), '启动时刻不是读状态文件的 generatedAt');
+  });
+
+  await check('路由账本写入点：脏值不进账本、空对象不进、读口返回副本（宁缺毋滥）', async () => {
+    // 为什么单独测写入点：annotateMemberModels 自己也会拦脏 model（纵深防御的第二道），
+    // 于是「noteAppliedRoute 不校验 model 空串」这种变异会被下游吸收、集成测试照样绿 ——
+    // 这条闸门让**上游那道校验**有独立的可咬性（变异 M26）。
+    const rt = await load('runtime.js');
+    const id = 'gate-agent-' + Math.random().toString(36).slice(2);
+    rt.noteAppliedRoute(id, { model: '' });
+    rt.noteAppliedRoute(id, { provider: '   ' });
+    rt.noteAppliedRoute(id, {});
+    rt.noteAppliedRoute(id, null);
+    rt.noteAppliedRoute('', { model: 'm' });
+    if (rt.appliedMemberRoutes().has(id)) return '脏值被写进了账本：' + JSON.stringify(rt.appliedMemberRoutes().get(id));
+    rt.noteAppliedRoute(id, { provider: 'provider-b', model: 'model-b', reasoningEffort: 'high' });
+    const got = rt.appliedMemberRoutes().get(id);
+    if (got === undefined) return '合法路由没进账本';
+    if (got.model !== 'model-b' || got.provider !== 'provider-b') return JSON.stringify(got);
+    // 读口必须是副本：Lead 侧改它不该动内部账本。
+    const snap = rt.appliedMemberRoutes();
+    snap.delete(id);
+    if (!rt.appliedMemberRoutes().has(id)) return 'appliedMemberRoutes 返回的是内部 Map 本身（可被调用方改坏）';
+    rt.clearAppliedRoute(id);
+    if (rt.appliedMemberRoutes().has(id)) return 'clearAppliedRoute 没作废';
+  });
+
+  await check('任务板闭环提示：只算未闭环、只标 Lead 行、不改入参、幂等（session-00001000 的闸门）', () => {
+    // 现场（2026-10-14 session-00001000，逐条从会话日志核出）：Lead 建了 4 条任务后全程没回看，
+    // 7 个队员都交了 completed 报告，任务板停在 pending。用户来问「是不是显示 bug」——
+    // 不是：面板如实投影账本。缺的是把这件事摆到 Lead 眼前，这一条就是那个提示的真值来源。
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: ['boom'] },
+    ];
+    const tasks = [
+      { id: 'task-1', revision: 1, status: 'pending' },
+      { id: 'task-2', revision: 2, status: 'in_progress', ownerName: 'builder' },
+      { id: 'task-3', revision: 3, status: 'completed', ownerName: 'builder' },
+      { id: 'task-4', revision: 1, status: 'deleted' },
+    ];
+    const note = roster.boardClosureNote(tasks);
+    assert.equal(typeof note, 'string', '有未闭环条目时必须给提示');
+    assert.ok(note.startsWith(roster.BOARD_CLOSURE_PREFIX), '提示要带固定前缀，Lead 才认得出');
+    assert.ok(note.includes('未闭环 2 条'), 'completed 与 deleted 都不算未闭环：' + note);
+    assert.ok(note.includes('无 owner 1 条'), '要分清「从没被 claim」与「claim 了没交」：' + note);
+    assert.ok(note.includes('task-1') && note.includes('task-2'), '要点名条目：' + note);
+    assert.ok(!note.includes('task-3') && !note.includes('task-4'), '已闭环的不许进名单：' + note);
+    assert.ok(note.includes('team_task_update'), '必须直接给出下一步动作：' + note);
+    assert.equal(roster.boardClosureNote([tasks[2], tasks[3]]), undefined, '全闭环时不许产生提示（长期噪音会被模型忽略）');
+    assert.equal(roster.boardClosureNote([]), undefined, '空任务板不许抛错');
+    assert.equal(roster.boardClosureNote(undefined), undefined, 'listTasks 拿不到时按无提示处理');
+    assert.equal(roster.boardClosureNote('不是数组'), undefined, '非数组入参不许抛错');
+    const many = [];
+    for (let i = 0; i < 9; i += 1) many.push({ id: 't' + String(i), revision: 1, status: 'pending' });
+    const manyNote = String(roster.boardClosureNote(many, 3));
+    assert.ok(manyNote.includes('未闭环 9 条') && manyNote.includes('t0'), '上限版仍要给总数与首批条目：' + manyNote);
+    assert.ok(manyNote.includes('…（共 9 条）'), '超出上限要标注省略：' + manyNote);
+    assert.equal(manyNote.includes('t3'), false, '超过 idLimit 的条目不许列出');
+    const marked = roster.annotateBoardClosure(rows, note);
+    assert.equal(marked[0].diagnostics.length, 1, '提示只挂 Lead 行');
+    assert.equal(marked[1], rows[1], '队员行不许被塞与它无关的账（收尾是 Lead 的责任）');
+    assert.deepEqual(rows[0].diagnostics, [], '入参必须不被修改（成员行同时是 Lead 的请求内容）');
+    assert.equal(roster.annotateBoardClosure(marked, note)[0].diagnostics.length, 1, '幂等：重复标注不加第二份');
+    assert.equal(roster.annotateBoardClosure(rows, undefined).length, 2, '无提示时原样返回');
+    assert.equal(roster.annotateBoardClosure(rows, '').length, 2, '空提示原样返回');
+    assert.equal(roster.annotateBoardClosure(null, note).length, 0, '非数组行集合按空处理，不抛错');
+    const bare = roster.annotateBoardClosure([{ id: 'l', name: 'lead', role: 'lead', status: 'running' }], note);
+    assert.equal(bare[0].diagnostics.length, 1, '行里没有 diagnostics 键时也要挂得上（官方 lead 伪行不保证带它）');
+  });
+
+
   await check('提示词预算：系统提示词前缀不许膨胀（每多一个字，每次请求都多付一次钱）', () => {
     const budget = {
       // 2026-10-09 上调 3800→3900 / 1150→1200：这两处增长都有明确来源，不是「往上堆」——
@@ -683,9 +1171,28 @@ function functionBodyOf(source, needle) {
       //   旧文本更短（它写的是排版样式「Q1 — <标题>」，而那正是导致会话断的错指令），
       //   所以这次不是往上堆，是把一条错指令换成一条对指令 + 它必须留在文本里的理由：
       //   模型只有知道「正文提问 = 回合结束 = 用户得再发一条」才会遵守卡片。
-      PLAYBOOK: 4000,        // 调度模式方法论（Lead 与所有请求的前缀）
-      TEAM_POLICY: 800,      // 团队运行期事实（开后才有）
-      TEAMMATE_CARD: 1250,   // 队员卡（每个队员的固定前缀）；留 ~50 余量，避免再次为「贴边」删信息
+      // 2026-10-14 上调（PLAYBOOK 3988→4214、TEAM_POLICY 758→841、CARD 1199→1365，
+      // 合计 4746→5055 / 1574→1740）：唯一来源是**任务板闭环**这一条新纪律（用户 2026-10-14 要求）。
+      // 依据是 session-00001000 的日志：Lead 建了 4 条任务（seq 81/84/87/90）到会话结束（seq 1697）
+      // 一条都没再动过，而 7 个队员全部交了 completed 报告 —— 提示词提过 team_task_create 的名字，
+      // 却从没要求「用它收尾」，所以这条增长是**新信息**，不是往上堆。
+      // 2026-10-17 上调（CARD 1365→1395，队员侧合计 1732→1762）：唯一来源是**第二轮真机验收
+      // 抓到的误读** —— builder-2 把队员卡那句「没有向最终用户提问的工具」读成「手上没有任何提问手段」，
+      // 于是上报「卡片与实测不符」（实际上同一句里就写了用 ask_lead）。改法不是加长，是把话说准：
+      // 点名 `ask_user_question` 不可用（调它报 DELEGATED_CALLER），并写明 `ask_lead` 是发给 Lead 的。
+      // 这条同时被 selftest 的细节闸门钉住（「它对你不可用」「或在报告里写清楚」），删一个字都会红。
+      // 2026-10-17 第三轮再加一次（CARD 1395→1399，队员侧 1762→1766）：来源是**测试 3 的量测**——
+      // 队员用相对路径写文件时落在**会话 cwd**（那次是 <scratch>，不是仓库根），而原句
+      // 「共享同一个工作目录」会让队员以为相对路径 = 仓库根。改成「与 Lead 共享 cwd（未必是仓库根）：
+      // 新建文件用绝对路径」，并把「有版本守卫」压成「有守卫」、「重读该文件、重基后再写」压成
+      // 「重读、重基后再写」腾出字节（信息一条没删）。依据：session-00001002 第三轮 builder-3 实写
+      // `.probe-tmp/round3-rel.md` → 落点 <scratch>\.probe-tmp\round3-rel.md（verify-3 独立 stat 确认），
+      // 仓库内候选路径全程不存在。
+      // 同时已按「先删再加」合并过一处同义表述（队员卡「别灌整段 dump」与「不贴整段日志、整个文件
+      // 或长篇代码」同义，删前者留后者），并逐句收紧了新文案。
+      PLAYBOOK: 4250,        // 调度模式方法论（Lead 与所有请求的前缀）
+      TEAM_POLICY: 880,      // 团队运行期事实（开后才有）
+      TEAMMATE_CARD: 1400,   // 队员卡（每个队员的固定前缀）；留 ~35 余量，避免再次为「贴边」删信息
     };
     const actual = {
       PLAYBOOK: playbook.PLAYBOOK.length,
@@ -700,8 +1207,8 @@ function functionBodyOf(source, needle) {
     );
     const lead = actual.PLAYBOOK + actual.TEAM_POLICY;
     const mate = actual.TEAMMATE_CARD + playbook.teammateBrief('scout', 'scout').length;
-    assert.ok(lead <= 5000, `Lead 侧提示词 ${lead} > 5000 字符`);
-    assert.ok(mate <= 1650, `队员侧提示词 ${mate} > 1650 字符`);
+    assert.ok(lead <= 5150, `Lead 侧提示词 ${lead} > 5150 字符`);
+    assert.ok(mate <= 1800, `队员侧提示词 ${mate} > 1800 字符`);
   });
 
   await check('纪律只在 PLAYBOOK、运行期语义只在 TEAM_POLICY（重复写 = 多付钱 + 迟早自相矛盾）', () => {
@@ -715,6 +1222,41 @@ function functionBodyOf(source, needle) {
       assert.ok(playbook.PLAYBOOK.includes(marker), `PLAYBOOK 缺少纪律：${marker}`);
       assert.ok(!playbook.TEAM_POLICY.includes(marker), `TEAM_POLICY 里重复了纪律「${marker}」——那属于 PLAYBOOK`);
     }
+  });
+
+  await check('任务板闭环纪律在提示词里（光提工具名字不够：2026-10-14 现场就是这么漏的）', () => {
+    // 与「每个已注册团队工具都在提示词里被提到」同一条思路，但那条只管**提到名字**：
+    // 现场里 PLAYBOOK 确实提了 team_task_create，却没有任何一句要求收尾 —— 于是 Lead 建完 4 条
+    // 任务就再没回看（seq 81→1697 之间零条 team/task 记录）。这一条管**要求去做**。
+    const card = playbook.TEAMMATE_CARD;
+    for (const marker of ['team_task_get', 'team_task_update', 'claim', 'complete', 'release', '别碰任务板']) {
+      assert.ok(card.includes(marker), '队员卡缺少任务板纪律：' + marker);
+    }
+    // 队员调 reassign 必被官方拒（TEAM_LEAD_REQUIRED，task-board.js:158-159）：教了就是骗它。
+    assert.ok(!card.includes('reassign'), '队员卡不许出现 reassign（Lead 专属，队员调它一定失败）');
+    assert.ok(playbook.PLAYBOOK.includes('收敛任务板'), 'PLAYBOOK 缺少「最终答复前收敛任务板」这条纪律');
+    assert.ok(playbook.PLAYBOOK.includes('task_id'), 'PLAYBOOK 没提 spawn_teammate 的 task_id：不绑定就会再出现「建了没人动」');
+    assert.ok(playbook.TEAM_POLICY.includes('只接受 in_progress'), 'TEAM_POLICY 缺 complete 的前置语义（不知道就会白调一次然后困惑）');
+    assert.ok(playbook.TEAM_POLICY.includes('调用者自己'), 'TEAM_POLICY 缺 claim 的归属语义（替别人接条目要用 reassign）');
+  });
+
+  await check('闭环联动的源码接线：四个落点都在（防止日后被重构成静默）', () => {
+    const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'tools.js'), 'utf8');
+    assert.ok(source.includes('reportBoardFollowUps(safeTasks(agentTeams, caller), name, report.status)'),
+      'report_result 不再对账任务板（completed 不 complete / blocked 不 release 都没人提醒了）');
+    assert.ok(source.includes("action: 'reassign'"), 'spawn_teammate 不再绑定 task_id');
+    assert.ok(source.includes('callerIsLead(agentTeams, caller) ? boardClosureNote(safeTasks(agentTeams, caller)) : undefined'),
+      'list_agents / wait_agent 的闭环提示接线不见了');
+    assert.ok(source.includes('annotateBoardClosure(rows, note)'), 'list_agents 不再把提示挂到 Lead 行');
+    const waitSchema = /const WAIT_VALUE_SCHEMA = \{[\s\S]*?\n\};/.exec(source);
+    assert.ok(waitSchema !== null, '找不到 WAIT_VALUE_SCHEMA');
+    assert.ok(waitSchema[0].includes("diagnostics: { type: 'array', items: { type: 'string' } }"),
+      'wait_agent 的 diagnostics 没进 schema —— 官方按 output.schema 校验返回值，漏声明就是模型侧一次 ToolOutputError');
+    // 诊断/提示路径必须容错：任务板读不到不许把交付路径带崩。
+    assert.ok(source.includes('function safeTasks(agentTeams, caller) {'), 'safeTasks 的容错包装不见了');
+    const safeTasksBlock = source.slice(source.indexOf('function safeTasks'), source.indexOf('/** 调用者是不是这个团队的 Lead'));
+    assert.ok(safeTasksBlock.includes('catch'), 'safeTasks 必须吞掉 listTasks 的异常（任务板读不到不该把交付路径带崩）');
+    assert.ok(safeTasksBlock.includes("return Array.isArray(rows) ? rows : []"), 'listTasks 返回非数组时也要退化成空表');
   });
 
   await check('队员/Lead 提示词的**关键细节**不许再被压缩删掉（2026-10-09 压缩事故的永久闸门）', () => {
@@ -1130,6 +1672,549 @@ function functionBodyOf(source, needle) {
     assert.equal(g.totals.totalTokens, 215);
   });
 
+  await check('turn/end 的错误正文与错误码不再被丢掉（P1-4，就是这次报障的本体）', () => {
+    // 2026-10-12 用户报「队员罢工没人察觉」之后，插件把 turn/end 的 reason.kind 上墙成了
+    // 一个「上一轮报错」，但**错误正文与错误码整个丢掉**（lib/graph.js:280 原先只存 reason?.kind）。
+    // 真机数据（.probe/real-events.json，seq 349/362/371/382/527 五条）：
+    //   reason:{kind:'error',error:{message:'opencode: 所有通道对该模型均受限…',code:'QUOTA_EXCEEDED'}}
+    // 那是用户唯一需要的信息（额度受限 → 换模型/换通道），却被压成三个字「上一轮报错」。
+    // 官方给的是整块 TurnErrorItem（.probe-tmp/messageitem.js.txt:94-118：标题 +
+    // failureMessage(message, code) + <code>{node.code}</code>）。我们不复制那一整套样式，
+    // 但**message 与 code 一个都不能少**。
+    const stats = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1,
+        reason: { kind: 'error', error: { message: '所有通道对该模型均受限', code: 'QUOTA_EXCEEDED' } } } },
+    ]);
+    assert.equal(stats.lastTurnEndReason, 'error', 'kind 仍要在（画布的红点判据用它）');
+    assert.equal(stats.lastTurnErrorMessage, '所有通道对该模型均受限', '错误正文必须留得下来');
+    assert.equal(stats.lastTurnErrorCode, 'QUOTA_EXCEEDED', '错误码必须留得下来');
+    // 正常收尾不留脏值：上一轮的错误不能在这一轮还挂着（否则红点与「罢工」文案会赖着不走）
+    const clean = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1,
+        reason: { kind: 'error', error: { message: 'boom', code: 'X' } } } },
+      { type: 'turn/start', seq: 3, time: 3000, data: { turn: 2 } },
+      { type: 'turn/end', seq: 4, time: 4000, data: { turn: 2, reason: { kind: 'completed' } } },
+    ]);
+    assert.equal(clean.lastTurnEndReason, 'completed');
+    assert.equal(clean.lastTurnErrorMessage, undefined, '本轮正常收尾却不该还挂着上一轮的错误正文');
+    assert.equal(clean.lastTurnErrorCode, undefined);
+    // max-tokens（罢工续跑那条）同样带上正文
+    const mt = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1, reason: { kind: 'max-tokens' } } },
+    ]);
+    assert.equal(mt.lastTurnEndReason, 'max-tokens');
+    assert.equal(mt.lastTurnErrorMessage, undefined, '没有 error 时不许编正文');
+    // 对话流里也要出现这一行：官方画 TurnErrorItem，我们此前对话区**一条都没有**
+    const rows = graph.extractConversation([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 2, time: 1500, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '我先看结构' }] } } },
+      { type: 'turn/end', seq: 3, time: 2000, data: { turn: 1,
+        reason: { kind: 'error', error: { message: '所有通道对该模型均受限', code: 'QUOTA_EXCEEDED' } } } },
+    ], 20);
+    const notice = rows.find((r) => r.kind === 'turnend');
+    assert.ok(notice, '回合结局要成行（否则用户只看到一个绿点/红点，不知道为什么）：' + JSON.stringify(rows.map((r) => r.kind)));
+    // 契约（2026-10-14 定）：后端只发**事实字段**，句子由客户端按当前语言拼 ——
+    // 服务端写死中文的话，英文界面下这一行就是整段对话里唯一的中文。
+    // 断言因此落在字段上：错误正文与错误码一个都不许丢（那正是这条要修的 bug）。
+    assert.equal(notice.reason, 'error');
+    assert.equal(notice.message, '所有通道对该模型均受限', '错误正文必须带到前端');
+    assert.equal(notice.code, 'QUOTA_EXCEEDED', '错误码必须带到前端');
+    assert.equal(notice.error, true, 'error 结局要标出来（渲染层据此走红色）');
+    assert.ok(!('text' in notice), '后端不再拼句子：' + JSON.stringify(notice));
+    // max-tokens 结局：没有 error 也要成行，且不编造 message/code
+    const stopRow = graph.extractConversation([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1, reason: { kind: 'max-tokens' } } },
+    ], 20).find((r) => r.kind === 'turnend');
+    assert.equal(stopRow.reason, 'max-tokens');
+    assert.equal(stopRow.error, false, '撞上限不是报错，别画成红的');
+    assert.ok(!('message' in stopRow) && !('code' in stopRow), '没有就不给，不许编：' + JSON.stringify(stopRow));
+    // completed 不制造噪音：正常收尾**不**出一行
+    const quiet = graph.extractConversation([
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'turn/end', seq: 2, time: 2000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ], 20);
+    assert.ok(!quiet.some((r) => r.kind === 'turnend'), '正常收尾别插一行废话');
+  });
+  await check('taskTipOf / buildGraph：任务归属进节点，且只算这个人名下的未删除条目', () => {
+    // 2026-10-14：现场 session-00001000 里 Lead 建了 4 条任务、派了 7 个队员，两边零引用，
+    // 画布上同样看不出「谁该收哪条」。归属由服务端算，客户端只画。
+    // ⚠️ 同一天再改一次**返回形状**：原来服务端拼一整句中文，等于把界面语言焊死在宿主半
+    // —— 而知道语言的只有浏览器。现在发结构化 rows，句子由客户端按当前语言拼。
+    const tasks = [
+      { id: 'task-1', revision: 3, status: 'in_progress', ownerName: 'a', subject: '都市天际线场景 src/scene-city.js' },
+      { id: 'task-2', revision: 5, status: 'completed', ownerName: 'a', subject: '第二条' },
+      { id: 'task-3', revision: 1, status: 'pending', subject: '没人认领的' },
+      { id: 'task-4', revision: 2, status: 'deleted', ownerName: 'a', subject: '删掉的' },
+    ];
+    const tip = graph.taskTipOf(tasks, 'a');
+    assert.equal(tip.total, 2, JSON.stringify(tip));
+    assert.equal(tip.rows.length, 2, '默认上限内要全带');
+    assert.deepEqual(tip.rows[0], { id: 'task-1', status: 'in_progress', revision: 3, subject: '都市天际线场景 src/scene-city.js' });
+    assert.equal(tip.rows[1].id, 'task-2');
+    assert.ok(!JSON.stringify(tip.rows).includes('task-3') && !JSON.stringify(tip.rows).includes('task-4'),
+      '别人的 / 没认领的 / 已删除的不许混进来：' + JSON.stringify(tip.rows));
+    assert.equal(graph.taskTipOf(tasks, 'nobody').total, 0, '名下没有条目时 total=0（客户端据此不挂 tooltip）');
+    assert.deepEqual(graph.taskTipOf(tasks, 'nobody').rows, []);
+    assert.equal(graph.taskTipOf(undefined, 'a').total, 0, '任务板读不到时不许抛错');
+    assert.equal(graph.taskTipOf(tasks, '').total, 0, '没有名字就不算');
+    const many = [];
+    for (let i = 0; i < 6; i += 1) many.push({ id: 't' + String(i), revision: 1, status: 'completed', ownerName: 'a', subject: 's' });
+    const capped = graph.taskTipOf(many, 'a');
+    assert.equal(capped.rows.length, 4, '默认上限 4 条：' + capped.rows.length);
+    assert.equal(capped.omitted, 2, '被折掉的条数要如实给出（省略句由客户端拼）：' + capped.omitted);
+    assert.equal(capped.total, 6, '总数是全部，不是带上来的那几条');
+    // Lead 名下条目走官方 ownerName='lead' 口径（task-view.js 把 ownerId == 团队 id 翻成 'lead'）
+    assert.equal(graph.taskTipOf([{ id: 't9', revision: 1, status: 'in_progress', ownerName: 'lead' }], 'lead').rows[0].id, 't9',
+      'Lead 自己接的条目也要能显示');
+    // subject 里的换行/制表要压平（它是多行 tooltip 的一行）
+    const messy = graph.taskTipOf([{ id: 't1', revision: 1, status: 'in_progress', ownerName: 'a', subject: '第一行\n第二行\t制表' }], 'a');
+    assert.ok(!messy.rows[0].subject.includes('\t') && !messy.rows[0].subject.includes('\n'),
+      'subject 里的控制符要压平：' + JSON.stringify(messy.rows[0].subject));
+    // 服务端算好、客户端只画：buildGraph 必须把清单挂到每个节点上
+    const bySession = new Map([['lead', graph.emptyStats()], ['a', graph.emptyStats()]]);
+    const g = graph.buildGraph({ leadId: 'lead', leadName: 'lead', members: [{ id: 'a', name: 'a', role: 'teammate' }], statsBySession: bySession, tasks });
+    const nodeA = g.nodes.find((node) => node.name === 'a');
+    const nodeLead = g.nodes.find((node) => node.role === 'lead');
+    assert.equal(nodeA.taskTip.rows[0].id, 'task-1', '队员节点没拿到自己的任务归属');
+    assert.equal(nodeLead.taskTip.total, 0, 'Lead 名下没有条目时不该有假提示');
+  });
+
+  await check('画布把任务归属画出来：tooltip 在 wsNodeCard 与 wsUpdateCard 两处都接上', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    // 2026-10-14 契约变更：服务端发**结构化**归属清单，句子由客户端拼（语言在浏览器）。
+    // 所以这里钉的是「两处都调 wsTaskTip(…) 且都带上 node.name」——
+    // 名字不传，标题行就成了「任务板：2 条归 」（官方 ownerName 只到服务端那一层）。
+    assert.ok(src.includes('el.title = wsTaskTip(node.taskTip, node.name)'),
+      'wsNodeCard 不再把任务归属挂到卡片 tooltip（新卡片悬停看不到）');
+    assert.ok(src.includes('const tip = wsTaskTip(node.taskTip, node.name)')
+      && src.includes('if (el.title !== tip) el.title = tip'),
+      'wsUpdateCard 不刷新 tooltip（claim / complete 之后要重开卡片才更新）');
+    const tipFn = src.slice(src.indexOf('function wsTaskTip('), src.indexOf('function wsNodeCard('));
+    assert.ok(tipFn.length > 60, '抓不到 wsTaskTip 函数体');
+    assert.ok(/wsTaskTipHead/.test(tipFn) && /wsTaskTipMore/.test(tipFn),
+      'tooltip 的标题行与省略行必须走字典（写死中文=英文界面翻不到）');
+    // （用 includes 而不是正则：那句里有裸括号，写成正则字面量会当场语法错。）
+    assert.ok(tipFn.includes("rows.length === 0) return ''"),
+      '名下没有条目必须回空串（据此不挂 tooltip，不编一个空标题出来）');
+    for (const gone of ['wsDrawerRelations', 'wsDrawerNoRel', 'wsDrawerTasks', 'wsDrawerNoTask']) {
+      assert.ok(!src.includes(gone + ':'), '死文案 ' + gone + ' 又回来了（浮窗只放「指标 + 对话」是用户 2026-10-08 的决定）');
+    }
+    // 采集链不许断：collectGraph 必须把它读到的任务列表交给 buildGraph，
+    // 否则 node.taskTip 恒为空串 —— 客户端接得再好也只会显示「没有任务」。
+    const gsrc = readFileSync(path.join(PLUGIN_DIR, 'lib', 'graph.js'), 'utf8');
+    const call = /const graph = buildGraph\(\{[\s\S]*?\n  \}\);/.exec(gsrc);
+    assert.ok(call !== null, '找不到 collectGraph 里的 buildGraph 调用（改名或换写法了？同步这条闸门）');
+    assert.ok(call[0].includes('tasks,'), 'collectGraph 没把 tasks 传给 buildGraph：节点上的任务归属会永远是空');
+    // Lead 节点的 name 必须是 'lead'：官方 ownerName 对 Lead 自己的条目就是翻成 'lead'
+    // （task-view.js），两边不同口径时 Lead 名下条目会一条都匹配不上。
+    assert.ok(call[0].includes("leadName: 'lead'"), 'Lead 节点名字不再是 lead：与官方 ownerName 口径分叉，归属会匹配不上');
+  });
+
+  await check('仓库内的行号指针必须仍指得到它声称的东西（2026-10-15 清掉一批失效后加的闸门）', () => {
+    // 起因：我先在文档里写了一句**假指针**（「见 §6」，而 §6 通篇没提那个字段），自查时
+    // 意识到这是本仓库最容易复发的一类错 —— **行号会被别人的编辑挪走**。全仓按本闸门
+    // 同一套规则数（可复跑）：正文自引用 17 处 = 速记 2 + 判不了 5 + **可判 10**（现在）。
+    // **HEAD 上可判的是 9 条，其中 5 条已经指错**（lib/runtime.js 对 index.js:282/:336/:539
+    // 与 integration-test 对 index.js:282/:336 —— 更早的欠账）。本轮 `git diff` 可复跑：含行号的
+    // 引用句共改动 8 行 / 9 条指针 = 那 5 条旧账 + 被我自己这几轮**当场弄坏**的 4 条
+    // （往 client.js 插 800 行后「lib/client.js:2123-2126」飘到 React.createElement；roster.js
+    // 加几十行后 HEAD 里一直对的 :472-482 也飘了）。所以这条闸门存在的理由是
+    // **写的时候对 ≠ 以后一直对**，而不是「改完就永远对了」。
+    //
+    // 判据（只核机器判得了的，宁可少判也不误判 —— 第一版我自己的正则太窄，
+    // 把我造的两个变异放过去了，白 PASS 两轮，教训记在这儿）：
+    //   * 目标写作 lib/X.js:NN 或 tools/X.js:NN，且 X 是本仓库真实文件；
+    //   * 引用句里必须点得出**符号名**：反引号里的（\u0060clipLine\u0060）或驼峰/下划线
+    //     形状的裸标识符（LINE_MAX、TEAMMATE_TOOL_DENY、getConfigPath…）；都没有就跳过；
+    //   * 目标文件 NN 的 **±8 行窗口**里至少出现一个那些符号。取窗口而不是整文件：
+    //     整文件永远命中（符号在别处也出现过），那等于没判。
+    // 四条**合法**跳过，各有依据：
+    //   * 勘误表整行（形如 | 42 |）：那是日期化的**历史记录**，行号是当时核实的样子，
+    //     改它等于篡改历史；当前性指针只允许写在正文。
+    //   * 指针前面是「/」：官方包全路径的尾巴（…/dsh-llm/lib/index.js:2367）。
+    //   * 上一行以「/」收尾：官方包路径**跨行折断**写的（dsh-client-ui-user-questions/
+    //     换行 lib/client.js:1668-1677）。实测有 2 处这种写法，不跳就误报。
+    //   * 句中出现 mcp-manager / dsh-xxx / 第三方插件：**非本仓库**文件的速记。例：§6 那句
+    //     「先例：@xxxyz/dsh-mcp-manager 的 apiCall()，lib/client.js:91-101」指的是那个第三方包
+    //     （本机 ~/.dsh/profiles/web/node_modules/…，2026-10-17 逐字读过）的 91-101，
+    //     不是我们自己的 client.js（我们的 90-101 是 bridgeService）。不跳就会误报。
+    //     注意：这类引用**在别人机器上不一定存在**（第三方插件），所以文档里要写明它是第三方、
+    //     并把本机路径给出来，别让读者以为那是官方包或本仓库文件。
+    const ROOT = path.join(__dirname, '..');
+    const files = ['lib/client.js', 'lib/graph.js', 'lib/runtime.js', 'lib/index.js', 'lib/playbook.js',
+      'lib/roster.js', 'lib/tools.js', 'tools/selftest.cjs', 'tools/integration-test.cjs',
+      'tools/drift-check.cjs', 'INTERFACES.md'];
+    const ownBase = new Set(['client.js', 'graph.js', 'runtime.js', 'index.js', 'playbook.js',
+      'roster.js', 'tools.js', 'selftest.cjs', 'integration-test.cjs', 'drift-check.cjs']);
+    const cache = new Map();
+    const linesOf = (rel) => {
+      if (cache.has(rel) === false) cache.set(rel, readFileSync(path.join(ROOT, rel), 'utf8').split('\n'));
+      return cache.get(rel)
+    };
+    const CITE = /(?:lib|tools)\/([\w-]+\.(?:js|cjs)):(\d+)/g;
+    const FOREIGN = /mcp-manager|dsh-[a-z]|某个第三方插件|第三方插件/;
+    const ERRATA = /^\s*\|\s*\d+\s*\|/;
+    const WRAPPED = /\/\s*$/;
+    const CAMEL = /[a-z][A-Z]/;
+    // 反引号对里的标识符：用 \u0060 而不是裸反引号，免得这个正则本身被当字符串截断。
+    const TICKED = /[\u0060]([A-Za-z_][A-Za-z0-9_]{2,})(?:\(\))?[\u0060]/g;
+    const BARE = /[A-Za-z_][A-Za-z0-9_]*/g;
+    const STOP = new Set(['javascript', 'undefined', 'interface', 'boolean', 'string', 'number',
+      'object', 'promise', 'function', 'react', 'createelement', 'https', 'http', 'json', 'node',
+      'window', 'document', 'assert', 'includes', 'indexof', 'readfile', 'splice', 'filter',
+      'replace', 'typeof', 'problems', 'offenders', 'params', 'targets', 'symbols', 'strings',
+      'notes', 'client', 'graph', 'runtime', 'index', 'playbook', 'roster', 'tools', 'selftest',
+      'drift', 'check', 'inter', 'section', 'sections', 'matchall']);
+    const symbolsOf = (line) => {
+      const set = new Set();
+      for (const m of line.matchAll(TICKED)) set.add(m[1]);
+      for (const m of line.matchAll(BARE)) {
+        const t = m[0];
+        if (t.length < 4 || STOP.has(t.toLowerCase())) continue;
+        if (t.indexOf('_') >= 0 || CAMEL.test(t)) set.add(t);
+      }
+      return [...set]
+    };
+    const problems = [];
+    let judged = 0;
+    for (const f of files) {
+      const lines = linesOf(f);
+      for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        if (ERRATA.test(line)) continue;                                  // 勘误表：历史不核
+        let m;
+        CITE.lastIndex = 0;
+        while ((m = CITE.exec(line)) !== null) {
+          if (line[Math.max(0, m.index - 1)] === '/') continue;           // 官方全路径尾巴
+          if (i > 0 && WRAPPED.test(lines[i - 1])) continue;              // 官方路径跨行折断
+          if (ownBase.has(m[1]) === false) continue;
+          if (FOREIGN.test(line)) continue;                               // 官方速记
+          const symbols = symbolsOf(line);
+          if (symbols.length === 0) continue;                             // 判不了就跳
+          const rel = (/^(client|graph|runtime|index|playbook|roster|tools)\./.test(m[1]) ? 'lib/' : 'tools/') + m[1];
+          const target = linesOf(rel);
+          const n = Number(m[2]);
+          judged += 1;
+          if (n > target.length) {
+            problems.push(f + ':' + (i + 1) + ' 指 ' + rel + ':' + n + ' 越界（该文件只有 ' + target.length + ' 行）');
+            continue
+          }
+          const win = target.slice(Math.max(0, n - 1 - 8), n + 8).join('\n');
+          if (symbols.some((s) => win.indexOf(s) >= 0) === false) {
+            problems.push(f + ':' + (i + 1) + ' 指 ' + rel + ':' + n + '，但那几行里没有 '
+              + symbols.slice(0, 3).join('/') + ' 任何一个（现在那行是 '
+              + JSON.stringify(target[n - 1].trim().slice(0, 56)) + '）');
+          }
+        }
+      }
+    }
+    // 能机器判的只有「句里点得出符号」的那些（实测 11 处上下）；纯行号引用（「见 :1117」）
+    // 机器无从知道它指什么。下限按真实可达数写 —— 写个够不着的高数就是自欺。
+    assert.ok(judged >= 6, '这条闸门只判了 ' + judged + ' 处，判据漂了');
+    assert.deepEqual(problems, [], '这些行号指针已经指不到它声称的东西：\n' + problems.join('\n'));
+  });
+  await check('浮窗必须认当前语言（P1：wsText 此前恒读 zh，英文界面下整个工作区仍是中文）', () => {
+    // 上一轮我把这条报成「zh 183 键 vs en 78 键的翻译缺口」—— 那个描述**不完整**。
+    // 这次先查真实读取路径再定契约：
+    //   * 配置页（React）走 makeText(props.t) → 官方 locale 查找链，本来就跟语言；
+    //   * 工作区浮窗（命令式 DOM）119 处全走 wsText(key)，实现是
+    //     typeof zh[key] === 'string' ? zh[key] : key（改动前在 lib/client.js:2123-2126；
+    //     本闸门就是为修它而加，现行实现见同文件 localeText）——
+    //     **恒读 zh**，连查都没查官方 locale。所以光把 en 补齐也不会变英文。
+    //   同一形状的还有 fallbackText（改动前在 :1158-1161，宿主错误回执走它）。
+    // 官方能力（本轮实读 dsh-client-locale/lib/client.js）：
+    //   getSnapshot() :1250-1252 带 active；subscribe(fn) :1260-1265 每次快照变化通知
+    //   （语言切换**与字典注册**都会 publish：:1443 与 :1397）；
+    //   translate :1423-1427 按 active 的 fallbackChain 查，缺键回 key 本身。
+    // 契约：wsText / fallbackText 先问官方链，拿不到（或原样回 key）才退本文件 zh，
+    // 再退 key。退 zh 而不是退 key 是刻意的：宁可给用户一句中文，也不给一串 camelCase。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const at = cli.indexOf('function wsText(');
+    assert.ok(at > 0, '抓不到 wsText（改名了？同步这条闸门）');
+    const wsTextBody = cli.slice(at, cli.indexOf('function TeamEntryAnchor(', at));
+    assert.ok(wsTextBody.length > 40 && wsTextBody.length < 2600, 'wsText 函数体形状不对');
+    assert.ok(/locale/i.test(wsTextBody),
+      'wsText 又不读当前语言了：英文界面下整个工作区浮窗会退回全中文');
+    const fbAt = cli.indexOf('function fallbackText(');
+    assert.ok(fbAt > 0, '抓不到 fallbackText');
+    assert.ok(/locale/i.test(cli.slice(fbAt, fbAt + 800)),
+      'fallbackText 也必须走同一套语言解析（宿主错误回执走它）');
+    // 切换语言必须让**已经打开**的浮窗跟着换字：覆盖层是命令式 DOM，官方那次
+    // React 重渲染不会顺手刷它。官方留 subscribe 正是给这个用的（同包先例：
+    // dsh-client-ui-conversation/lib/client.js:18014 ctx.locale.subscribe(refreshViews)）。
+    assert.ok(/locale\.subscribe\(/.test(cli),
+      '没有订阅 locale 变化：用户切语言后，开着的浮窗仍是旧语言');
+  });
+
+  await check('浮窗逐行时间与复制按钮：只给用户/助手行（官方就这么定，不多不少）', () => {
+    // P1-3（用户：弹窗要和官方聊天窗口等价）。官方实现本轮实读：
+    //   * 规则 .probe-tmp/chat-client.js:1057-1068 formatMessageClock(time, t, now)：
+    //     当天只给 HH:mm；同年给 clock.md + 空格 + HH:mm；跨年给 clock.ymd + HH:mm。
+    //   * 官方文案 dsh-client-locale/lib/client.js:933-934/979-980（实读 asar）：
+    //     copy=复制/Copy，copied=复制成功/Copied；clock.md={m}月{d}日 / {m}/{d}；
+    //     clock.ymd={y}年{m}月{d}日 / {y}-{m}-{d}（两份都是真值，不是自造措辞）。
+    //   * **谁有**这两样：UserMessageNodeView（chat-client.js:1458-1464，time+clock=start）、
+    //     助手回合尾（:6596-6599，time+clock=end）。而工具行**没有**时间：
+    //     .probe-tmp/tool-client.js 里 formatMessageClock 出现 0 次，
+    //     official-conversation-client.js 里也是 0 次。PendingSteeringBubble（:1398-1403）
+    //     有复制键但**不传 time**（官方 :1144 `time === void 0 ? null` 就不画钟）。
+    //   → 所以「给每一行都加时间」是**超出官方**的做法，会把工具行搞成官方没有的样子；
+    //     这里钉的是「用户/助手行有，工具行没有」。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const at = cli.indexOf('function wsFormatClock(');
+    assert.ok(at > 0, '没有 wsFormatClock（逐行时间的官方规则移植丢了？）');
+    const body = cli.slice(at, cli.indexOf('\n  }', at) + 4);
+    assert.ok(body.length > 200 && body.length < 2400, 'wsFormatClock 函数体形状不对');
+    // 官方三档都在，且日期串走字典（不写死「月/日」—— 英文界面要 {m}/{d}）。
+    assert.ok(/wsClockYmd|wsClockMd/.test(body), '跨年/同年必须走 clock.md / clock.ymd 两条键');
+    assert.ok(/getHours\(\)/.test(body) && /getMinutes\(\)/.test(body) && /pad/.test(body),
+      '必须是 24 小时制 HH:mm（官方 pad2(getHours()):pad2(getMinutes())）');
+    assert.ok(/getFullYear\(\)/.test(body) && /getMonth\(\)/.test(body) && /getDate\(\)/.test(body),
+      '同年判定要按本地日历（官方 :1061 三件套），不能按「相差 24 小时」');
+    // 复制：官方标签 + 成功后短暂回显（:1137-1141 setCopied(true) + 1e3 ms 复位）
+    assert.ok(/wsCopyLabel|'wsCopy'/.test(cli), '没有复制按钮的字典键接线');
+    assert.ok(/'wsCopied'/.test(cli), '复制成功后的回显文案缺失（官方 copied）');
+    assert.ok(/navigator\.clipboard/.test(cli) && /execCommand/.test(cli),
+      '剪贴板必须有 execCommand 兜底：官方 writeClipboard 就这么写（非安全上下文里 clipboard 不可用，' +
+      '只写 clipboard 的话用户点了没反应）');
+    // 谁有：用户/助手行接 wsRowClock/复制，工具行**不许**接。
+    assert.ok(/wsRowMeta|wsClockEl|wsCopyBtn/.test(cli), '没找到行内时间/复制的挂载点');
+    const clockCalls = [...cli.matchAll(/wsFormatClock\(/g)].length;
+    assert.ok(clockCalls >= 2 && clockCalls <= 12, 'wsFormatClock 调用点数量异常（' + clockCalls + '）：要么没接上，要么到处乱贴');
+  });
+  await check('宿主提示 notes 走结构化 code（双语的前提：服务端不拼句子）', () => {
+    // 上一轮我给用户的建议原话是「宿主只发 code/count/reason 这类事实、句子挪到浏览器拼」，
+    // 用户 2026-10-15 点头做的是这条。范围**只有画布底栏那批 notes**（lib/graph.js）：
+    // lib/runtime.js / lib/preset.js 里的同名 notes 是**另一个通道**（配置页 + 磁盘状态文件），
+    // 那边有 40 多个推送点、且大部分是排障用语，不在这次范围内（如实记在这儿，不假装全修了）。
+    const graph = readFileSync(path.join(PLUGIN_DIR, 'lib', 'graph.js'), 'utf8');
+    const cli = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+
+    // ① graph.js 的每一处 notes.push 必须是 { code, params }，不许再拼中文句子。
+    const pushes = [];
+    const scan = (from) => {
+      // 从 notes.push( 之后扫到配对的 )（字符串里的括号按引号跳过）。
+      let depth = 1; let i = from; let quote = null;
+      while (i < graph.length && depth > 0) {
+        const c = graph[i];
+        if (quote !== null) {
+          if (c === '\\') { i += 2; continue }
+          if (c === quote) quote = null;
+          i += 1; continue;
+        }
+        if (c === "'" || c === '"' || c === String.fromCharCode(96)) { quote = c; i += 1; continue }
+        if (c === '(' || c === '{' || c === '[') depth += 1;
+        else if (c === ')' || c === '}' || c === ']') depth -= 1;
+        i += 1;
+      }
+      return graph.slice(from, i - 1);
+    };
+    let at = 0;
+    while ((at = graph.indexOf('notes.push(', at)) >= 0) {
+      const body = scan(at + 'notes.push('.length);
+      pushes.push(body);
+      at += 1;
+    }
+    assert.ok(pushes.length >= 7, 'notes.push 只找到 ' + pushes.length + ' 处（七个降级事实都在 graph.js 里，数量变了要重核这条闸门）');
+    const codes = [];
+    for (const body of pushes) {
+      assert.ok(!new RegExp('[\\u4e00-\\u9fff]').test(body),
+        'notes.push 里又出现中文字面量（等于把界面语言焊回宿主半）：' + body.trim().slice(0, 90));
+      const m = /^\s*\{\s*code:\s*'([A-Za-z][A-Za-z0-9]*)'/.exec(body);
+      assert.ok(m !== null, 'notes.push 必须是 { code: 名字, params: {…} } 形状：' + body.trim().slice(0, 90));
+      codes.push(m[1]);
+    }
+    const uniqueCodes = [...new Set(codes)];
+    assert.equal(codes.length, uniqueCodes.length, '同一个 code 被推了两遍（每种降级事实应各一个）：' + codes.join(','));
+
+    // ② 客户端的 WS_NOTE_CODES 必须与之**双向相等**：少一个映射，那条提示就显示成裸 code。
+    const mapAt = cli.indexOf('const WS_NOTE_CODES = {');
+    assert.ok(mapAt > 0, 'client.js 找不到 WS_NOTE_CODES 表（语言切换后宿主提示无句可拼）');
+    const mapBlock = cli.slice(mapAt, cli.indexOf('\n  }', mapAt));
+    const mapped = [...mapBlock.matchAll(/^\s{4}([A-Za-z][A-Za-z0-9]*):/gm)].map((x) => x[1]);
+    const missingMap = uniqueCodes.filter((c) => !mapped.includes(c));
+    const orphanMap = mapped.filter((c) => !uniqueCodes.includes(c));
+    assert.deepEqual(missingMap, [], 'graph.js 发了但客户端没有映射的 code（画布上会显示成 ' + 'code 原文）：' + missingMap.join(','));
+    assert.deepEqual(orphanMap, [], 'WS_NOTE_CODES 里有 graph.js 不再发的死映射：' + orphanMap.join(','));
+
+    // ③ 每个映射指向的字典键，zh 与 en 两本都得有（缺一本 = 那种「补齐也没用」的谎）。
+    const lines = cli.split('\n');
+    const dictKeys = (dict) => {
+      const start = lines.findIndex((l) => l.trim().startsWith('const ' + dict + ' = {'));
+      assert.ok(start >= 0, '找不到字典 ' + dict);
+      let end = start;
+      while (end + 1 < lines.length && lines[end].trim() !== '}') end += 1;
+      const out = new Set();
+      for (let i = start + 1; i < end; i += 1) {
+        const l = lines[i];
+        if (!l.startsWith('    ')) continue;
+        const cut = l.indexOf(':');
+        if (cut <= 4) continue;
+        const name = l.slice(4, cut);
+        if (name.trim() === name && /^[A-Za-z0-9_]+$/.test(name)) out.add(name);
+      }
+      return out;
+    };
+    const zh = dictKeys('zh');
+    const en = dictKeys('en');
+    const targets = [...mapBlock.matchAll(/^\s{4}[A-Za-z][A-Za-z0-9]*:\s*'([^']+)'/gm)].map((x) => x[1]);
+    assert.equal(targets.length, mapped.length, 'WS_NOTE_CODES 的某一项值不是字典键名（写成了句子？）');
+    for (const key of targets) {
+      assert.ok(zh.has(key), '宿主提示的中文文案缺键：' + key);
+      assert.ok(en.has(key), '宿主提示的英文文案缺键：' + key);
+    }
+
+    // ④ 渲染处必须过 wsNoteText（原来两处直接 state.notes.join('\n') —— 那会把对象渲染成 [object Object]）。
+    assert.ok(/function wsNoteText/.test(cli), '没有 wsNoteText（结构化 code 拿不到句子）');
+    assert.ok(/function wsNotesText/.test(cli), '没有 wsNotesText（整批提示的组装点）');
+    assert.ok(!/state\.notes\.join\(/.test(cli), '还有地方把 state.notes 直接 join 上屏（对象会变成 [object Object]）');
+    // 兼容旧宿主半（浏览器刷新但 DSH 没重启 → notes 还是字符串）：不许当场报错。
+    const fn = cli.slice(cli.indexOf('function wsNoteText'), cli.indexOf('function wsNotesText'));
+    assert.ok(/typeof note === 'string'/.test(fn), 'notes 是字符串（旧宿主半）时必须有直通分支');
+  });
+
+  await check('两本字典的键集合必须严格相等（缺一边就是「补齐也没用」的那种谎）', () => {
+    // 上一轮只报「zh 比 en 多 105 键」，容易读成「补翻译就行」。
+    // 真正的下限是两边键集合**相等**：多出来的键在另一种语言里必然渲染成中文或裸键名。
+    // 解析判据与上面死键闸门同源（同一套 block/keyOf），不留两套各说各话。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const lines = cli.split('\n');
+    const range = (dict) => {
+      const start = lines.findIndex((line) => line.trim().startsWith('const ' + dict + ' = {'));
+      assert.ok(start >= 0, '找不到字典 ' + dict);
+      let end = start;
+      while (end + 1 < lines.length && lines[end].trim() !== '}') end += 1;
+      return { start, end };
+    };
+    const keyOf = (line) => {
+      if (!line.startsWith('    ')) return '';
+      const cut = line.indexOf(':');
+      if (cut <= 4) return '';
+      const name = line.slice(4, cut);
+      if (name === '' || name.trim() !== name) return '';
+      for (const ch of name) if (!/^[A-Za-z0-9_]+$/.test(ch)) return '';
+      return name;
+    };
+    const collect = (dict) => {
+      const r = range(dict);
+      const out = new Set();
+      for (let i = r.start + 1; i < r.end; i += 1) {
+        const name = keyOf(lines[i]);
+        if (name !== '') out.add(name);
+      }
+      return out;
+    };
+    const zhKeys = collect('zh');
+    const enKeys = collect('en');
+    assert.ok(zhKeys.size >= 190, 'zh 只解析出 ' + zhKeys.size + ' 个键，判据漂了？');
+    const missingEn = [...zhKeys].filter((name) => !enKeys.has(name)).sort();
+    const missingZh = [...enKeys].filter((name) => !zhKeys.has(name)).sort();
+    assert.deepEqual(missingEn, [], '这些键英文界面会渲染成中文或裸键名：' + missingEn.join(', '));
+    assert.deepEqual(missingZh, [], '这些键只有英文有（中文界面会看到 key）：' + missingZh.join(', '));
+  });
+
+  await check('字典之外不许出现硬编码中文（否则补齐 en 也翻不到那几句）', () => {
+    // 2026-10-14 全文件实扫：字典区与注释**之外**仍有中文字符串字面量（按钮 title、
+    // 上下文环的悬停说明、协作核展开标题、读取失败、图片张数单位等）。
+    // 它们不在字典里，英文界面下就是一句孤零零的中文 —— 补多少条翻译都没用。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const lines = cli.split('\n');
+    const range = (dict) => {
+      const start = lines.findIndex((line) => line.trim().startsWith('const ' + dict + ' = {'));
+      assert.ok(start >= 0, '找不到字典 ' + dict);
+      let end = start;
+      while (end + 1 < lines.length && lines[end].trim() !== '}') end += 1;
+      return { start, end };
+    };
+    const ranges = [range('zh'), range('en')];
+    const CJK = new RegExp('[\\u4e00-\\u9fff]');
+    const DQ = String.fromCharCode(34);
+    const BT = String.fromCharCode(96);
+    // 扫一行里**真正是字符串字面量**的片段，跳过行注释与块注释。
+    // 只按 split 粗剥不够：本文件的注释一律是中文，而块注释也常出现在行尾
+    // （catch 里那种「已经掉了」），第一版就是这么误报了 5 处。
+    const stringLiterals = (code) => {
+      const found = [];
+      let quote = null;
+      let text = '';
+      let inBlock = false;
+      for (let j = 0; j < code.length; j += 1) {
+        const c = code[j];
+        const next = code[j + 1];
+        if (inBlock) {
+          if (c === '*' && next === '/') { inBlock = false; j += 1 }
+          continue;
+        }
+        if (quote === null) {
+          if (c === '/' && next === '/') break;
+          if (c === '/' && next === '*') { inBlock = true; j += 1; continue }
+          if (c === "'" || c === DQ || c === BT) { quote = c; text = ''; continue }
+          continue;
+        }
+        if (c === '\\') { text += c + (next === undefined ? '' : next); j += 1; continue }
+        if (c === quote) { found.push(text); quote = null; continue }
+        text += c;
+      }
+      // 跨行模板串：收尾时仍处于引号内，就把攒下的这段也算进去。
+      if (quote !== null) found.push(text);
+      return found;
+    };
+    const offenders = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      if (ranges.some((r) => i >= r.start && i <= r.end)) continue;
+      const t = lines[i].trim();
+      if (t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) continue;
+      const hit = stringLiterals(lines[i]).filter((s) => CJK.test(s));
+      if (hit.length > 0) offenders.push((i + 1) + ': ' + hit[0].slice(0, 40));
+    }
+    assert.deepEqual(offenders, [], '这些中文没进字典，英文界面翻不到：' + offenders.join(' | '));
+  });
+  await check('client.js 的两本内联字典里不许有零引用文案（2026-10-14 清掉 6 条死键后钉死这一类）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    const lines = src.split('\n');
+    const blockRange = (dict) => {
+      const start = lines.findIndex((line) => line.trim().startsWith('const ' + dict + ' = {'));
+      if (start < 0) return null;
+      let end = start;
+      while (end + 1 < lines.length && lines[end].trim() !== '}') end += 1;
+      return { dict, start, end };
+    };
+    const ranges = [];
+    for (const dict of ['zh', 'en']) {
+      const range = blockRange(dict);
+      if (range === null) return '找不到字典 ' + dict + '（写法变了？同步这条闸门）';
+      ranges.push(range);
+    }
+    const keyOf = (line) => {
+      if (!line.startsWith('    ')) return '';
+      const cut = line.indexOf(':');
+      if (cut <= 4) return '';
+      const name = line.slice(4, cut);
+      if (name === '' || name.trim() !== name) return '';
+      for (const ch of name) if (!/^[A-Za-z0-9_]+$/.test(ch)) return '';
+      return name;
+    };
+    // 判据：键名以**字符串字面量**出现在两本字典之外。本文件唯一的取键方式是 zh[key] / t('key')，
+    // 全文没有 'ws' + 变量 这类动态拼键（2026-10-14 逐行扫过），所以字面量判据是充分的。
+    const outside = lines.map((line, i) => (ranges.some((range) => i > range.start && i <= range.end) ? '' : line)).join('\n');
+    const keys = [];
+    for (const range of ranges) {
+      for (let i = range.start + 1; i < range.end; i += 1) {
+        const name = keyOf(lines[i]);
+        if (name !== '') keys.push({ dict: range.dict, line: i + 1, name });
+      }
+    }
+    assert.ok(keys.length > 200, '只解析出 ' + keys.length + ' 个字典键，判据漂了？');
+    const dead = keys.filter((item) => (outside.split("'" + item.name + "'").length - 1) === 0);
+    assert.deepEqual(dead.map((item) => item.dict + ':' + item.line + ' ' + item.name), [],
+      '这些文案定义了却没人引用（删渲染忘了删文案 = 下次改 UI 的人无从判断还有没有用）');
+  });
+
+
   await check('extractConversation：过滤注入、工具逐条成官方风格行、正文有界、按 limit 取尾部', () => {
     const long = 'x'.repeat(5000);
     const rows = graph.extractConversation([
@@ -1176,6 +2261,96 @@ function functionBodyOf(source, needle) {
     assert.equal(folded.filter((r) => r.kind === 'tool').length, 6, '折叠后保留头 4 + 尾 2');
   });
 
+  await check('detailOf：浮窗展开层的数据源 —— 按 callId / turn:step 取到官方那份输入与输出', () => {
+    // 用户 2026-10-09 原话：「弹窗要像在原始界面看到的界面一样，能看到读取文件、修改文件、
+    // 调用工具等等」「一定要正确，和我用官方的对话框没太大区别」。
+    // 官方每一行工具调用是**可展开**的：折叠时一行标签+目标，展开是「输入」与「输出」
+    // （.probe-tmp/tool-client.js:1495 注释原文 render one localized tool summary and
+    //  lazily mounted result card；:1662/:1676 渲 row.input / row.output；:1518 可展开判据）。
+    // 本插件此前折到「读取 · package.json」为止：lib/graph.js:1711-1714 处理 tool/result
+    // 时**只**写 row.error = true，结果正文一个字节都没取。
+    const events = [
+      { type: 'tool/call', data: { callId: 'c1', name: 'read', arguments: '{\"file_path\":\"a/b.md\"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: '第一行\n第二行' }], isError: false } } },
+      // 非文本块：官方 resultText 对不是 text 的块 JSON.stringify(block, null, 2)，不静默丢
+      { type: 'tool/call', data: { callId: 'c2', name: 'grep', arguments: '{\"pattern\":\"x\"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c2' }, content: [{ type: 'image', attachment: { attachmentId: 'sha256:zz' } }], isError: false } } },
+      // 失败且正文为空：官方回退 name: code（同文件 :183），不能显示成空白
+      { type: 'tool/call', data: { callId: 'c3', name: 'bash', arguments: '{\"command\":\"ls\"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c3' }, content: [], isError: true, error: { name: 'QuotaError', code: 'QUOTA_EXCEEDED' } } } },
+      // 正文全文按 turn:step 取（行内被 clipLine 截过，展开看整段）
+      { type: 'assistant/message', data: { turn: 3, step: 5, message: { content: [{ type: 'text', text: 'y'.repeat(2600) }] } } },
+    ];
+    const one = graph.detailOf(events, 'call:c1');
+    assert.equal(one.ok, true, '按 callId 取详情必须命中：' + JSON.stringify(one));
+    assert.equal(one.input, JSON.stringify({ file_path: 'a/b.md' }, null, 2), '输入 = 官方 formatToolBody 的序列化（:263 JSON.stringify(parsed, null, 2)）');
+    assert.equal(one.output, '第一行\n第二行', '输出 = result 的 text 块');
+    assert.equal(one.error, false);
+    const img = graph.detailOf(events, 'call:c2');
+    assert.ok(img.output.indexOf('\"image\"') >= 0 && img.output.indexOf('sha256:zz') >= 0,
+      '非文本块要按官方那样序列化出来：' + img.output);
+    const dead = graph.detailOf(events, 'call:c3');
+    assert.equal(dead.error, true);
+    assert.ok(dead.output.indexOf('QuotaError') >= 0 && dead.output.indexOf('QUOTA_EXCEEDED') >= 0,
+      '空正文的失败调用要给错误身份：' + dead.output);
+    const body = graph.detailOf(events, 'turn:3:5');
+    assert.equal(body.ok, true, '按 turn:step 取正文全文必须命中：' + JSON.stringify(body));
+    assert.equal(body.output.length, 2600, '展开层拿到的是**全文**，不是 2000 截断版');
+    // 读不到时如实失败，不编内容；畸形 key 不抛错
+    assert.equal(graph.detailOf(events, 'call:nope').ok, false);
+    assert.equal(graph.detailOf(events, '').ok, false);
+    assert.equal(graph.detailOf(events, 'bogus').ok, false);
+    assert.equal(graph.detailOf(events, 'turn:9:9').ok, false);
+    assert.equal(graph.detailOf(null, 'call:c1').ok, false, '事件读不到时不许抛错');
+    // 真人输入与队员汇报**同样会被截**（实测 session-00001000：最长 user 行 12,897 码元、
+    // 最长 team 汇报 12,815，都超 LINE_MAX=2000）。行身份用消息 id（两类事件都带）。
+    const msgs = [
+      { type: 'user/message', data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '用'.repeat(2600) }] } },
+      { type: 'team/message/queued', data: { message: { id: 'm1', senderName: 'lead', targetId: 'x', content: [{ type: 'text', text: '汇报正文' }] } } },
+    ];
+    assert.equal(graph.detailOf(msgs, 'msg:u1').output.length, 2600, '真人输入按消息 id 取全文');
+    assert.equal(graph.detailOf(msgs, 'msg:m1').output, '汇报正文', '队员汇报按 message.id 取全文');
+    assert.equal(graph.detailOf(msgs, 'msg:nope').ok, false);
+    const marked = graph.extractConversation(msgs, 10);
+    const urow = marked.find((r) => r.kind === 'user');
+    assert.equal(urow.detailKey, 'msg:u1', '截过的 user 行要带可展开身份：' + JSON.stringify(urow));
+    assert.equal(urow.hasDetail, true);
+    assert.equal(urow.truncated, true);
+    // 有界：单次返回的正文不得无上限（官方是 lazily mount 一整块，我们走路由要设界）
+    const huge = graph.detailOf([{ type: 'tool/call', data: { callId: 'h', name: 'read', arguments: '{}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'h' }, content: [{ type: 'text', text: 'z'.repeat(200000) }], isError: false } } }], 'call:h');
+    assert.ok(huge.output.length <= 33000, '输出有上限（防把上下文与带宽打满）：' + huge.output.length);
+    assert.ok(huge.truncated === true, '截过要如实标 truncated');
+  });
+
+  await check('extractConversation：行带 hasDetail / truncated，折叠组那几条点得开（不许空头承诺）', () => {
+    const rows = graph.extractConversation([
+      { type: 'tool/call', data: { callId: 'c1', name: 'read', arguments: '{\"file_path\":\"a\"}' } },
+      { type: 'tool/result', data: { message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'ok' }] } } },
+      { type: 'tool/call', data: { callId: 'c2', name: 'todo_write', arguments: '' } },
+      { type: 'assistant/message', data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: '短正文' }] } } },
+      { type: 'assistant/message', data: { turn: 1, step: 2, message: { content: [{ type: 'text', text: 'w'.repeat(2400) }] } } },
+    ], 20);
+    assert.equal(rows.find((r) => r.callId === 'c1').hasDetail, true, '有参数有结果的工具行该能展开');
+    assert.ok(!rows.find((r) => r.callId === 'c2').hasDetail, '没参数没结果不该有箭头：点了没反应的按钮比没有按钮更糟');
+    const short = rows.find((r) => r.text === '短正文');
+    assert.ok(!short.hasDetail && !short.truncated, '没截断的正文不该有箭头');
+    const long = rows.find((r) => r.kind === 'assistant' && r.step === 2);
+    assert.equal(long.truncated, true, '被 LINE_MAX 截过的行必须标 truncated');
+    assert.equal(long.hasDetail, true, '截过的行要能展开看全文');
+    // 折叠组：中间那几条必须**带着数据**回来（点开就看到），且文案不再承诺一个不存在的「查看」
+    const many = [];
+    for (let k = 0; k < 12; k += 1) many.push({ type: 'tool/call', data: { callId: 'x' + k, name: 'read', arguments: '{}' } });
+    const folded = graph.extractConversation(many, 50);
+    const group = folded.find((r) => r.kind === 'toolgroup');
+    assert.ok(group, '12 条连续工具应折叠中段');
+    assert.ok(Array.isArray(group.rows) && group.rows.length === 6, '折叠掉的 6 条要带在行上供展开：' + JSON.stringify(group.rows));
+    assert.equal(group.rows[0].callId, 'x4', '折叠的是中段（头 4 + 尾 2 保留）');
+    assert.equal(group.count, 6, '数量是事实，随行走');
+    // 措辞归客户端（i18n）；而旧文案那句「可在「查看」中读取」是**空头承诺** ——
+    // 官方有 Inspect 按钮（tool-client.js:1684-1688），本插件没有，照抄就是骗人。
+    assert.ok(!('text' in group), '后端不再拼句子：' + JSON.stringify(group));
+  });
   await check('team 行：sender 走结构化字段，正文保持纯净 markdown（弹窗乱码修复）', () => {
     // 用户 2026-10-11 报障：弹窗里 `##`、`**`、反引号全部裸显（「乱码」）。
     // 根因（真实会话 session-0000100b seq=66 实测）：队员的 report_result 报告正文**就是
@@ -1512,68 +2687,268 @@ function functionBodyOf(source, needle) {
     assert.ok(indexSrc.includes('healManagedBlock'), 'lib/index.js 必须调用 healManagedBlock（否则自愈形同虚设）');
   });
 
-  await check('dsh-ops 组件合并（vendor 化）：ops-file 行、vendor 闭包、共存自愈三件套齐备', () => {
-    // 用户 2026-10-11 第二轮要求：「ops 插件直接放进我的智能体团队源码里面，把我本机上
-    // 安装的 ops 卸载了也可以用；别人装了 ops 可以兼容不报错，没装 ops 也能装我的插件」。
-    //
-    // 落地形态（四处协同，缺一即坏）：
-    //   ① vendor/ops/lib/ —— dsh-ops 0.2.9 lib/ 的完整运行时拷贝（14 模块依赖闭包，
-    //      除 Node 内置外零外部包）；vendor/ops/vendor/fastctx/target/release/fastctx.exe
-    //      是工具的 Rust 执行体（dsh-ops binary.js 搜索链第 2 环 repoBuildFile 命中，
-    //      PACKAGE_ROOT 在 vendor 副本里指向 vendor/ops，实测 resolveBinary+probeBinary 通过）。
-    //      （2026-10-12 从官方 v0.2.9 同步；此前副本为 v0.2.8。）
-    //   ② cordis.patch.yml 第 4 行 `- id: ops-file / name: @zws/dsh-dispatch-agent-team/ops-file`
-    //      —— name 指向**本包自己的 exports 子路径**（./ops-file），卸载独立 dsh-ops 后
-    //      本行照常解析挂载。id 不能沿用 dsh-ops-file（会被它的 bundle 行覆盖，
-    //      asar 文档 overridden 语义）。
-    //   ③ package.json exports['./ops-file'] + files 含 vendor（发布时带上二进制）。
-    //   ④ lib/ops-coexist.js 启动自愈 —— 别人装了独立 dsh-ops 时，把它 bundle 的
-    //      dsh-ops-file 行在 profile 层钉 disabled（机制同 self-heal），防 ops_* 重复注册；
-    //      没装则该自愈零动作。lib/index.js 必须调用它 + detectOpsIntegration 体检。
+  await check('dsh-ops 原生链接（2026-10-15 改版）：内嵌 ops 已删干净，且本包不含任何改 ops 源码的东西', () => {
+    // 用户 2026-10-15 的要求：不再内嵌 —— 两插件各自安装各自启用，本包检测到 ops 就用它的工具。
+    // 闸门两头都要盯：① 旧内嵌形态的任何残留（vendor/ops-file/ops-coexist）不得复活；
+    // ② 新适配层（lib/ops-adapter.js + tools/ops-enable.cjs + tools/ops-mount-check.mjs）齐备且接线；
     const patch = readFileSync(path.join(__dirname, '..', 'cordis.patch.yml'), 'utf8');
-    assert.ok(/^\s*-\s*id:\s*ops-file\s*$/m.test(patch), 'cordis.patch.yml 必须有 `- id: ops-file` 行（第四组件）');
-    assert.match(patch, /name:\s*['"]@zws\/dsh-dispatch-agent-team\/ops-file['"]/,
-      'ops-file 行的 name 必须指向本包 vendor 入口（卸载独立 dsh-ops 后仍可解析）');
-    assert.ok(!/^\s*-\s*id:\s*dsh-ops-file\s*$/m.test(patch),
-      '本包不得声明 id=dsh-ops-file（会被 dsh-ops 自己的 bundle 行覆盖，overridden 语义）');
-    // config 逐项核对（与 dsh-ops 官方 dsh-ops-file 行同值，防止两个实现配置分叉）
-    const blockMatch = /- id: ops-file\n([\s\S]*?)(?=\n    - id:|\n$|$)/.exec(patch);
-    assert.ok(blockMatch !== null, 'ops-file 行块提取失败');
-    const block = blockMatch[1];
-    assert.match(block, /promptPolicy:\s*true/);
-    assert.match(block, /enableShellTools:\s*false/);
-    assert.match(block, /required:\s*false/);
-    assert.match(block, /toolCallTimeoutMs:\s*300000/);
-
-    // vendor 闭包完整性（13 模块 + file 组件 manifest + fastctx.exe）
-    const vendorLib = path.join(__dirname, '..', 'vendor', 'ops', 'lib');
-    for (const mod of ['index.js', 'binary.js', 'policy.js', 'tools.js', 'config.js', 'config-updates.js',
-      'shells.js', 'session-shells.js', 'session-pwsh.js', 'handshake.js', 'jobs.js',
-      'presentation.js', 'runtime-pool.js']) {
-      assert.ok(existsSync(path.join(vendorLib, mod)), `vendor/ops/lib/${mod} 缺失（vendor 闭包不完整）`);
-    }
-    assert.ok(existsSync(path.join(vendorLib, 'components', 'file', 'index.js')), 'vendor file 入口缺失');
-    assert.ok(existsSync(path.join(vendorLib, 'components', 'file', 'package.json')),
-      'vendor file manifest 缺失（插件页组件卡片会没有图标/描述）');
-    assert.ok(existsSync(path.join(__dirname, '..', 'vendor', 'ops', 'vendor', 'fastctx', 'target', 'release', 'fastctx.exe')),
-      'vendor fastctx.exe 缺失（工具的 Rust 执行体；resolveBinary 的 repoBuild 环就是找它）');
-
+    assert.ok(!/^-\s*id:\s*ops-file\s*$/m.test(patch) && !/dsh-dispatch-agent-team\/ops-file/.test(patch),
+      'cordis.patch.yml 不得再有本包自带的 ops-file 组件行（内嵌已按用户要求删除）');
     const pkg = JSON.parse(readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
-    assert.equal(pkg.exports?.['./ops-file'], './vendor/ops/lib/components/file/index.js',
-      'package.json exports 必须有 ./ops-file 子路径（patch 行 name 解析的锚点）');
-    assert.ok(pkg.files?.includes('vendor'), 'package.json files 必须含 vendor（发布不带二进制 = 别人装了组件挂掉）');
+    assert.equal(pkg.exports?.['./ops-file'], undefined, 'package.json 不得再有 ./ops-file 导出（vendor 入口）');
+    assert.ok(!pkg.files?.includes('vendor'), 'package.json files 不得再含 vendor');
+    assert.ok(!existsSync(path.join(__dirname, '..', 'vendor')), 'vendor/ 目录必须已删除');
+    assert.ok(!existsSync(path.join(__dirname, '..', 'lib', 'ops-coexist.js')), 'lib/ops-coexist.js 必须已删除（钉 dsh-ops-file 的旧自愈，留着会把真 ops 的 file 组件误关）');
 
-    const coexistSrc = readFileSync(path.join(__dirname, '..', 'lib', 'ops-coexist.js'), 'utf8');
-    assert.ok(coexistSrc.includes('export function healOpsCoexist(ctx)'), 'lib/ops-coexist.js 必须导出 healOpsCoexist');
-    assert.ok(coexistSrc.includes('- id: dsh-ops-file'), '共存自愈必须钉 dsh-ops-file 行（只此一行，不碰 shell/background）');
+    // ② 适配层：检测 + 队员链接，四组件与 11 个公开工具名逐名对齐 ops 0.3.0。
+    const adapterSrc = readFileSync(path.join(__dirname, '..', 'lib', 'ops-adapter.js'), 'utf8');
+    assert.ok(adapterSrc.includes('export function detectOpsComponents'), 'ops-adapter 必须导出 detectOpsComponents（体检）');
+    assert.ok(adapterSrc.includes('export function linkOpsForMember'), 'ops-adapter 必须导出 linkOpsForMember（队员链接）');
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
+      assert.ok(adapterSrc.includes("id: '" + id + "', component:"), 'ops-adapter 的 OPS_ROWS 必须覆盖 ' + id);
+    }
+    for (const tool of ['ops_inspect_local_file', 'ops_grep', 'ops_glob', 'ops_replace', 'ops_bash',
+      'ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill', 'ops_batch', 'ops_result']) {
+      assert.ok(adapterSrc.includes("'" + tool + "'"), 'ops-adapter 的 OPS_TOOL_NAMES 必须含 ' + tool);
+    }
+    // 文案真实性闸门（2026-10-16 第二轮真机，researcher-ops2 自己抓出来的）：
+    // 旧文案写「与宿主工具同级，放心直调」，但纯 PTC 档队员**直调任何 ops_* 一律被拒**
+    // （实测原文：unknown tool "ops_glob": only run_code is callable directly）。它据此把
+    // 「提示词与实际行为不一致」列成未决项 —— 那是我们自己的文案在骗模型。
+    // 所以这里钉住：不许再出现「放心直调」这类无条件直调的说法，且必须含档无关的自查指引。
+    assert.ok(!adapterSrc.includes('放心直调'),
+      'ops 指引段又出现无条件的「放心直调」（纯 PTC 档直调会被拒，这句在骗模型）');
+    // 文案真实性闸门第二弹（2026-10-16 真机 session-00001005 + 本会话对照实验）：
+    // 上一版写「返回开头常另起一行 (Background: …) 通知（报告其它已结束/在跑的任务，本轮实测 5 次皆有）」。
+    // 对照实验证伪了它：只起一个任务时**没有**这一行（R1 原文 = "(Complete: job j-lhvnbs started; …)"），
+    // 第二个任务在跑时才出现（R2 开头 "(Background: j-lhvnbs running 0s.)"）。
+    // scout-qa 那轮 5 次都是单任务，返回里就没有 Background 行 —— 它照抄原文时如实报了没有，
+    // 而我们的文案在骗模型「开头常另起一行」。「5 次皆有」那句话还是我从**别的**一轮的观测搬过来的，
+    // 搬来时没在本轮复核：本轮 2.3 只跑了一次 ops_run_background。
+    assert.ok(!adapterSrc.includes('5 次皆有') && !adapterSrc.includes('常另起一行'),
+      'ops 指引段又出现「(Background:) 开头常另起一行 / 5 次皆有」这种无条件断言（对照实验：单任务时那行不存在）');
+    // 而且我**第一版修正本身也是错的**（写成「只有当本会话还有别的任务在跑时」）。
+    // 同一条会话里后来起的第三次调用打出 (Background: j-lhvnbs exited 0, j-djf7lx exited 0.)
+    // —— 那两个任务**都已经结束了**。ops 自己的 jobs.js:21-29 也是按「本会话拥有过的 job」筛
+    // （ENTRY 正则同时认 running / exited / killed / interrupted），不是只认在跑的。
+    // 所以判据锁这两句：出现条件 = 本会话此前有过别的任务（在跑或已结束都算），且首个任务没有这行。
+    assert.ok(adapterSrc.includes('此前有过别的任务') && adapterSrc.includes('在跑的或已结束的都算') && adapterSrc.includes('没有这一行'),
+      'ops 指引段对 (Background:) 行的判据必须是「本会话此前有过别的任务（在跑或已结束都算）」+「首个任务没有这一行」；「只在还有任务在跑时出现」是我犯过的第二个错');
+    assert.ok(!adapterSrc.includes('还有别的任务在跑'),
+      'ops 指引段又回到「只有当本会话还有别的任务在跑」这个错的中间版（实测已结束的任务同样进 Background 行）');
+    assert.ok(adapterSrc.includes('只有 run_code') && adapterSrc.includes('别因为直调被拒就判定通路不通'),
+      'ops 指引段缺少「纯 PTC 档直调被拒是正常的」这条自查（两名队员共用同一段，必须档无关）');
+    // 这段必须对所有队员逐字节相同（共享前缀纪律）：不得含角色名/队员身份插值。    // 队员指引段必须与具体队员无关（共享前缀纪律）：文本里不得出现角色/名字插值。
+    assert.ok(adapterSrc.includes("name: OPS_LINK_SECTION") && adapterSrc.includes('OPS_LINK_ORDER'),
+      'linkOpsForMember 必须注册 dispatch:ops-link 段');
+
     const indexSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
-    assert.ok(indexSrc.includes('healOpsCoexist'), 'lib/index.js 必须调用 healOpsCoexist（别人装了 dsh-ops 时的防重复注册）');
-    assert.ok(indexSrc.includes('async function detectOpsIntegration(ctx)'), 'lib/index.js 必须有 detectOpsIntegration 体检');
-    assert.ok(indexSrc.includes('status.opsIntegration = await detectOpsIntegration(ctx)'), 'writeStatusFile 必须落盘 opsIntegration');
-    assert.ok(indexSrc.includes("entryId === 'ops-file' || entryId === 'dsh-ops-file'"),
-      'rows 采集必须同时覆盖 ops-file 与 dsh-ops-file 两行（排查「谁被顶掉」看这里）');
-  });
+    assert.ok(indexSrc.includes("from './ops-adapter.js'"), 'lib/index.js 必须 import ops-adapter');
+    assert.ok(/detectOpsComponents\(ctx, void 0, false\)/.test(indexSrc), 'lib/index.js 启动期必须做 ops 组件检测（Lead 作用域 + purePtc=false）');
+    assert.ok(!indexSrc.includes('healOpsCoexist'), 'lib/index.js 不得再调用 healOpsCoexist（旧共存自愈）');
+    assert.ok(indexSrc.includes('status.opsIntegration = detectOpsComponents('), 'writeStatusFile 必须落盘 opsIntegration（状态文件是唯一真值来源）');
+    // 告警判据必须由**调用方按该作用域的呈现档**给，不许 detectOpsComponents 自己凭可见性猜：
+    // 猜了就会给 Lead（原生档）和 both 队员（批量档）误报「拿不到 ops_batch 需要处理」，而那是设计使然。
+    // 2026-10-21：判据从 mounted 改成 **liveMounted**（剔除 0.3.2 已移除的 background 组件）。
+    // 断言的**意图**不变：missingPtc 必须由调用方给的呈现档决定，不许凭可见性猜。
+    assert.ok(/purePtc === true && liveMounted\.includes\('ptc'\)/.test(adapterSrc),
+      'ops-adapter 的 missingPtc 必须以 purePtc === true 为前提（否则按可见性误报）');
+    assert.ok(/OPS_REMOVED_COMPONENTS/.test(adapterSrc),
+      'ops-adapter 必须知道 dsh-ops 0.3.2 已移除 background 组件（否则会报假的缺失）');
+    assert.ok(/!purePtc && mounted\.includes\('ptc'\)/.test(adapterSrc) === false,
+      'ops-adapter 里不得出现引用未定义变量 mounted 的判据（linkOpsForMember 作用域只有 probe.mounted）');
+    assert.ok(/probe\.mounted\.includes\('ptc'\)/.test(adapterSrc),
+      'linkOpsForMember 的非纯 PTC 档记录必须走 probe.mounted（作用域内真值）');
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    assert.ok(runtimeSrc.includes('linkOpsForMember(ctx, scoped, agent, notes, disposers, purePtc)'),
+      'installMember 必须给每名队员接 ops 链接**并传实测呈现档**（Lead 不接：那是用户主会话，ops 自己全局可见）');
+    // 2026-10-21：判据从「布尔反推」改成「实际档名」—— 旧式在新语义下两个方向都算反
+    // （batch=true 实际 ptc 却给 false；batch=false 实际 native 却给 true）。
+    assert.ok(/const purePtc = declaredMode === 'ptc';/.test(runtimeSrc),
+      "purePtc 必须等于「实际声明的档 === 'ptc'」（不许从布尔反推）");
+    // 2026-10-21：接住的不是布尔了，是**实际声明的档名**（见 purePtc 那条回归）。
+    assert.ok(/const declaredMode = applyMemberBatch\(ctx, agent, role, notes, disposers\);/.test(runtimeSrc),
+      'applyMemberBatch 的返回值（实际档名）必须被接住 —— purePtc 的唯一真值来源');
+    // 2026-10-16 真机 P0（researcher-ops 白跑一轮 + 每步翻转）：预设 ptc + 关批量的队员，
+    // 必须在**自己那层同步** presentAs('ptc')。只靠异步预设重绑会带来两个后果：第一次请求跑在
+    // 继承来的 native 组合上；而且实测不是「晚一次」而是**每步翻转**（native→ptc→native→ptc）。
+    // 对照证据：scout-ops（批量开着，本包同步声明 both）逐请求是 both→both 稳定；
+    // researcher-ops（本包什么都没声明）是 native(76)→ptc(1)→native(76)→ptc(1)。
+    // 差别就在「自己那层有没有钉住」—— 所以这里钉住源码形状。
+    const dmAt = runtimeSrc.indexOf('function declareMemberMode');
+    assert.ok(dmAt >= 0, 'runtime.js 必须有 declareMemberMode（纯 PTC 档的同步声明口）');
+    const dmBody = runtimeSrc.slice(dmAt, dmAt + 2200);
+    // 2026-10-21：ptcRuntime 守卫只对**非 native** 档有意义（官方 requirePtcRuntime 在
+    // wireSchemas 的 `if (mode === "native") return …` 之后才调用）。断言改成认这个条件。
+    assert.ok(/mode !== 'native' && pick\(ctx, 'ptcRuntime'\) === undefined/.test(dmBody) && /presentAs\(mode\)/.test(dmBody),
+      'declareMemberMode 必须只在非 native 档探 ptcRuntime（native 装配根本不碰它），然后再 presentAs');
+    // 关掉批量 = 明确钉 native（2026-10-21 第二次修正：不再是「沿用预设」。
+    // 交付态里 12 个角色全是 preset ptc，沿用预设会让开关两端都是 ptc = 拨了没反应）。
+    // 2026-10-21：返回值改成档名后，这一句变成 `const declared = declareMemberMode(…'native'…) === true;`，
+    // 断言跟着放宽到「必须调用 declareMemberMode 且传 native」。
+    assert.ok(/declareMemberMode\(ctx, agent, 'native', who, notes, disposers\)/.test(runtimeSrc),
+      'applyMemberBatch 关掉批量的那一支必须**明确声明 native**（否则开关拨到「关」与「开」没有可观测差异）');
+    const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
+    assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes("return 'both';"),
+      "applyMemberBatch 的 both 成功路径必须返回 'both'（不是布尔）—— purePtc 判据依赖它");
+    // 2026-10-21 回归（本轮真机体检抓到）：purePtc 原来写成 `!batchDeclared && preset==='ptc'`，
+    // 而语义改成「开=ptc / 关=native」之后这个式子**两个方向都算反**：
+    //   batch=true  -> 实际 ptc  -> 旧式给 false（该 true）；
+    //   batch=false -> 实际 native -> 旧式给 true（该 false）。
+    // 后果是 ops 的告警判据反向：该报的不报、不该报的乱报。
+    // 现在唯一的真值来源是 applyMemberBatch **返回的实际档**。
+    assert.ok(/const purePtc = declaredMode === 'ptc';/.test(runtimeSrc),
+      "purePtc 必须由 applyMemberBatch 返回的实际档决定（declaredMode === 'ptc'）");
+    // 负向只盯 **purePtc 那一行**：别处出现 !batchDeclared 与本判据无关。
+    assert.ok(!/const purePtc = !batchDeclared/.test(runtimeSrc),
+      '又用布尔反推 purePtc 了 —— 新语义下它是反的');
 
+    // ②c 队员 model 显示链路（2026-10-16 session-00001005 P1 的形状闸门）：
+    //     runtime 必须在**真的把覆盖写进请求对象之后**才记账（记早了会把「解析出但没采用」的写进去），
+    //     list_agents 必须消费这份账（否则 Lead 拿到的还是继承来的模型 = 错数据）。
+    const rtForModel = runtimeSrc;
+    const ioAt = rtForModel.indexOf('function installRouteOverride');
+    assert.ok(ioAt >= 0, 'runtime.js 必须有 installRouteOverride');
+    const ioBody = rtForModel.slice(ioAt, ioAt + 3600);
+    assert.ok(ioBody.includes('noteAppliedRoute(agent.id,'), 'installRouteOverride 必须经唯一写入点记路由（不许散写 appliedRoutes.set）');
+    assert.ok(ioBody.indexOf('noteAppliedRoute(agent.id,') < ioBody.indexOf('return override;'),
+      '记账必须在 return override 之前、且在覆盖真的合进请求对象之后（catch 分支里不许记 = 宁缺毋滥）');
+    assert.ok(!/catch[\s\S]{0,240}noteAppliedRoute/.test(ioBody),
+      'catch 分支（覆盖失败退回原配置）里不许记路由：记了就是把没用上的东西报成用过');
+    assert.ok(/export function noteAppliedRoute\(agentId, route\)/.test(rtForModel), '必须有唯一写入点 noteAppliedRoute');
+    assert.ok(/export function clearAppliedRoute\(agentId\)/.test(rtForModel), '必须有唯一作废点 clearAppliedRoute');
+    assert.ok(!/function installRouteOverride[\s\S]{0,3000}appliedRoutes\.set/.test(rtForModel),
+      'installRouteOverride 里不许绕过写入点直接 set 账本');
+    // 2026-10-17 更正：旧断言要求 disposeInstalled **必须**清掉路由账本 —— 那条断言本身是错的。
+    // 真机 session-00001002 实测：可续期子代理每轮结束都触发 agent/disposed，清了账本之后
+    // list_agents 对 inactive 队员退回「继承自 Lead 的模型」（同一次调用里 running 的对、inactive 的全错）。
+    // 现在的要求反过来：**不许**在 disposeInstalled 里清，只允许在插件整体卸载（disposeAll）时清。
+    const disposeBody = rtForModel.slice(rtForModel.indexOf('function disposeInstalled'), rtForModel.indexOf('function disposeInstalled') + 1200);
+    assert.ok(!disposeBody.includes('clearAppliedRoute('),
+      'disposeInstalled 不许清路由账本：可续期子代理每轮结束都触发 agent/disposed，清了就会让 list_agents 对已结束的队员报回继承模型（2026-10-17 真机 P1）');
+    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账（插件整体卸载时才回收）');
+    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账');
+    assert.ok(/export function appliedMemberRoutes\(\) \{/ .test(rtForModel), 'runtime 必须导出 appliedMemberRoutes()');
+    // ── 2026-10-17 更正：账本必须在「队员结束」之后仍然存在 ──────────────────────
+    // 起因（真机 session-00001002）：可续期子代理每轮结束都会触发 agent/disposed
+    // （官方 dsh-subagent 的 finishDisposal 结算后调 activation.handle.dispose()，
+    //  dsh-agent 的 detachEntered 随即 emit agent/disposed），于是 disposeInstalled 被调用。
+    // 旧实现里它 clearAppliedRoute —— 结果 list_agents 对**已结束**的队员退回继承模型：
+    // 实测同一次 list_agents 里 running 的 builder/verify = model-b（对），
+    // inactive 的 researcher = model-d（= Lead 的模型，错）。
+    assert.ok(/appliedMemberRoutes,\n/.test(rtForModel), 'appliedMemberRoutes 必须进 runtimeApi');
+    const toolsSrc = readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8');
+    assert.ok(toolsSrc.includes("annotateMemberModels(withRetries, runtime?.appliedMemberRoutes?.() ?? new Map())"),
+      'list_agents 必须消费 appliedMemberRoutes（不接 = Lead 继续看到继承模型）');
+    assert.ok(!/model:\s*\{[^\n]*required/.test(toolsSrc.split('MEMBER_VIEW_SCHEMA')[1]?.slice(0, 1200) ?? ''),
+      '不许把 model 变成必填字段（那是改 Lead 的工具目录）');
+
+    // ②a 纪律闸门（用户 2026-10-15 明令「别改 ops 的源码」）：本仓库不得再出现任何
+    //     修改 dsh-ops 包内文件的工具、判据字面或备份痕迹。适配只能发生在本包这一侧。
+    const repoFiles = [];
+    (function collect(dir, depth) {
+      if (depth > 3) return;
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (['node_modules', '.git', '.probe-tmp', '%SystemDrive%', 'NVIDIA Corporation'].includes(entry.name)) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { collect(full, depth + 1); continue; }
+        if (/\.(js|cjs|mjs|json|yml|md)$/.test(entry.name)) repoFiles.push(full);
+      }
+    })(path.join(__dirname, '..'), 0);
+    // needle 用拼接写：这个闸门文件本身不该被自己的字面量命中。
+    const FORBIDDEN = ['ops' + '-ptc-both', 'ptc' + 'Presentation', 'pre-' + 'ptc-both'];
+    const offenders = [];
+    for (const file of repoFiles) {
+      const text = readFileSync(file, 'utf8');
+      for (const needle of FORBIDDEN) {
+        if (text.includes(needle)) offenders.push(path.relative(path.join(__dirname, '..'), file) + ' 含 ' + needle);
+      }
+    }
+    assert.deepEqual(offenders, [], '本仓库不得含修改 dsh-ops 源码的东西（适配只在本包这一侧）：' + offenders.join(' ; '));
+    // ②b profile 启用工具：四行钉 disabled:false，且 drift-check 复用它的 plan()（单一真值）。
+    const enableSrc = readFileSync(path.join(__dirname, '..', 'tools', 'ops-enable.cjs'), 'utf8');
+    assert.ok(enableSrc.includes('module.exports = { plan, splitRows'), 'ops-enable.cjs 必须导出 plan/splitRows（drift-check 要复用同一份判据）');
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
+      assert.ok(enableSrc.includes("id: '" + id + "'"), 'ops-enable 的 ROWS 必须覆盖 ' + id);
+    }
+    assert.ok(enableSrc.includes('--revert') && enableSrc.includes('pre-ops-enable'), 'ops-enable 必须可还原且写前备份');
+    // 迁移标记（P1）：ops 的 updatedConfig 会把无标记行的 allowSystemShellFallback 翻成 false 并写回。
+    const enableRows = enableSrc.slice(enableSrc.indexOf('const ROWS = ['));
+    const rowBlockOf = (id) => { const at = enableRows.indexOf("id: '" + id + "'"); return at < 0 ? '' : enableRows.slice(at, at + 600); };
+    // 2026-10-21 改判据：MARKER 的**值**不再写死 1，而是从装机 dsh-ops 的
+    // lib/config-updates.js 读 CONFIG_UPDATE_VERSION（0.3.2 已是 2）。
+    // 原来这里断言字面量 `configUpdateVersion: 1` —— 那条断言本身就是在保护那个 bug：
+    // 它逼着实现写死 1，于是 ops 升到 2 之后本脚本会把用户的**已迁移**配置降级写回 1。
+    assert.ok(enableSrc.includes('CONFIG_UPDATE_VERSION') && enableSrc.includes('detectConfigVersion'),
+      'ops-enable 必须从装机 dsh-ops 读 CONFIG_UPDATE_VERSION（不许写死迁移版本号）');
+    assert.ok(!/configUpdateVersion: 1'/u.test(enableSrc),
+      'ops-enable 里又出现了写死的 configUpdateVersion: 1（上游升到 2 时会把用户配置降级）');
+    // shell / file 两行要带标记；background **不许带**（0.3.2 的 config-updates.js:22 明写
+    // 「`dsh-ops/background` is a no-op stub that reads no config, so it needs no migration」）。
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file']) {
+      const block = rowBlockOf(id);
+      assert.ok(block.includes('MARKER,'),
+        'ops-enable 的 ' + id + ' 行必须带迁移标记（否则 ops 迁移会改写这一行）');
+    }
+    assert.ok(!rowBlockOf('dsh-ops-background').includes('MARKER,'),
+      '背景行不许带迁移标记：0.3.2 已移除该组件，它不读任何配置，标记只会制造假缺失');
+    assert.ok(!rowBlockOf('dsh-ops-ptc').slice(0, 300).includes('configUpdateVersion'), 'ops-enable 的 ptc 行不得带 configUpdateVersion（resolvePtcConfig 会抛 Unknown PTC config key）');
+    assert.ok(rowBlockOf('dsh-ops-background').includes('allowSystemShellFallback: true'), 'ops-enable 的 background 行必须 allowSystemShellFallback: true（job 工具的发布门）');
+    const driftSrc = readFileSync(path.join(__dirname, '..', 'tools', 'drift-check.cjs'), 'utf8');
+    assert.ok(driftSrc.includes("require('./ops-enable.cjs')"), 'drift-check 必须复用 ops-enable 的 plan()（两处各写一份正则就会各自漂）');
+    for (const listFile of ['repair.cjs', 'sync-to-dsh.cjs']) {
+      const listSrc = readFileSync(path.join(__dirname, '..', 'tools', listFile), 'utf8');
+      assert.ok(listSrc.includes("'tools/ops-enable.cjs'"), listFile + ' 的文件清单必须含 ops-enable.cjs（漏了 = 装到别人机器上没这条修复命令）');
+      assert.ok(!listSrc.includes("'lib/ops-coexist.js'"), listFile + ' 不得再列已删除的 ops-coexist.js');
+      assert.ok(listSrc.includes("'tools/ops-mount-check.mjs'"), listFile + ' 的文件清单必须含 ops-mount-check.mjs（离线验收工具要能随包分发）');
+    }
+  });
+  await check('ops-adapter 的 profile 退回链必须有 .dsh 那一段（2026-10-16 真机 P1 回归闸门）', async () => {
+    // 真机抓出来的过程：状态文件里四个 dsh-ops 组件行都 phase:2 挂着，但 opsIntegration.package = null。
+    // 上一版 profileDirs()：`const home = process.env.DSH_HOME ?? homedir()` 然后 join(home,'profiles','desktop')
+    // —— 宿主 Electron 进程**没设 DSH_HOME**，于是 base = <home>，去看 <home>\profiles\desktop
+    // （不存在）→ 判成「没装 dsh-ops」→ linkOpsForMember 提前返回 → **每个队员都收不到 ops 指引段**。
+    // 规矩本身早就写在 tools/lib-dsh-home.cjs:34-53（2026-10-04 审查 P1-7，同一类 bug 在 tools 侧修过），
+    // 这次是 lib 侧另写一份、把它漂掉了。测试当时只用 DSH_PROFILE_DIR 注入假目录，从不走退回链 → 闸门全绿。
+    const mod = await load('ops-adapter.js');
+    const probeHome = path.join(process.platform === 'win32' ? 'C:\\' : '/', 'FakeHomeForGate');
+    const dirs = mod.profileDirs({}, probeHome);
+    assert.ok(dirs.includes(path.join(probeHome, '.dsh', 'profiles', 'desktop')),
+      '空 env 必须退回 <homedir>/.dsh/profiles/desktop（少 .dsh 就是真机那个 P1）：' + JSON.stringify(dirs));
+    assert.ok(dirs.includes(path.join(probeHome, '.dsh', 'profiles', 'web')), '也要覆盖 web profile：' + JSON.stringify(dirs));
+    assert.ok(!dirs.includes(path.join(probeHome, 'profiles', 'desktop')),
+      '又生成 <homedir>/profiles/desktop 了（P1 复发：少了 .dsh 段）：' + JSON.stringify(dirs));
+    assert.deepStrictEqual(mod.profileDirs({ DSH_HOME: 'D:\\altHome' }, probeHome),
+      [path.join('D:\\altHome', 'profiles', 'desktop'), path.join('D:\\altHome', 'profiles', 'web')],
+      'DSH_HOME 是**主目录本身**：不得再补 .dsh，也不得被 homedir 顶掉');
+    assert.strictEqual(mod.profileDirs({ DSH_PROFILE_DIR: '   ' }, probeHome)[0],
+      path.join(probeHome, '.dsh', 'profiles', 'desktop'), '空白 DSH_PROFILE_DIR 要当没给');
+    assert.strictEqual(mod.profileDirs({ DSH_PROFILE_DIR: 'X:\\p' }, probeHome)[0], 'X:\\p',
+      '显式 DSH_PROFILE_DIR 必须排第一');
+    // lib 与 tools 两侧必须是同一条规矩（这次漂的就是 lib 那份）
+    const dshHome = require(path.join(__dirname, 'lib-dsh-home.cjs'));
+    // 注意 lib-dsh-home.cjs:34/:47 的 homedir 形参是**主目录字符串**（默认值才是 os.homedir()），不是函数。
+    assert.strictEqual(dshHome.resolveProfileDir({ env: {}, homedir: probeHome }).profileDir,
+      path.join(probeHome, '.dsh', 'profiles', 'desktop'),
+      'tools/lib-dsh-home.cjs 的退回链与 profileDirs 不一致（同一台机器两套答案就是这次的 P1）');
+    // 真机事实（**按本机安装情况分流，别让没装 ops 的机器假红**）：清掉两个 env、只给真实主目录。
+    // 用户 2026-10-15 的前提是「别人下载本插件，有无 ops 都要能跑」，所以这条只能是条件断言：
+    //   装了 → 必须解析到（这正是宿主进程的真实条件，也是这次 P1 的现场）；
+    //   没装 → 必须返回 null（零影响的另一头）。
+    const realHome = os.homedir();
+    const installedSomewhere = ['desktop', 'web'].some((profile) => existsSync(
+      path.join(realHome, '.dsh', 'profiles', profile, 'node_modules', 'dsh-ops', 'package.json')));
+    const real = mod.resolveOpsPackage({}, realHome);
+    if (installedSomewhere) {
+      assert.ok(real !== null && real.installed === true && /^\d+\.\d+\.\d+/.test(String(real.version)),
+        '本机装了 dsh-ops，但空 env 的退回链没解析到它（就是 2026-10-16 那个 P1）：' + JSON.stringify(real));
+    } else {
+      assert.strictEqual(real, null, '本机没装 dsh-ops 却解析出了包（凭空捏造在场）：' + JSON.stringify(real));
+      envSkipped += 0; // 这一支照常通过：它就是「无 ops」那半边的正解
+    }
+    assert.strictEqual(mod.resolveOpsPackage({}, path.join(probeHome, 'NoSuchUserDir')), null,
+      '主目录不存在时必须如实返回 null（不许假装装着）');
+  });
   await check('托管块结构（2026-10-10 P0）：块必须在文件开头，且切片重写不得吞掉哨兵区内的外来行', async () => {
     // 用户 2026-10-10 报障的根因（已用真实 profile 复现）：托管块原本 append 在**文件末尾**，
     // 而宿主 dsh-plugin-manager 切换插件组件时用 YAML AST 的 document.add() 追加新行 ——
@@ -1654,6 +3029,177 @@ function functionBodyOf(source, needle) {
     assert.ok(src.includes('const table = wsTableAt(lines, i)'), 'wsMarkdown 必须调用 wsTableAt');
     assert.ok(src.includes('.dat-ws .md table{'), '缺少表格样式（.dat-ws .md table）');
     assert.ok(src.includes('md-table'), '缺少表格容器样式（.md-table，用于横向滚动）');
+  });
+
+  await check('抽屉工具调用「放大查看」：面板随视口自适应，展开层高度不再写死（用户 2026-10-15 报「固定容器太窄」）', () => {
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    // ① 展开层高度必须**随视口**，旧的写死值不许回来（写死 260px 就是这次报障的正面原因）。
+    // 展开层高度必须随视口（2026-10-21 从 min(52vh,480px) 改成 70vh：用户要「展开即见代码」，
+    // 52vh 在一个 760px 高的窗口里只有 ~395px，长输出的后半段仍要另开面板才读得到）。
+    assert.ok(src.includes('max-height:70vh'), '展开层高度没随视口自适应（仍是写死的 px）');
+    assert.ok(!src.includes('max-height:260px'), '旧的写死高度 max-height:260px 又回来了');
+    // ② 面板本体：CSS 与三个函数都必须在。
+    assert.ok(src.includes('.dat-ws .ws-zoom{'), '缺少放大面板的 CSS（.ws-zoom）');
+    assert.ok(src.includes('width:min(1180px,100%)'), '面板宽度不是自适应的（写死宽度 = 又一次「固定容器」）');
+    for (const fn of ['function wsOpenDetailZoom(', 'function wsCloseDetailZoom(', 'function wsDetailZoomBar(']) {
+      assert.ok(src.includes(fn), '缺少 ' + fn);
+    }
+    // ③ 挂在 .dat-ws 根节点上：挂抽屉里会被它的 transform 夹住宽度（那正是要逃出去的东西）。
+    assert.ok(src.includes('const host = state.root'), '放大面板没挂在 .dat-ws 根节点上');
+    // ④ 工具条插在展开层**开头**：.dzb 是 sticky 的，排在后面就钉不住上沿。
+    assert.ok(src.includes('box.insertBefore(wsDetailZoomBar(state, row, parts), box.firstChild)'),
+      '「放大查看」工具条没插在展开层开头');
+    // ⑤ 点击必须拦冒泡：不拦的话同一次点击顺带把那一行收起，面板一闪就没。
+    const barAt = src.indexOf('function wsDetailZoomBar(');
+    assert.ok(barAt >= 0 && src.slice(barAt, barAt + 1400).includes('event.stopPropagation()'),
+      '工具条没拦 stopPropagation（点开会被所在行的折叠逻辑关掉）');
+    // ⑥ 关闭路径：Esc **先**关面板再关抽屉；关抽屉顺手关面板。顺序错了就是留残骸。
+    const keyAt = src.indexOf('const onKey = (event) =>');
+    const keyBlock = keyAt < 0 ? '' : src.slice(keyAt, keyAt + 700);
+    assert.ok(keyBlock.includes('wsCloseDetailZoom(state)')
+      && keyBlock.indexOf('wsCloseDetailZoom') < keyBlock.indexOf('state.drawer.classList.contains'),
+      'Esc 没优先关放大面板（先关抽屉会把它孤零零留在画布上）');
+    const closeAt = src.indexOf('function wsCloseDrawer(state) {');
+    assert.ok(closeAt >= 0 && src.slice(closeAt, closeAt + 400).includes('wsCloseDetailZoom(state)'),
+      '关抽屉没顺手关掉放大面板');
+  });
+
+  await check('抽屉展开层不许被 flex 列压扁成一条缝（用户 2026-10-21 报「展开是一条缝」）', () => {
+    // 症状与根因（真机 + headless Chrome 实测）：.cv 是 display:flex;flex-direction:column 的
+    // 滚动容器，子项默认 flex-shrink:1。展开一层会往这一列里塞两个子项（.trow + .dbox），
+    // 总高超过可视高时浏览器按比例压扁它们 —— 8 个展开时每个 .dbox 只剩 **27px**（用户看到的缝）。
+    // 实测对照（同一份 CSS、1400×760）：flex:none 后 8 个展开全是 149~155px，滚动交给 .cv。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/\.dat-ws \.dbox\{flex:none;/.test(src), '.dbox 没有 flex:none —— 展开层会被 flex 列压扁成一条缝');
+    assert.ok(/\.dat-ws \.trow\{flex:none\}/.test(src), '.trow 没有 flex:none —— 行高塌陷会连带把正文压没');
+    // 只要 .cv 仍是 flex 列（这条是它的定义），上面两条就是必需的；它若改回普通块级流，
+    // 这两条 flex:none 变成无害冗余，但断言仍成立，不会假红。
+    assert.ok(/\.dat-ws \.cv\{[^}]*display:flex;flex-direction:column/.test(src),
+      '.cv 不再是 flex 列 —— 失效的收缩前提变了，请重跑 .probe/deep/asar-test/height3.mjs 重新取值');
+    // 展开文本用等宽字体：工具输入是 JSON、输出是命令回显，比例字体下引号/花括号对不齐。
+    assert.ok(/\.dat-ws \.dbox pre\{[^}]*font-family:var\(--dsw-font-family-mono/.test(src),
+      '展开层正文没走等宽字体（用户要「展开后就能看到代码」）');
+  });
+
+  await check('批量调用（both）档必须探测宿主还认不认这一档（DSH 0.2.1-rc.2 把它删了）', () => {
+    // 2026-10-21 复核：DSH 0.2.1-rc.2 的 tools 行把呈现档从 native|ptc|both 收窄成 native|ptc。
+    // 台架实测（宿主真身 dsh-tools/lib/index.js 解出来后直接喂 Config）：
+    //   Config({mode:'native'}) ok / Config({mode:'ptc'}) ok / Config({mode:'both'}) 抛
+    //   "$.mode expected \"native\" | \"ptc\" but got \"both\""。
+    // 而 presentAs() **不校验取值**（只把字符串写进 layer.mode），所以旧代码不会在这一步抛错：
+    // 开关拨了、诊断写着「已开启」，实际装配行为两边都不匹配 —— 静默退化。
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    const at = runtimeSrc.indexOf('function presentationModeSupported');
+    assert.ok(at >= 0, 'runtime.js 必须有 presentationModeSupported（问注册表自己认不认这一档）');
+    const body = runtimeSrc.slice(at, at + 1200);
+    // 判据必须是「喂给 Config schema」：那是官方对合法取值的唯一声明。
+    assert.ok(/schema\(\{ mode \}\)/.test(body), '探测必须把候选值喂给 tools 行的 Config schema');
+    assert.ok(/constructor\?\.Config/.test(body), 'schema 要从 tools 服务的构造函数上取（实例上没有 Config）');
+    // 取不到 schema 时必须返回 undefined（不知道），让调用方退回老行为 —— 不许当成 false 把功能关掉。
+    assert.ok(/return undefined;/.test(body), '取不到 schema 必须返回 undefined（不知道），不能当成不支持');
+    // 守卫必须在 presentAs('both') **之前**，且失败时如实记一条「看得见」的说明。
+    const gate = runtimeSrc.indexOf("presentationModeSupported(ctx, 'both')");
+    const call = runtimeSrc.indexOf("tools.presentAs('both')");
+    assert.ok(gate >= 0 && call > gate, "both 的能力探测必须排在 presentAs('both') 之前");
+    assert.ok(runtimeSrc.slice(gate, call).includes('noteCapabilityOnce('),
+      '不支持时必须让用户看得见（否则开关拨了没反应，与旧缺陷一模一样）');
+    // 客户端那格开关的说明也要跟着说准：它现在只在「宿主支持 both」时才有意义。
+    const clientSrc = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(clientSrc.includes('batchTip'), '批量开关的说明文案必须仍在（配置页那一格）');
+  });
+
+  await check('会改用户配置的脚本：不认识的参数必须拒绝，不许落进默认写盘动作（2026-10-21 真事故）', () => {
+    // 事故原貌：想先看用法，跑了 `node tools/ops-enable.cjs --help` —— 它只做 includes('--check')/
+    // includes('--revert')，于是 --help 静默落进**默认动作 = 写盘**，把用户 profile 里两行
+    // configUpdateVersion 从 2 改回 1、并把 dsh-ops 的 shell 段降级。
+    // 判据：未知参数一律退出码 2 且不写；--help 打印用法且不写。这里只做静态断言
+    // （真跑一次要动用户 profile，放进 run 里跑会污染环境），行为验证见提交说明里的实测输出。
+    const src = readFileSync(path.join(__dirname, 'ops-enable.cjs'), 'utf8');
+    const at = src.indexOf('function unknownArgs');
+    assert.ok(at >= 0, 'ops-enable.cjs 必须有 unknownArgs 白名单校验');
+    const body = src.slice(at, at + 900);
+    for (const known of ["'--check'", "'--revert'", "'--help'", "'-h'"]) {
+      assert.ok(body.includes(known), '白名单少了 ' + known);
+    }
+    // 拒绝分支必须 return 2（不是 undefined = 继续往下写盘）且排在默认动作之前。
+    const guard = src.indexOf('if (bad.length > 0)');
+    const checkAt = src.indexOf("const check = argv.includes('--check')");
+    assert.ok(guard >= 0 && checkAt > guard, '未知参数守卫必须排在默认动作之前');
+    assert.ok(/if \(bad\.length > 0\)[\s\S]{0,400}return 2;/u.test(src), '未知参数必须以退出码 2 拒绝');
+    // --help 必须自己开一条只打印的分支，不能靠「没有 --check」落到写盘。
+    assert.ok(/argv\.includes\('--help'\)[\s\S]{0,600}return 0;/u.test(src), '--help 必须单独走「只打印、直接返回」');
+  });
+
+  await check('both 不被宿主支持时，预设 ptc 的队员仍必须同步声明 ptc（不许退回到 2026-10-16 的 P0）', () => {
+    // 这条是给 2026-10-21 那次修复补的**回归闸门**：加「both 能力探测」时，我曾让
+    // 「不支持 both」那一支直接 return —— 而它与「批量档关着」那一支本该**完全对称**。
+    // 差别只在预设是 ptc 的角色身上：不补 presentAs('ptc')，它第一次请求就跑在继承来的
+    // native 组合上（预设重绑是异步的，赶不上首次装配），于是队员把「没有 run_code」
+    // 当成事实报给 Lead，白跑一轮（session-00001005 的 researcher-ops 就是这样）。
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    const gate = runtimeSrc.indexOf("presentationModeSupported(ctx, 'both')");
+    assert.ok(gate >= 0, '缺少 both 能力探测');
+    // 探测之后的这一段里，必须同时出现「return」和「declareMemberMode(... 'ptc' ...)」，
+    // 且声明排在 return 之前（否则就是死代码）。
+    const tail = runtimeSrc.slice(gate, gate + 1600);
+    const decl = tail.indexOf("declareMemberMode(ctx, agent, 'ptc'");
+    const ret = tail.indexOf('return;');
+    assert.ok(decl > 0, 'both 不支持的那一支必须给预设 ptc 的队员同步声明 ptc —— 否则退回真机那个 P0');
+    assert.ok(ret < 0 || decl < ret, 'ptc 声明必须排在 return 之前（排在后面就是永不执行的死代码）');
+    // 2026-10-21：对称性换了对象 —— 现在两端都由**开关**决定，且必须是**不同的档**：
+    // 开 -> ptc（拿 run_code），关 -> native（拿全套原生工具）。两边都只声明、都不等异步重绑。
+    const offAt = runtimeSrc.indexOf('wantRunCode === false');
+    assert.ok(offAt >= 0, 'applyMemberBatch 关门那一支必须由 wantRunCode 判据控制');
+    assert.ok(runtimeSrc.slice(offAt, offAt + 700).includes("declareMemberMode(ctx, agent, 'native'"),
+      '关掉批量必须钉 native（与「开 -> ptc」形成真实差异）');
+    const onAt = runtimeSrc.indexOf('presentationModeSupported(ctx, \'both\')');
+    assert.ok(onAt >= 0 && runtimeSrc.slice(onAt, onAt + 1400).includes("declareMemberMode(ctx, agent, 'ptc'"),
+      '开批量（宿主无 both 时）必须钉 ptc');
+  });
+
+  await check('工具行标签：本机工具面里的工具都必须有官方同类词，不许退成泛泛的「工具调用」（2026-10-21 真机）', () => {
+    // 真机证据（session-0000100d 的 builder-git）：18 条工具行里 **12 条**显示「工具调用」，
+    // 而它真实调用是 ops_bash×8 / ops_glob×2 / ops_grep×1 / team_task_get×1 ——
+    // 全部只是**别名表没登记**。用户 2026-10-09 的原话是「和我用官方的对话框没太大区别」，
+    // 67% 的行退成泛泛词显然不算。
+    //
+    // 判据两层：
+    //   ① 本机工具面里会出现在对话里的那些名字，逐个查表，**必须**命中非 generic 的官方词；
+    //   ② 别名表里出现的每个目标键，都必须在官方表里真实存在（不许把自造词写进别名）。
+    const graph = require(path.join(__dirname, '..', 'lib', 'graph.js'));
+    const table = graph.toolLabelTable();
+    const generic = table.generic;
+    // 这些是队员/Lead 在真实会话里真的会调用、且会渲染成工具行的工具名。
+    const MUST_HAVE_LABEL = [
+      // dsh-ops 四件套 + 后台/批量族（本次会话用了 213 次 ops_bash）
+      'ops_bash', 'ops_grep', 'ops_glob', 'ops_inspect_local_file', 'ops_replace',
+      'ops_edit_file', 'ops_write_file', 'ops_stat', 'ops_diff', 'ops_copy', 'ops_move', 'ops_remove',
+      'ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill', 'ops_batch', 'ops_result',
+      // 团队工具（create/list/update 本来就有，get 是唯一漏的）
+      'team_task_create', 'team_task_list', 'team_task_get', 'team_task_update',
+      // 本机工具面里的其它常客
+      'present', 'skill', 'diagram_read', 'diagram_apply', 'todo_write',
+      // 宿主自带（回归对照：这些早就有）
+      'read', 'edit', 'write', 'pwsh', 'web_search', 'web_fetch', 'subagent',
+    ];
+    const missing = MUST_HAVE_LABEL.filter((name) => graph.toolRowLabel(name) === generic);
+    assert.deepEqual(missing, [],
+      '这些工具会渲染成泛泛的「' + generic + '」（别名表没登记）：' + JSON.stringify(missing));
+    // ② 别名只能是「指向官方已有键」，而且渲染出来必须**逐字等于**那个官方键的值。
+    // 这条防的是「为了补全而自造词」（用户 2026-10-09 明令：要和官方对话框一致）。
+    const pairs = [
+      ['ops_bash', 'bash'], ['ops_grep', 'grep'], ['ops_glob', 'glob'],
+      ['ops_inspect_local_file', 'read'], ['ops_replace', 'edit'], ['ops_edit_file', 'edit'],
+      ['ops_write_file', 'write'], ['ops_stat', 'read'], ['ops_diff', 'read'],
+      ['ops_copy', 'write'], ['ops_move', 'write'], ['ops_remove', 'write'],
+      ['ops_job_output', 'readJob'], ['ops_job_list', 'listJobs'], ['ops_job_kill', 'killJob'],
+      ['ops_batch', 'bash'], ['ops_result', 'readJob'], ['ops_run_background', 'bash'],
+      ['team_task_get', 'getTeamTask'], ['present', 'sendMessage'], ['skill', 'read'],
+      ['diagram_read', 'read'], ['diagram_apply', 'edit'],
+    ];
+    const drifted = pairs.filter(([tool, officialKey]) => graph.toolRowLabel(tool) !== table.titles[officialKey]);
+    assert.deepEqual(drifted, [],
+      '这些工具的标签与官方同名键不一致（自造词或映射变了）：' + JSON.stringify(drifted));
   });
 
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
@@ -1890,6 +3436,83 @@ function functionBodyOf(source, needle) {
     assert.equal(graph.effectiveRuntimeMs(open, now - 60000), 55000, 'now 早于最后事件时取两者较大，不得倒退');
   });
 
+  await check('tps 的分母必须扣掉工具调用时长（用户 2026-10-21 的口径）', () => {
+    // 用户原话：「tps 似乎是总 token/对话时长，但应该为 总token/(对话时长-工具调用时长)」。
+    // 现象核验（真机 session-0000100d，32 轮 / 1132 次工具调用）：
+    //   turn 累计 75,609 秒，其中工具占用 61,165 秒（81%）⇒ 旧口径 5.95 tps、新口径 31.14 tps。
+    // 一个把 81% 时间花在等工具上的会话，「输出速度」显示 5.95 是在量「含工具等待的吞吐」。
+    const s = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 1000, data: { turn: 1, step: 1, callId: 'a', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 2, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'a', content: [], isError: false } } },
+      { type: 'assistant/message', seq: 3, time: 10000, data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 300, cacheReadTokens: 0, cacheWriteTokens: 0 } } },
+      { type: 'turn/end', seq: 4, time: 10000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    assert.equal(graph.effectiveRuntimeMs(s), 10000, '前提：回合 0→10000 = 10 秒');
+    assert.equal(graph.toolBusyMs(s), 8000, '前提：一次工具调用占了 8 秒');
+    assert.equal(graph.generatingMs(s), 2000, '生成时长必须 = 10000 − 8000');
+    const g = graph.buildGraph({ leadId: 'L', leadName: 'lead', members: [], statsBySession: new Map([['L', s]]), tasks: [] });
+    const node = g.nodes[0];
+    assert.equal(node.toolBusyMs, 8000, '节点要把工具占用如实带给前端（悬停解释分母用）');
+    assert.equal(node.generatingMs, 2000, '节点要把生成时长带给前端');
+    // 300 token / 2 秒 = 150 tps；旧口径会是 300/10 = 30 tps。
+    assert.ok(Math.abs(node.tps - 150) < 1e-6, `tps 应按生成时长算 = 150，实际 ${node.tps}`);
+    // 底栏两档只统计**队员**（Lead 自己单列）：夹具里是 Lead，所以这里断言的是「不被误算进去」，
+    // 再由下一个断言核对：把同一份统计挂到队员名下时，两个口径必须都给出 150。
+    assert.equal(g.totals.avgTps, 0, '底栏均值只统计队员，Lead 不参与');
+    const asMember = graph.buildGraph({
+      leadId: 'L', leadName: 'lead', members: [{ id: 'M', name: 'builder-a', role: 'teammate', status: 'active' }],
+      statsBySession: new Map([['L', graph.emptyStats()], ['M', s]]), tasks: [],
+    });
+    assert.ok(Math.abs(asMember.totals.avgTps - 150) < 1e-6, '底栏均值同口径（队员档）');
+    assert.ok(Math.abs(asMember.totals.tps - 150) < 1e-6, '底栏全队速度同口径（token 合计 ÷ 生成时长合计）');
+    assert.equal(asMember.totals.toolBusyMs, 8000, '底栏要带工具占用（与节点同口径）');
+  });
+
+  await check('tps 的工具时长必须**合并重叠**（并行工具不能扣两遍，否则分母会被扣成负数）', () => {
+    // 官方 maxParallelToolCalls 默认 10：同一 step 里并发发的工具调用时间区间互相重叠，
+    // 「把每次调用时长相加」会把同一段时间扣 10 次。实测 session-0000100d 的重叠只有 2 秒，
+    // 但这笔账没有上限 —— 一批并行调用就能把生成时长算成负数，tps 变成无穷大。
+    const s = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 1000, data: { turn: 1, step: 1, callId: 'a', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/call', seq: 2, time: 2000, data: { turn: 1, step: 1, callId: 'b', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/call', seq: 3, time: 3000, data: { turn: 1, step: 1, callId: 'c', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 4, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'a', content: [], isError: false } } },
+      { type: 'tool/result', seq: 5, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'b', content: [], isError: false } } },
+      { type: 'tool/result', seq: 6, time: 9000, data: { turn: 1, step: 1, message: { toolCallId: 'c', content: [], isError: false } } },
+      { type: 'turn/end', seq: 7, time: 10000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    // 三次调用区间 [1000,9000] × 3：合并后是 8000，相加会是 24000（比回合还长）。
+    assert.equal(graph.toolBusyMs(s), 8000, `合并后应为 8000ms，实际 ${graph.toolBusyMs(s)}`);
+    assert.equal(graph.generatingMs(s), 2000, '生成时长不能为负');
+    // 不相邻的两段必须分开算（中间那段是模型在生成，不能被吞掉）。
+    const split = graph.foldSession([
+      { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 1000, data: { turn: 1, step: 1, callId: 'x', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 2, time: 4000, data: { turn: 1, step: 1, message: { toolCallId: 'x', content: [], isError: false } } },
+      { type: 'tool/call', seq: 3, time: 6000, data: { turn: 1, step: 1, callId: 'y', name: 'pwsh', arguments: '{}' } },
+      { type: 'tool/result', seq: 4, time: 7000, data: { turn: 1, step: 1, message: { toolCallId: 'y', content: [], isError: false } } },
+      { type: 'turn/end', seq: 5, time: 10000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    assert.equal(graph.toolBusyMs(split), 4000, '3000 + 1000 两段，中间 2 秒是生成时间');
+    assert.equal(graph.generatingMs(split), 6000, '10000 − 4000');
+  });
+
+  await check('tps 口径的三处消费方必须同源（节点 / 底栏 / 悬停说明）', () => {
+    // 口径改了一半最糟：卡片按旧口径、浮窗按新口径，两个数字互相打架且都没法核对。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    assert.ok(/tps\.title = wsTpsTip\(node\)/.test(src), '卡片上的 tps 必须挂分母说明');
+    assert.ok(/footCells\[1\]\.title !== tpsTip/.test(src), '刷新路径也要更新说明（冷启动与轮询两条路）');
+    assert.ok(/function wsTpsTip\(/.test(src), '说明必须只有一个来源（wsTpsTip）');
+    assert.ok(src.includes('wsTpsFormula'), '文案键要在字典里');
+    const graphSrc = readFileSync(path.join(__dirname, '..', 'lib', 'graph.js'), 'utf8');
+    assert.ok(/const generating = Math\.max\(0, runtimeMs - busyMs\)/.test(graphSrc),
+      'tps 的分母必须是 runtimeMs − busyMs');
+    assert.ok(!/const tps = runtimeSec > 0\.5 \? s\.usage\.outputTokens \/ runtimeSec/.test(graphSrc),
+      '旧的「总 token ÷ 对话总时长」口径必须已经删掉');
+  });
+
   await check('工作区实时刷新：浮窗打开不得冻结卡片与浮窗指标（用户 2026-10-12 报「弹窗一开就不更新」）', () => {
     // 症状：点了 lead 卡片开浮窗后，工作区卡片的「运行 0 秒」与浮窗指标格永远不变。
     // 根因（实测复现，见 .probe/repro-freeze.mjs）：wsLoad 在浮窗打开时**整轮跳过**刷新
@@ -1934,6 +3557,66 @@ function functionBodyOf(source, needle) {
       '提问盒的签名/未答计数必须认本地已答记录（否则刚答完的卡会退回可点）');
   });
 
+  await check('浮窗能停止正在跑的回合（P1-1，走官方 stop 的同一条通道）', () => {
+    // 官方输入框在 running 时那个方块就是「停止生成」（locale：
+    // official-conversation-client.js:14487 \"input.stop\": \"停止生成\"；:17402-17410 primaryStops → stop?.()），
+    // 落到同文件 :18022-18024 的 stop = (sessionId) => scopedConversation(sessions, sessionId).cancel()。
+    // 本插件此前整条链都没有：lib/client.js 里 cancel( 出现次数 0（2026-10-14 审查 P1-1）。
+    // 代价很具体：用户在画布上发现某个队员在跑歪方向，官方界面能立刻叫停，
+    // 浮窗里只能干等 —— 而浮窗正是他「盯着这个人干活」时看的那个窗口。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    // ① session 必须从 retain 里带出来（cancel 就在它身上，binding 本来就在手里）
+    assert.ok(/session: binding\.session,/.test(cli),
+      'bridgeRetain 不再往外带 session：浮窗没有 cancel() 可调用');
+    // ② 调的是官方那个 cancel()，不是自己另发明一条停止通道
+    assert.ok(/\.session\.cancel\(\)|session\.cancel\(\)/.test(cli), '必须走官方 session.cancel()');
+    // ③ 按钮 + 只在真在跑时可点（官方也按 running 切：:17402 primaryStops = running && …）
+    assert.ok(/wsStopRun/.test(cli), '缺少停止按钮的文案键');
+    assert.ok(/state\.drawerStop/.test(cli), '停止按钮必须随图刷新同步可用性（wsApplyGraph 那条链）');
+    // ④ 失败要如实报，不能按了没反应
+    assert.ok(/wsStopFailed/.test(cli), '停止失败要给原因');
+  });
+
+  await check('取官方卡必须认 kind：审批卡的 answer() 收的是 outcome 字符串', () => {
+    // bridgeQuestionCard 原来只验 typeof card.answer === 'function' && card.callId === callId。
+    // 可官方挂进**同一个** pending-interaction 快照的不止提问卡：审批卡也是
+    // （dsh-client-ui-approval/lib/client.js:152-252 PendingApproval，同样带 callId、同样有 answer()），
+    // 而它 answer(outcome) 期望 'allowed-once' | 'rejected'
+    // （同文件 :214-220 + dsh-user-approval/lib/index.js:30-35 的 OUTCOMES）。
+    // 把 {answers:[…]} 交给它就是喂错类型。
+    // 今天默认档（danger-full-access → approval: never，dsh-user-approval/lib/index.js:175
+    // 直接 return 'rejected'）不会弹审批，所以撞不上；但用户一切到 workspace-write 档，
+    // 这条路的**形状**就成立了 —— 判据得自己关上门，不能指望配置永远不变。
+    const cli = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    const at = cli.indexOf('function bridgeQuestionCard(');
+    const to = cli.indexOf('function bridgePlanReviewCard(');
+    assert.ok(at > 0 && to > at, '两座桥的相对位置变了？同步这条闸门');
+    const fn = cli.slice(at, to);
+    assert.ok(/card\.kind === 'question'/.test(fn),
+      '按 callId 取到卡却不认 kind：万一是审批卡，答案会被喂给期望 outcome 的 answer()');
+  });
+  await check('计划审批在浮窗里看得到计划、答得上官方那张卡（P0-3）', () => {
+    // 两个半边各自都可能悄悄失效，所以都钉住。
+    const src = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
+    // ① 渲：官方把 detail 渲在**选项之上**（dsh-client-ui-user-questions/lib/client.js:1077-1082）。
+    //    没有这一句就是「给用户两个按钮却让他看不到要批什么」。
+    assert.ok(/q\.detail/.test(src) && /qdetail/.test(src),
+      '提问卡不再渲染 detail（计划审批退化成只有按钮的盲签）');
+    // ② 答：计划审批那张官方卡**没有 callId**（plan-mode 调 ask() 不带 wait，
+    //    卡由 QuestionCards.ensure 建，callId 为 undefined：
+    //    dsh-client-ui-user-questions/lib/client.js:1672-1677「A request without a
+    //    call id always gets a fresh card」）。所以按 callId 取卡的 bridgeQuestionCard
+    //    **永远取不到它** —— 必须有按 kind 取的那条路，否则弹窗里的 Approve 只能
+    //    退成消息投递，官方那张卡还挂着（正是用户 2026-10-13 骂过的症状）。
+    assert.ok(/function bridgePlanReviewCard\(/.test(src), '缺少按 kind 取计划审批卡的桥');
+    assert.ok(/kind === 'plan-review'/.test(src), '取计划审批卡必须认官方 kind 字段（不是猜 header 文案）');
+    // 计划卡与提问卡走**同一个** answer()：批次形状一致（官方按 entry.id 匹配，
+    // dsh-plan-mode/lib/index.js:287），不许为计划另开一条投递通道。
+    const planAt = src.indexOf('bridgePlanReviewCard(node.id)');
+    const answerAt = src.indexOf('await official.answer({ answers })');
+    assert.ok(planAt > 0 && answerAt > 0 && planAt < answerAt,
+      '提交时必须先按 kind 试官方计划卡，再走原批次通道');
+  });
   await check('答案批次不得含 undefined —— 含就把提问当场打死（2026-10-13 实测）', () => {
     // 这条闸门是上一次「等价」修法**自己**的 bug，也是最贵的一条：
     // 浏览器探针 23 项全绿，真机却坏了。症状（截图 192100/192148）：
@@ -2147,7 +3830,11 @@ function functionBodyOf(source, needle) {
     assert.equal(g.ok, true, JSON.stringify(g));
     const names = g.graph.nodes.map((n) => n.name).sort().join(',');
     assert.equal(names, 'builder-r,lead', `应从 Lead 日志重建成员，实际 ${names}`);
-    assert.ok(g.notes.some((n) => n.includes('重建')), '要如实说明这是历史快照');
+    // 2026-10-15：note 改发结构化 {code, params}（句子挪到浏览器拼）。
+    // 原来这条断的是中文字子里的「重建」—— 那正是这次要拆掉的耦合：
+    // 断 code 才是断「有没有如实说明」，断字样只是在断文案。
+    assert.ok(g.notes.some((n) => n.code === 'recoveredFromLog'),
+      '要如实说明这是历史快照（结构化 code）：' + JSON.stringify(g.notes));
   });
 
   await check('collectGraph：刚派出的队员不能因本地账本未登记而被跳过（用户报的实时更新问题）', async () => {
@@ -2211,6 +3898,70 @@ function functionBodyOf(source, needle) {
     assert.ok(!names2.includes('ghost'), `不属于本团队的幽灵成员必须被跳过，实际 ${names2}`);
   });
 
+  await check('extractQuestions：认出计划审批（exit_plan_mode），计划全文进卡（不再让用户盲签）', () => {
+    // 2026-10-14 审查 P0-3：官方 dsh-plan-mode/lib/index.js:254-298 在退出计划模式时
+    // 用 userQuestions.ask 挂一张**计划审批卡**，问题里带 `detail: args.plan`（整份计划），
+    // 前端 dsh-client-ui-user-questions/lib/client.js:1077-1080 用 MarkdownText 把 detail
+    // 渲在选项**之上**。本插件的 extractQuestions 只认 ask_user_question，计划审批于是
+    // 在浮窗里退化成一张只有 Approve / Keep planning 两个按钮、**读不到计划本身**的卡
+    // —— 等于让用户签字却看不到文件内容。
+    // 真机证据（session-00001007，本次实扫 274 份会话中唯一真出现过计划审批的一份）：
+    //   seq 453 tool/call name=exit_plan_mode callId=call_324ec7aa0b384e2da59e2264
+    //           arguments='{"plan":"# 调度模式（Dispatch Mode）实现计划\n\n## 0. …"}' 长 6021
+    // 所以计划的真值来源就是**这条 tool/call 的 arguments.plan**，不是 intent/detail
+    // （intent 只存在于官方那张活体卡上，日志里没有）。
+    const plan = '# 标题\n\n## 依据\n\n- 第一条\n- **加粗的一条**';
+    const callEvent = { type: 'tool/call', seq: 453, time: 1000, data: {
+      callId: 'call_plan', name: 'exit_plan_mode', arguments: JSON.stringify({ plan }),
+    } };
+    const rows = graph.extractQuestions([
+      { type: 'tool/call', seq: 1, time: 50, data: { name: 'read', arguments: '{\"file_path\":\"a\"}' } },
+      callEvent,
+    ], 10);
+    assert.equal(rows.length, 1, `计划审批应成一条待答卡，实际 ${rows.length}：` + JSON.stringify(rows.map((r) => r.id)));
+    const row = rows[0];
+    assert.equal(row.planReview, true, '必须标出这是计划审批（渲染层据此走 markdown + 官方措辞）');
+    // 措辞与选项逐字取官方 dsh-plan-mode/lib/index.js:37-41 的常量，不自造：
+    // REVIEW_ID='plan-review'、header='Plan review'、question='Approve this plan and leave plan mode?'
+    // APPROVE_LABEL='Approve'、KEEP_PLANNING_LABEL='Keep planning'。
+    // 这不是翻译问题：答案批次要按 id 匹配（同文件 :287 `entry.id === REVIEW_ID`），
+    // 选项要按 label 匹配（:289 `item.selected[0] !== APPROVE_LABEL`），改一个字就答不上。
+    assert.equal(row.id, 'plan-review', '题目 id 必须是官方 REVIEW_ID');
+    assert.equal(row.header, 'Plan review');
+    assert.equal(row.question, 'Approve this plan and leave plan mode?');
+    assert.deepEqual(row.options.map((o) => o.label), ['Approve', 'Keep planning']);
+    assert.equal(row.callId, 'call_plan');
+    assert.equal(row.answered, false);
+    assert.equal(row.detail, plan, '计划全文必须原样带上（含换行，markdown 要靠它排版）');
+    assert.ok(row.detail.includes('\n'), 'detail 不许被 clipLine 压成一行');
+    // 已批准的批次（官方答案判据 :287-292）
+    const answered = graph.extractQuestions([
+      callEvent,
+      { type: 'tool/result', time: 2000, data: { message: { source: { kind: 'tool', callId: 'call_plan' },
+        content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'plan-review', selected: ['Approve'] }] }) }] } } },
+    ], 10);
+    assert.equal(answered[0].answered, true, '有答案批次就必须只读');
+    assert.equal(answered[0].answer, 'Approve');
+    // 被拒（Keep planning 会以 isError 结算）：也算已答完，不能再给一次可点的按钮
+    const rejected = graph.extractQuestions([
+      callEvent,
+      { type: 'tool/result', time: 2000, data: { message: { source: { kind: 'tool', callId: 'call_plan' },
+        content: [{ type: 'text', text: 'The user chose to keep planning; revise the plan and present it again.' }], isError: true } } },
+    ], 10);
+    assert.equal(rejected[0].answered, true, '拒绝也是结算：不许留着按钮等第二次点击');
+    // 超长计划有界（真机实测 6,021 码元，本闸门给一份 40k 的）
+    const big = graph.extractQuestions([{ type: 'tool/call', time: 1, data: {
+      callId: 'call_big', name: 'exit_plan_mode', arguments: JSON.stringify({ plan: '# t\n' + 'p'.repeat(40000) }) },
+    }], 10);
+    assert.ok(big[0].detail.length <= 32000, '计划正文同样要有界：' + big[0].detail.length);
+    assert.equal(big[0].detailTruncated, true, '截过要如实标');
+    // 坏 JSON / 缺 plan：不编一条假审批卡
+    assert.equal(graph.extractQuestions([{ type: 'tool/call', time: 1, data: { callId: 'c', name: 'exit_plan_mode', arguments: '{bad' } }], 5).length, 0,
+      '参数解析不出来就不该造卡');
+    assert.equal(graph.extractQuestions([{ type: 'tool/call', time: 1, data: { callId: 'c', name: 'exit_plan_mode', arguments: '{}' } }], 5).length, 0,
+      '没有 plan 字段就不该造卡');
+  });
+
   await check('extractQuestions：抽提问 + 配对 tool/result 判定已回答（用户：回答过不能再答）', () => {
     // 用户 2026-10-08：「他提问的时候我在工作区看不到也收不到任何的提问信息」。
     // 数据源必须是**会话日志**而不是官方 userQuestions 投影 —— 后者只跟踪 mode:'timed'，
@@ -2259,6 +4010,16 @@ function functionBodyOf(source, needle) {
     const done = rows.find((r) => r.callId === 'call_done');
     assert.equal(done.answered, true, '有 answers result 的提问必须标成已回答');
     assert.equal(done.answer, '用 GitHub noreply 邮箱（推荐）', `已回答卡应带答案文本，实际 ${done.answer}`);
+    // 普通提问也可以带 detail（官方 QuestionComposer 对**每一题**都渲 question.detail：
+    // dsh-client-ui-user-questions/lib/client.js:1077-1082，MarkdownText，不分是不是计划审批）。
+    // 本插件此前逐题只读 id/header/question/options/multi_select，detail 整个字段被丢掉。
+    const withDetail = graph.extractQuestions([
+      { type: 'tool/call', seq: 1, time: 10, data: { callId: 'call_d', name: 'ask_user_question', arguments: JSON.stringify({
+        questions: [{ id: 'q1', header: 'h', question: '选哪个？', detail: '## 背景\n\n- 证据 A\n- **证据 B**', options: [{ label: 'A' }, { label: 'B' }] }],
+      }) } },
+    ], 5);
+    assert.equal(withDetail[0].detail, '## 背景\n\n- 证据 A\n- **证据 B**', 'detail 必须原样带上（含换行，渲染层靠它排版 markdown）');
+    assert.equal(withDetail[0].planReview, undefined, '普通提问不该被误标成计划审批');
     // 自定义回答形状（selected 空、custom 有值）
     const customRows = graph.extractQuestions([
       ask(1, 'call_c', 'install', '装到哪？'),
@@ -2474,6 +4235,7 @@ function visibleModelTexts(playbook, roster) {
     ['PLAYBOOK', playbook.PLAYBOOK],
     ['TEAM_POLICY', playbook.TEAM_POLICY],
     ['TEAMMATE_CARD', playbook.TEAMMATE_CARD],
+    ['MEMBER_PERSONA_PIN', roster.MEMBER_PERSONA_PIN],
     ['wakeInstruction', playbook.wakeInstruction('scout', '只做调研')],
     ['teamCommandLine', playbook.teamCommandLine('x')],
   ];

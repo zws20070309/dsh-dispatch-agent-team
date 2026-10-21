@@ -26,6 +26,7 @@
 | DSH 桌面端 | 0.2.0-rc.2 或更新（更早的版本请先跑 `node tools/drift-check.cjs` 看兼容性） |
 | Node.js | ≥ 18 |
 | 官方 bundle | 需在插件页启用 `@deepseek-ai/dsh-experimental-agent-team-profile`（本插件复用它不可替代的持久化域服务；工具面与界面由本插件接管） |
+| 可选：dsh-ops | 装了并启用后，Lead 与每个队员自动获得它的**文件检索四件套**（注册在全局层）；其余工具各有权限门 —— `ops_bash` 与四个 job 工具要会话处于「完全访问」，`ops_batch`/`ops_result` 只给纯 PTC 档队员（见下文「ops 工具」）。**不装也完全能用**，本插件不依赖它 |
 
 ## 安装
 
@@ -66,6 +67,24 @@ node tools/install.cjs
 
 如果源码目录与桌面端实际加载的那份是两个目录，改完要同步一次：
 `node tools/sync-to-dsh.cjs`（`--dry-run` 只看差异）。
+
+### 分支约定（用户 2026-10-14 定案）
+
+**日常改动一律在 `dev`，提交后推 `origin/dev`；攒一批再合并进 `main`**（合并需用户批准，
+历史上是 10-09、10-11、10-14 三次）。`main` 是仓库默认分支，也是「已发布」的那一份。
+
+为什么必须定期合：GitHub 贡献图**只统计默认分支可达的提交**。实测 10-13 那 17 个提交
+只推了 dev 时，图上 10-13 = 0；合并进 main 后同一格变成 17。所以「改动都在远端、图上却是 0」
+不是丢提交，是分支问题 —— 先 `git ls-remote origin dev` 确认在不在，再看 main 可不可达。
+
+合并的做法（照 10-14 那次）：
+
+1. `git merge-tree --write-tree origin/main origin/dev` 先干跑，确认零冲突；
+2. **用临时 worktree 操作**（`git worktree add <tmp> --detach origin/main`），不要在正在运行的
+   插件目录里 checkout —— 那个目录是桌面端实际加载的 junction，切分支会当场改变插件代码；
+3. `git merge --no-ff origin/dev`（保留合并提交，与历史两次一致）；
+4. 核对 `git diff --stat HEAD origin/dev` 为空，再 `git push origin HEAD:main`；
+5. `git worktree remove <tmp>`，确认插件目录仍在 `dev` 且工作树干净。
 
 ## 使用
 
@@ -165,6 +184,44 @@ node tools/install.cjs
 队员看到的是另一份子集：没有 `spawn_teammate` / `interrupt_agent`（只有 Lead 能创建或打断），
 多一个 `report_result`（交付报告）与 `ask_lead`（中途向 Lead 提问），也没有目标与子代理工具。
 
+### ops 工具（可选插件 dsh-ops，原生链接）
+
+[dsh-ops](https://github.com/T-Auto/dsh-ops) 是另一个插件：用 Rust 实现的文件检索、后台任务与批量操作，
+比宿主同名工具更快、输出更省 token。**本插件不内嵌它、也不依赖它** —— 两个插件各自安装、各自启用；
+检测到它在场时，队员**不需要任何配置**就直接看得到它的工具，并额外收到一段简短的使用指引。
+
+分工要说准（实测，别当成「全都一样」）：`file` 组件的四个工具注册在全局层，**Lead 与每个队员都有**；
+`background`/`shell` 与 `PTC 增强` 的工具注册在**各 agent 自己的作用域**上，并且各有一道门 ——
+后台任务要求该会话处于「完全访问」；批量工具（`ops_batch`/`ops_result`）的门更窄，
+**只放行纯 PTC 呈现档**（dsh-ops `lib/ptc/index.js:20`：该作用域的工具组合恰好只有一个 `run_code`）。
+所以实测结论是：**Lead（原生档）与开着「批量调用」的队员（both 档）都拿不到那两个工具** ——
+both 档的组合是「全部原生工具 + `run_code`」，工具数 >1，被那扇门挡在门外（`ops-mount-check` B 段
+用同一份原版组件对照过：ptc 档拿到 `ops_batch/ops_result`，both 档拿到空）。这不是缺陷，
+是 ops 的设计；要它们见下面第一条。Lead 那侧本插件**刻意不动** —— 那是你的主会话。
+
+想确认这套链接在你机器上真的通了（**不用重启 DSH**）：`node tools/ops-mount-check.mjs` —— 它挂真 dsh-ops 组件与真宿主注册表跑一遍，
+四段各自独立（各用独立 Context）：A 交付态、B 负对照（同一份原版组件只差呈现档）、C 后台任务真起 FastCtx 服务器并**真调一次** `ops_run_background`、D shell 组件（`ops_bash` 发布 + 口径文字确实进段）。
+
+| dsh-ops 组件 | 队员拿到什么 |
+|---|---|
+| file | `ops_grep` / `ops_glob` / `ops_inspect_local_file` / `ops_replace` —— 检索与批量替换 |
+| background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` —— 长任务托管（需会话处于完全访问） |
+| shell | `ops_bash`（一次性 POSIX 命令）+ 把命令执行器换成随包 PowerShell 7（Windows 上通常比系统自带的好用） |
+| PTC 增强 | `ops_batch` / `ops_result` —— 一次调用完成跨文件的复制/移动/删除（先 plan 再执行），大结果分页引用。**仅纯 PTC 档队员**（预设 `ptc` + 关闭「批量调用」）拿得到；Lead 与批量档队员按 ops 的设计拿不到 |
+
+三点如实说明：
+
+- **`ops_batch`/`ops_result` 要纯 PTC 档才有**：dsh-ops 的 PTC 组件按自己的设计只把这两个工具
+  给纯 PTC 呈现档的作用域。本包**不改 dsh-ops 一行源码**，用已有的配置就能拿到：把该角色的
+  **预设设为 `ptc`** 并**关掉它的「批量调用」开关**（见上文配置页），那名队员就是纯 PTC 档，
+  ops 自己会把这两个工具给他（可在 `run_code` 程序里调用）。默认（批量档开着）拿不到它们，
+  但**其余 ops 工具照常可用**，不影响任何功能。
+- **没装 dsh-ops 的用户零影响**：不注册任何提示词、不多一个字节，插件页也不会出现 ops 组件。
+- **状态可查**：`~/.dsh/dispatch-agent-team-status.json` 的 `opsIntegration` 字段记录四个组件的挂载事实、
+  当前可见的 ops_* 清单，以及（仅当某名**纯 PTC 档**队员看不到 `ops_batch`/`ops_result` 时）一句点名修法。
+
+想四个组件都开（含 dsh-ops 默认关着的 background 与 PTC）：`node tools/ops-enable.cjs` 后重启 DSH；
+`--check` 只看不改，`--revert` 删掉这四行回到 dsh-ops 自带默认。
 ## 卸载
 
 ```bash
@@ -193,11 +250,13 @@ node tools/repair.cjs             # 安装状态体检（bundles / junction / �
 注意：除 `client-smoke-test` 外，其余脚本都需要先有安装期那个依赖 junction
 （也就是跑过 `repair.cjs --apply`），否则会报 `ERR_MODULE_NOT_FOUND` —— 那是「还没装好」，不是插件坏了。
 
-还有两个只读探针，排查问题时很有用：
+还有三个只读探针，排查问题时很有用：
 
 ```bash
 node tools/session-probe.cjs --tools --session <会话子串>          # 会话里团队工具面的真实增删
 node tools/asar-probe.cjs --grep "<字符串>" --list "dsh-llm/lib"   # 官方安装包里到底有没有这个东西
+node tools/cache-prefix-audit.cjs                                  # 缓存命中率：① 实测（读会话日志的 usage）② 前缀复用模型（定位断裂点）
+node tools/cache-prefix-audit.cjs --all --tail 200                 # 连非本插件的会话一起看
 ```
 
 ## 开发者文档

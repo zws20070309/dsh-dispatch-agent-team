@@ -912,6 +912,590 @@ async function main() {
     });
   }
 
+  // ── 9) 队员 agent 预设这一列（2026-10-15）──────────────────────────────────
+  // 这一列最容易出的错不是「不显示」，而是**静默丢数据**：草稿管道里任何一个构造函数
+  // 少带一个 preset，用户保存后那一半配置就没了。所以断言全部围绕「读回来 = 显示 = 存回去」。
+  // 定位一律**按列标题文字**，不按「第几个 select」：思考强度那一格在某些目录形状下会
+  // 整个不渲染，位置索引会指错列（这条我自己踩过）。
+  {
+    const PRESET_TABLE = {
+      presets: [
+        { id: 'ptc', name: '', available: true, reason: '', detail: '' },
+        { id: 'standard', name: '', available: true, reason: '', detail: '' },
+        { id: 'minimal-grayscale', name: '极简灰度模式', available: true, reason: '', detail: '' },
+        { id: 'liangshen', name: '梁神模式', available: false, reason: 'not-registered', detail: '' },
+      ],
+      notes: [],
+    };
+    const optionItems = (node) => {
+      const out = [];
+      const walk = (x) => {
+        if (Array.isArray(x)) { for (const item of x) walk(item); return }
+        if (x === null || x === undefined || typeof x !== 'object') return
+        if (x.type === 'option') out.push({ value: String(x.props.value), disabled: x.props.disabled === true })
+        walk(x.props === undefined ? undefined : x.props.children)
+      };
+      walk(node === undefined || node === null ? undefined : node.props.children);
+      return out;
+    };
+    /** 角色行按**角色 id** 找（dat-row 这个类名缓存保活的覆盖行也在用，位置索引会指错；行顺序也不归测试说了算）。 */
+    const roleRow = (root, roleId) => findAll(root, (node) => {
+      if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+      const code = findAll(node, (inner) => inner.type === 'code')[0];
+      return code !== undefined && textOf(code) === roleId;
+    })[0];
+    /** 某个角色行里，标题为 label 的那一格下拉。 */
+    const selectInRow = (root, roleId, label) => {
+      const row = roleRow(root, roleId);
+      if (row === undefined) return undefined;
+      for (const field of findAll(row, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== label) continue;
+        const sel = findAll(field, (node) => node.type === 'select')[0];
+        if (sel !== undefined) return sel;
+      }
+      return undefined;
+    };
+    /** 「统一选择」那一块里标题为 label 的下拉（整页只有一处用这些标题）。 */
+    const bulkSelect = (root, label) => {
+      const bulk = findAll(root, (node) => node.type === 'div' && node.props.className === 'dat-bulk')[0];
+      if (bulk === undefined) return undefined;
+      for (const field of findAll(bulk, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== label) continue;
+        const sel = findAll(field, (node) => node.type === 'select')[0];
+        if (sel !== undefined) return sel;
+      }
+      return undefined;
+    };
+    const PRESET_COL = 'agent 预设';
+    const BULK_PRESET_COL = 'agent 预设（应用到全部角色）';
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { scout: { preset: 'standard' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: PRESET_TABLE,
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+      // 保存成功后组件**以宿主回传的净化结果为准**重建草稿（onSave 里那条），所以这里必须
+      // 如实回它保存的那一份，否则后面几条断言测的是「fixture 骗人」。
+      set: { ok: true, config: { version: 1, roles: { scout: { preset: 'ptc' } } }, revision: 'bbb:2', diagnostics: [] },
+    });
+
+    check('每行有「agent 预设」下拉，且已保存的预设显示成它自己（读回来 = 显示）', () => {
+      const sel = selectInRow(page.tree(), 'scout', PRESET_COL);
+      if (sel === undefined) return '第一行里没有标题为「' + PRESET_COL + '」的下拉：' + textOf(page.tree()).slice(0, 160);
+      if (sel.props.value !== 'standard') return '预设下拉显示的是 ' + JSON.stringify(sel.props.value) + '，不是已保存的 standard';
+      return true;
+    });
+
+    check('预设选项：跟随 Lead 与三个 id 都在，注册表里没有的那项在但禁用（不藏）', () => {
+      const items = optionItems(selectInRow(page.tree(), 'scout', PRESET_COL));
+      const values = items.map((item) => item.value);
+      for (const want of ['', 'ptc', 'standard', 'minimal-grayscale']) {
+        if (!values.includes(want)) return '选项不全：' + values.join(' | ');
+      }
+      const stale = items.find((item) => item.value === 'liangshen');
+      if (stale === undefined) return '不可用的预设被藏起来了（用户会以为功能坏了）';
+      if (stale.disabled !== true) return '不可用的预设竟然可选（选了保存会被宿主拒掉）';
+      return true;
+    });
+
+    selectInRow(page.tree(), 'scout', PRESET_COL).props.onChange({ target: { value: 'ptc' } });
+    findAll(page.repaint(), (node) => node.type === 'button' && textOf(node).includes('保存'))[0].props.onClick();
+    await page.settle();
+    await page.settle();
+    const onlyPreset = page.sent().filter((entry) => entry.op === 'set').pop();
+    check('只改预设：set 里该角色只带 preset，没有 provider/model（不猜路由）', () => {
+      const scout = onlyPreset === undefined ? undefined : onlyPreset.args.roles.scout;
+      if (scout === undefined) return 'set 里没有 scout：' + JSON.stringify(onlyPreset === undefined ? null : onlyPreset.args.roles);
+      if (scout.preset !== 'ptc') return 'preset=' + JSON.stringify(scout.preset);
+      if (scout.provider !== undefined || scout.model !== undefined) return '不该带上模型：' + JSON.stringify(scout);
+      return true;
+    });
+
+    check('改模型不许顺手清掉预设（草稿管道少带一个字段 = 静默丢配置）', () => {
+      const before = selectInRow(page.tree(), 'scout', PRESET_COL);
+      if (before === undefined || before.props.value !== 'ptc') return '改模型前预设已经不是 ptc 了';
+      selectInRow(page.tree(), 'scout', '模型').props.onChange({ target: { value: 'p1\u0000m1' } });
+      const after = selectInRow(page.repaint(), 'scout', PRESET_COL);
+      if (after === undefined || after.props.value !== 'ptc') return '改模型把预设清成了 ' + JSON.stringify(after === undefined ? null : after.props.value);
+      return true;
+    });
+
+    check('清掉模型后预设仍留在行里（两个维度各自独立）', () => {
+      selectInRow(page.tree(), 'scout', '模型').props.onChange({ target: { value: '' } });
+      const after = selectInRow(page.repaint(), 'scout', PRESET_COL);
+      if (after === undefined || after.props.value !== 'ptc') return '清模型后预设变成 ' + JSON.stringify(after === undefined ? null : after.props.value);
+      return true;
+    });
+
+    check('统一选择预设：一次改完全部 12 个角色', () => {
+      const bulk = bulkSelect(page.tree(), BULK_PRESET_COL);
+      if (bulk === undefined) return '统一块里没有「' + BULK_PRESET_COL + '」这一格';
+      bulk.props.onChange({ target: { value: 'minimal-grayscale' } });
+      const after = page.repaint();
+      const values = [];
+      for (const role of ROLES) {
+        const sel = selectInRow(after, role.id, PRESET_COL);
+        values.push(sel === undefined ? '(缺行)' + role.id : String(sel.props.value));
+      }
+      if (values.some((value) => value !== 'minimal-grayscale')) return '统一后：' + values.join(' | ');
+      return true;
+    });
+
+    check('统一预设不动模型与强度（三列各管各的）', () => {
+      const model = selectInRow(page.tree(), 'builder', '模型');
+      if (model === undefined) return '第 4 行找不到模型下拉';
+      if (model.props.value !== '') return '统一预设把模型也改了：' + model.props.value;
+      return true;
+    });
+  }
+
+  // 旧宿主 / agentPresets 服务缺席：这一列必须禁用并说明原因，而不是空下拉或崩掉。
+  {
+    const page = await mount({
+      get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: 'aaa:1', diagnostics: [] },
+      'list-models': { ok: true, groups: [], failures: [] },
+    });
+    const tree = page.tree();
+    const rows = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-row');
+    let sel;
+    for (const field of findAll(rows[0], (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+      const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+      if (head !== undefined && textOf(head) === 'agent 预设') sel = findAll(field, (node) => node.type === 'select')[0];
+    }
+    check('宿主没带预设表：这一列仍渲染但禁用（用户看得见「读不到」，不是少了功能）', () => {
+      if (sel === undefined) return '预设下拉没渲染出来';
+      if (sel.props.disabled !== true) return '读不到注册表却仍可点（选了会被宿主拒）';
+      return true;
+    });
+    check('宿主没带预设表：统一那一列给出唯一原因', () => {
+      const text = textOf(tree);
+      if (!text.includes('读不到')) return '没有说明原因：' + text.slice(-240);
+      return true;
+    });
+  }
+
+  // ── 10) 布局结构：三个下拉必须是同级（2026-10-15 用户报「总控页面空白太多」）────
+  //
+  // 上面 §9 的定位全是 findAll（**后代**搜索），所以「预设那一格被套进强度格里面」它照样
+  // 找得到 —— React 对嵌套 label 一句不报，坏掉的只有版面：flex 容器里只剩两格，左边
+  // 空出一整块、中间空出一整块。这类 bug 只能靠**直接子节点**判据抓到，故本节点用
+  // node.props.children（替身把 children 平铺成数组，同级关系就是数组元素，嵌套的在更深层）。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { scout: { preset: 'standard' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+    });
+    const tree = page.tree();
+    /** 某个 dat-field 里那一格的列标题。 */
+    const fieldLabel = (field) => {
+      const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+      return head === undefined ? '' : textOf(head);
+    };
+    const isField = (node) => node.type === 'label' && node.props.className === 'dat-field';
+
+    check('全局：没有任何 dat-field 套在另一个 dat-field 里面（同级判据）', () => {
+      const nested = [];
+      const walk = (node, insideField) => {
+        if (node === null || node === undefined || typeof node !== 'object') return;
+        if (Array.isArray(node)) { for (const item of node) walk(item, insideField); return; }
+        const nowField = isField(node);
+        if (nowField && insideField !== undefined) nested.push(fieldLabel(node) || '(无标题)');
+        walk(node.props === undefined ? undefined : node.props.children, nowField ? node : insideField);
+      };
+      walk(tree.props.children, undefined);
+      if (nested.length > 0) return '这些下拉被嵌进了别的下拉里（同级才会并排）：' + nested.join(' | ');
+      return true;
+    });
+
+    check('统一选择块：模型 / 思考强度 / agent 预设 三格都是 dat-bulk-ctl 的直接子节点', () => {
+      const ctl = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-bulk-ctl')[0];
+      if (ctl === undefined) return '找不到 dat-bulk-ctl';
+      const direct = (ctl.props.children || []).filter(isField).map(fieldLabel);
+      const want = ['模型（应用到全部角色）', '思考强度（应用到全部角色）', 'agent 预设（应用到全部角色）'];
+      const missing = want.filter((label) => !direct.includes(label));
+      if (missing.length > 0) return '直接子节点只有 [' + direct.join(' | ') + ']，缺 ' + missing.join(' | ');
+      return true;
+    });
+
+    check('角色行：模型与 agent 预设同为 dat-ctl 的直接子节点（逐行那一列也不许套娃）', () => {
+      const row = findAll(tree, (node) => {
+        if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+        const code = findAll(node, (inner) => inner.type === 'code')[0];
+        return code !== undefined && textOf(code) === 'scout';
+      })[0];
+      if (row === undefined) return '找不到 scout 行';
+      const ctl = findAll(row, (node) => node.type === 'div' && node.props.className === 'dat-ctl')[0];
+      if (ctl === undefined) return 'scout 行里没有 dat-ctl';
+      const direct = (ctl.props.children || []).filter(isField).map(fieldLabel);
+      for (const label of ['模型', 'agent 预设']) {
+        if (!direct.includes(label)) return 'dat-ctl 的直接子节点是 [' + direct.join(' | ') + ']，缺「' + label + '」';
+      }
+      return true;
+    });
+  }
+
+  // ── 12)「推荐」按钮（2026-10-16 用户：在统一选择那块右上角加一个推荐，点一下填好并保存）──
+  //
+  // 用户诉求原话：「在画圈的地方加一个推荐，点击之后直接就可以直接把最适合这个队员的基本信息填上并保存」。
+  // 所以钉四件事：① 按钮渲染在 dat-bulk-head 里（= 画圈那一行）；② 点一下**既填又存**
+  // （发出 set，载荷里 preset/batch 正确、模型与强度**没被改动**）；③ 回执要说清只动了两格；
+  // ④ 宿主没回推荐取值时按钮禁用并写明原因（不许静默少一个功能）。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: {
+          researcher: { provider: 'p1', model: 'm1', reasoningEffort: 'high', preset: 'standard', batch: false },
+          scout: { provider: 'p1', model: 'm1', reasoningEffort: 'high' },
+          builder: { provider: 'p1', model: 'm1', reasoningEffort: 'high', preset: 'ptc', batch: false },
+        } },
+        roles: ROLES,
+        revision: 'rec:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+        recommendations: [ { roleId: 'researcher', preset: 'ptc', batch: false }, { roleId: 'scout', preset: 'ptc', batch: false }, { roleId: 'builder', preset: 'ptc', batch: true }, ], recommendationRule: '规则文本（只读型走纯 PTC，写域型保留批量调用）',
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1', reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'rec:2' },
+    });
+    const tree = page.tree();
+    const head = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-bulk-head')[0];
+    const btn = findAll(head === undefined ? { props: { children: [] } } : head, (node) => node.type === 'button' && textOf(node) === '推荐')[0];
+
+    check('推荐按钮渲染在统一选择那一行（dat-bulk-head = 用户画圈的位置）', () => {
+      if (head === undefined) return '找不到 dat-bulk-head';
+      if (btn === undefined) return 'dat-bulk-head 里没有「推荐」按钮';
+      if (btn.props.disabled === true) return '有推荐取值时按钮却被禁用';
+      return true;
+    });
+    check('推荐按钮的 title 用宿主回传的规则文本（页面不自己写一份理由）', () => {
+      if (btn.props.title !== '规则文本（只读型走纯 PTC，写域型保留批量调用）') return JSON.stringify(btn.props.title);
+      return true;
+    });
+
+    btn.props.onClick();
+    await flush();
+    check('点一下 = 直接保存（发出 set，且带读到的 revision）', () => {
+      const call = sent.find((entry) => entry.op === 'set');
+      if (call === undefined) return '点「推荐」没有发出 set 请求（只填不存 = 用户还得自己点保存）';
+      if (call.args.revision !== 'rec:1') return '没带上读到的 revision：' + JSON.stringify(call.args.revision);
+      return true;
+    });
+    check('点一下 = 按角色填对两格，且模型与思考强度原样保留', () => {
+      const roles = sent.find((entry) => entry.op === 'set').args.roles;
+      const want = {
+        researcher: { preset: 'ptc', batch: false },   // 原本就是纯 PTC：保持
+        scout: { preset: 'ptc', batch: false },        // 原本没有 batch 键（默认开）→ 推荐关 = 落键 false
+        builder: { preset: 'ptc', batch: undefined },  // 写域型：从「关」被拨回「开」= 默认 = 不落键
+      };
+      for(const id of Object.keys(want)) {
+        const row = roles[id];
+        if (row === undefined) return id + ' 没进载荷';
+        if (row.preset !== want[id].preset) return id + ' preset=' + row.preset;
+        if (row.batch !== want[id].batch) return id + ' batch=' + JSON.stringify(row.batch) + '（应为 ' + JSON.stringify(want[id].batch) + '）';
+        if (row.provider !== 'p1' || row.model !== 'm1' || row.reasoningEffort !== 'high') return id + ' 的模型/强度被改了：' + JSON.stringify(row);
+      }
+      return true;
+    });
+    check('保存成功的回执说清「只填了两格、模型与强度未动」', () => {
+      const text = textOf(page.repaint());
+      if (!text.includes('模型与思考强度未改动')) return '回执没说明改动范围：' + text.slice(-260);
+      return true;
+    });
+  }
+  {
+    // 降级：宿主是旧版（get 不回 recommendations）→ 按钮不许消失，要禁用 + 给原因。
+    const page = await mount({
+      get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: 'x:1', diagnostics: [] },
+      'list-models': { ok: true, groups: [], failures: [] },
+    });
+    const tree = page.tree();
+    const head = findAll(tree, (node) => node.type === 'div' && node.props.className === 'dat-bulk-head')[0];
+    const btn = findAll(head, (node) => node.type === 'button' && textOf(node) === '推荐')[0];
+    check('宿主没回推荐取值：按钮仍渲染但禁用，并写明原因（不静默少功能）', () => {
+      if (btn === undefined) return '按钮整个消失了';
+      if (btn.props.disabled !== true) return '读不到推荐取值却仍可点';
+      const text = textOf(tree);
+      if (!text.includes('宿主没有回传推荐取值')) return '没有给出原因：' + text.slice(-200);
+      return true;
+    });
+  }
+
+  // ── 11) 批量调用开关（both 档，2026-10-15 用户选路径 1：默认开 + 开关放控件列左边）──
+  //
+  // 这一维最容易出的两种错：① 开关被摞进右边那一列（用户明确不要的版面）；
+  // ② 拨了开关但保存时被别的列挤掉（草稿行是四字段对象，任何一处绕过 makeRow 都会丢）。
+  // 所以断言同时盯**结构**（直接子节点）与**往返**（读回来 = 显示 = 存回去）。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: {
+          version: 1,
+          roles: {
+            builder: { provider: 'p', model: 'm1', preset: 'ptc', batch: false },
+            scout: { batch: false },
+          },
+        },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1', efforts: [{ id: 'low', name: 'Low' }] }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'bbb:2', diagnostics: [] },
+    });
+    /** 某个角色行里那一颗批量开关（连同它那一格与整行）。 */
+    const batchBox = (root, roleId) => {
+      const row = findAll(root, (node) => {
+        if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+        const code = findAll(node, (inner) => inner.type === 'code')[0];
+        return code !== undefined && textOf(code) === roleId;
+      })[0];
+      if (row === undefined) return undefined;
+      const cell = findAll(row, (node) => node.type === 'label' && node.props.className === 'dat-batch')[0];
+      if (cell === undefined) return undefined;
+      const box = findAll(cell, (node) => node.type === 'input')[0];
+      return box === undefined ? undefined : { cell, box, row };
+    };
+    /** 某个角色行里、列标题为 label 的那个下拉（与 §9 同一套定位：按标题文字，不按位置）。 */
+    const selectOf = (root, roleId, label) => {
+      const row = findAll(root, (node) => {
+        if (node.type !== 'div' || node.props.className !== 'dat-row') return false;
+        const code = findAll(node, (inner) => inner.type === 'code')[0];
+        return code !== undefined && textOf(code) === roleId;
+      })[0];
+      if (row === undefined) return undefined;
+      for (const field of findAll(row, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== label) continue;
+        const sel = findAll(field, (node) => node.type === 'select')[0];
+        if (sel !== undefined) return sel;
+      }
+      return undefined;
+    };
+    const bulkBatchBox = (root) => {
+      const bulk = findAll(root, (node) => node.type === 'div' && node.props.className === 'dat-bulk')[0];
+      if (bulk === undefined) return undefined;
+      for (const field of findAll(bulk, (node) => node.type === 'label' && node.props.className === 'dat-field')) {
+        const head = findAll(field, (node) => node.type === 'span' && node.props.className === 'dat-label')[0];
+        if (head === undefined || textOf(head) !== '批量调用（应用到全部角色）') continue;
+        const box = findAll(field, (node) => node.type === 'input')[0];
+        if (box !== undefined) return { field, box };
+      }
+      return undefined;
+    };
+    const save = () => {
+      const btn = findAll(page.tree(), (node) => node.type === 'button' && textOf(node).includes('保存'))[0];
+      btn.props.onClick();
+    };
+
+    check('每个角色行都有一颗批量开关，已关掉的那颗显示为未勾选（读回来 = 显示）', () => {
+      const tree = page.tree();
+      const scout = batchBox(tree, 'scout');
+      if (scout === undefined) return 'scout 行里没有 dat-batch 那一格';
+      if (scout.box.props.checked !== false) return '配置里 batch:false，界面上却仍是勾选状态';
+      const researcher = batchBox(tree, 'researcher');
+      if (researcher === undefined) return 'researcher 行里没有 dat-batch 那一格';
+      if (researcher.box.props.checked !== true) return '没配任何维度的角色应当默认打勾（默认开）';
+      const builder = batchBox(tree, 'builder');
+      if (builder === undefined || builder.box.props.checked !== false) return 'builder 的 batch:false 没读回来';
+      return true;
+    });
+
+    check('版面：批量开关是 dat-row 的直接子节点，且不在 dat-ctl 那一列里', () => {
+      const found = batchBox(page.tree(), 'scout');
+      if (found === undefined) return '找不到 scout 的开关';
+      const ctl = findAll(found.row, (node) => node.type === 'div' && node.props.className === 'dat-ctl')[0];
+      if (ctl === undefined) return '找不到 dat-ctl（行结构变了，本条判据要重写）';
+      if (findAll(ctl, (node) => node === found.cell).length > 0) return '批量开关被放进了 dat-ctl 那一列';
+      if ((found.row.props.children || []).indexOf(found.cell) < 0) return 'dat-batch 不是 dat-row 的直接子节点';
+      return true;
+    });
+
+    check('统一那一格：角色不一致时不打勾（有一格关掉就不打勾）', () => {
+      const bulk = bulkBatchBox(page.tree());
+      if (bulk === undefined) return '统一选择块里找不到「批量调用（应用到全部角色）」';
+      if (bulk.box.props.checked !== false) return 'scout/builder 是关的，统一格却打勾了（骗人）';
+      return true;
+    });
+
+    check('关掉批量后再改模型，batch 仍是 false（四字段收口到 makeRow 的行为证明）', () => {
+      const researcher = batchBox(page.tree(), 'researcher');
+      researcher.box.props.onChange({ target: { checked: false } });
+      const model = selectOf(page.repaint(), 'researcher', '模型');
+      if (model === undefined) return '找不到 researcher 的模型下拉';
+      model.props.onChange({ target: { value: 'p1\u0000m1' } });
+      const after = batchBox(page.repaint(), 'researcher');
+      if (after === undefined || after.box.props.checked !== false) return '改模型把批量开关拨回了开';
+      return true;
+    });
+
+    check('统一开关：一次拨全部角色，且不动模型/强度/预设', () => {
+      const bulk = bulkBatchBox(page.tree());
+      if (bulk === undefined) return '找不到统一格';
+      bulk.box.props.onChange({ target: { checked: true } });
+      const after = page.repaint();
+      const bad = [];
+      for (const role of ROLES) {
+        const found = batchBox(after, role.id);
+        if (found === undefined || found.box.props.checked !== true) bad.push(role.id);
+      }
+      if (bad.length > 0) return '统一开后仍未勾选的角色：' + bad.join(' ');
+      const preset = selectOf(after, 'builder', 'agent 预设');
+      if (preset === undefined || preset.props.value !== 'ptc') return '统一批量把 builder 的预设改掉了：' + JSON.stringify(preset === undefined ? null : preset.props.value);
+      bulk.box.props.onChange({ target: { checked: false } });
+      const off = page.repaint();
+      const stillOn = ROLES.filter((role) => {
+        const found = batchBox(off, role.id);
+        return found === undefined || found.box.props.checked !== false;
+      }).map((role) => role.id);
+      if (stillOn.length > 0) return '统一关后仍在勾选的角色：' + stillOn.join(' ');
+      return true;
+    });
+
+    save();
+    await page.settle();
+    await page.settle();
+    check('保存时 batch:false 真的进了 payload（与模型/预设同在一行、互不挤掉）', () => {
+      const setCall = page.sent().filter((entry) => entry.op === 'set').pop();
+      if (setCall === undefined) return '没有发出 set 请求';
+      const roles = setCall.args.roles;
+      const scout = roles.scout;
+      if (scout === undefined || scout.batch !== false) return 'scout 的 batch:false 丢了：' + JSON.stringify(scout);
+      if (scout.provider !== undefined) return 'scout 不该带模型：' + JSON.stringify(scout);
+      const researcher = roles.researcher;
+      if (researcher === undefined || researcher.batch !== false) return 'researcher 的 batch:false 丢了：' + JSON.stringify(researcher);
+      if (researcher.provider !== 'p1' || researcher.model !== 'm1') return 'researcher 的模型丢了：' + JSON.stringify(researcher);
+      const builder = roles.builder;
+      if (builder === undefined || builder.preset !== 'ptc' || builder.batch !== false) return 'builder 两维没同时活下来：' + JSON.stringify(builder);
+      return true;
+    });
+
+    // 上一轮保存后组件按宿主回包重建草稿（fixture 回的是 roles:{}），这里正好从「全默认」起算。
+    check('拨开关再拨回去 = 不算未保存改动（默认值不留残骸行）', () => {
+      const found = batchBox(page.tree(), 'researcher');
+      if (found === undefined) return '找不到 researcher 的开关';
+      found.box.props.onChange({ target: { checked: false } });
+      const dirty = textOf(page.repaint());
+      if (dirty.includes('有未保存改动') === false) return '关掉批量没有产生未保存提示（这一维没进指纹？）';
+      const back = batchBox(page.tree(), 'researcher');
+      back.box.props.onChange({ target: { checked: true } });
+      const clean = textOf(page.repaint());
+      if (clean.includes('有未保存改动') === true) return '拨回默认（开）之后仍提示未保存：说明默认值被写成了显式行，配置会越长越脏';
+      return true;
+    });
+  }
+  // ── 12) 统一选择那一排的**等高骨架**（2026-10-15 用户第二次报版面：四格不在一条线上）──
+  //
+  // 现象：「agent 预设」整格比旁边高出一截。根因是 .dat-bulk-ctl 底对齐 + **只有那一格**
+  // 多了第三个孩子（提示语）：格子变高，底对齐就把它的 select 往上推。
+  // 所以判据不是「有没有提示语」，而是**每格的孩子数与形状必须一致**：标题 / 控件 / 提示槽。
+  // 提示槽恒定存在（没话也说空串），四格才永远等高，提示出现/消失时版面也不跳。
+  {
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { scout: { preset: 'ptc', batch: false }, builder: { preset: 'standard' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }, { id: 'standard', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'bbb:2', diagnostics: [] },
+    });
+    const ctl = findAll(page.tree(), (node) => node.type === 'div' && node.props.className === 'dat-bulk-ctl')[0];
+
+    check('统一选择：四格都是「标题 + 控件 + 提示槽」三件套（等高骨架，谁也不会被顶上去）', () => {
+      if (ctl === undefined) return '找不到 dat-bulk-ctl';
+      const cells = (ctl.props.children || []).filter((node) => node.type === 'label' && node.props.className === 'dat-field');
+      if (cells.length !== 4) return '统一块里应有 4 格，实得 ' + cells.length;
+      const bad = [];
+      for (const cell of cells) {
+        const kids = (cell.props.children || []);
+        const head = kids[0];
+        const slot = kids[kids.length - 1];
+        const title = head === undefined || head.props === undefined ? '' : textOf(head);
+        if (kids.length !== 3) { bad.push(title + '（' + kids.length + ' 个孩子）'); continue; }
+        if (head.props.className !== 'dat-label') bad.push(title + '（第一个孩子不是 dat-label）');
+        else if (slot === undefined || slot.props === undefined || slot.props.className !== 'dat-hintslot') bad.push(title + '（末尾没有恒定的 dat-hintslot）');
+      }
+      if (bad.length > 0) return '这些格不符合三件套：' + bad.join(' | ');
+      return true;
+    });
+
+    check('提示槽恒定占位：没话的格是空串（不是 null），有话的格把原因写在自己槽里', () => {
+      const cells = (ctl.props.children || []).filter((node) => node.type === 'label' && node.props.className === 'dat-field');
+      const slotTextOf = (wantLabel) => {
+        for (const cell of cells) {
+          const kids = cell.props.children || [];
+          if (kids.length === 0 || kids[0].props === undefined || textOf(kids[0]) !== wantLabel) continue;
+          const slot = kids[kids.length - 1];
+          if (slot === undefined || slot.props === undefined || slot.props.className !== 'dat-hintslot') return '(那格没有提示槽)';
+          return textOf(slot);
+        }
+        return '(找不到那一格)';
+      };
+      // 这份配置：预设三行不一致（ptc / standard / 空）、批量也不一致（scout 关着），模型与强度一致或没得说。
+      const problems = [];
+      if (slotTextOf('模型（应用到全部角色）') !== '') problems.push('模型格本该是空槽');
+      if (slotTextOf('思考强度（应用到全部角色）') !== '') problems.push('强度格本该是空槽（长原因由下面的 dat-note 承担）');
+      if (!slotTextOf('agent 预设（应用到全部角色）').includes('不一致')) problems.push('预设格的不一致原因没写进自己槽里：' + slotTextOf('agent 预设（应用到全部角色）'));
+      if (!slotTextOf('批量调用（应用到全部角色）').includes('不一致')) problems.push('批量格的不一致原因没写进自己槽里：' + slotTextOf('批量调用（应用到全部角色）'));
+      return problems.length === 0 ? true : problems.join(' | ');
+    });
+  }
+
+  {
+    // 上面那份配置里**每一格都有话要说**（预设/批量都不一致），所以「有提示时是三个孩子」
+    // 那种断言抓不到真正的病：**没话要说时**把提示槽写成 null，格子就矮一截，底对齐的
+    // 老 CSS 会把旁边整排顶歪。第一版闸门就是这个空转的（变异「presetHint 为空时不渲染槽」
+    // 完全没红），这里补一份「全一致」的配置专门盯空槽。
+    const page = await mount({
+      get: {
+        ok: true,
+        config: { version: 1, roles: { researcher: { preset: 'ptc' }, scout: { preset: 'ptc' }, builder: { preset: 'ptc' } } },
+        roles: ROLES,
+        revision: 'aaa:1',
+        diagnostics: [],
+        agentPresets: { presets: [{ id: 'ptc', name: '', available: true, reason: '', detail: '' }], notes: [] },
+      },
+      'list-models': { ok: true, groups: [{ id: 'p1', name: 'P1', models: [{ id: 'm1', name: 'M1' }] }], failures: [] },
+      set: { ok: true, config: { version: 1, roles: {} }, revision: 'bbb:2', diagnostics: [] },
+    });
+
+    check('四格全一致时（没话要说）提示槽仍然必须存在且为空串 —— 不许写成 null', () => {
+      const ctl = findAll(page.tree(), (node) => node.type === 'div' && node.props.className === 'dat-bulk-ctl')[0];
+      if (ctl === undefined) return '找不到 dat-bulk-ctl';
+      const cells = (ctl.props.children || []).filter((node) => node.type === 'label' && node.props.className === 'dat-field');
+      if (cells.length !== 4) return '应有 4 格，实得 ' + cells.length;
+      const bad = [];
+      for (const cell of cells) {
+        const kids = cell.props.children || [];
+        const title = kids.length === 0 || kids[0].props === undefined ? '(无标题)' : textOf(kids[0]);
+        const slot = kids.length === 0 ? undefined : kids[kids.length - 1];
+        if (kids.length !== 3) { bad.push(title + '（' + kids.length + ' 个孩子：没话时槽被省掉了）'); continue; }
+        if (slot === undefined || slot.props === undefined || slot.props.className !== 'dat-hintslot') { bad.push(title + '（末尾不是 dat-hintslot）'); continue; }
+        if (textOf(slot) !== '') bad.push(title + '（本该空槽，实得 ' + textOf(slot) + '）');
+      }
+      return bad.length === 0 ? true : '这些格在「没话要说」时破坏了等高骨架：' + bad.join(' | ');
+    });
+  }
+
   // ── 7) 加载失败路径 ───────────────────────────────────────────────────────
   {
     const page = await mount({
