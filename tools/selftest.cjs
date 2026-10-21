@@ -3125,6 +3125,36 @@ function functionBodyOf(source, needle) {
       '批量档关着那一支也要有同一句（两边必须对称）');
   });
 
+  await check('工具行标签：本机工具面里的工具都必须有官方同类词，不许退成泛泛的「工具调用」（2026-10-21 真机）', () => {
+    // 真机证据（session-0000100d 的 builder-git）：18 条工具行里 **12 条**显示「工具调用」，
+    // 而它真实调用是 ops_bash×8 / ops_glob×2 / ops_grep×1 / team_task_get×1 ——
+    // 全部只是**别名表没登记**。用户 2026-10-09 的原话是「和我用官方的对话框没太大区别」，
+    // 67% 的行退成泛泛词显然不算。
+    //
+    // 判据两层：
+    //   ① 本机工具面里会出现在对话里的那些名字，逐个查表，**必须**命中非 generic 的官方词；
+    //   ② 别名表里出现的每个目标键，都必须在官方表里真实存在（不许把自造词写进别名）。
+    const graph = require(path.join(__dirname, '..', 'lib', 'graph.js'));
+    const table = graph.toolLabelTable();
+    const generic = table.generic;
+    // 这些是队员/Lead 在真实会话里真的会调用、且会渲染成工具行的工具名。
+    const MUST_HAVE_LABEL = [
+      // dsh-ops 四件套 + 后台/批量族（本次会话用了 213 次 ops_bash）
+      'ops_bash', 'ops_grep', 'ops_glob', 'ops_inspect_local_file', 'ops_replace',
+      'ops_edit_file', 'ops_write_file', 'ops_stat', 'ops_diff', 'ops_copy', 'ops_move', 'ops_remove',
+      'ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill', 'ops_batch', 'ops_result',
+      // 团队工具（create/list/update 本来就有，get 是唯一漏的）
+      'team_task_create', 'team_task_list', 'team_task_get', 'team_task_update',
+      // 本机工具面里的其它常客
+      'present', 'skill', 'diagram_read', 'diagram_apply', 'todo_write',
+      // 宿主自带（回归对照：这些早就有）
+      'read', 'edit', 'write', 'pwsh', 'web_search', 'web_fetch', 'subagent',
+    ];
+    const missing = MUST_HAVE_LABEL.filter((name) => graph.toolRowLabel(name) === generic);
+    assert.deepEqual(missing, [],
+      '这些工具会渲染成泛泛的「' + generic + '」（别名表没登记）：' + JSON.stringify(missing));
+  });
+
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
     // 用户 2026-10-09：「一定要正确，和我用官方的对话框没太大区别」。
     // 官方真值来自 dsh-client-ui-conversation/lib/client.js 的 locale 块，
