@@ -2754,10 +2754,13 @@ function functionBodyOf(source, needle) {
     const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
     assert.ok(runtimeSrc.includes('linkOpsForMember(ctx, scoped, agent, notes, disposers, purePtc)'),
       'installMember 必须给每名队员接 ops 链接**并传实测呈现档**（Lead 不接：那是用户主会话，ops 自己全局可见）');
-    assert.ok(/const purePtc = !batchDeclared && resolveRolePreset\(peekConfig\(\), role\) === 'ptc';/.test(runtimeSrc),
-      'purePtc 必须由「本层没声明成 both」+「该角色预设是 ptc」两件事共同决定（不能只看预设：both 会压住 ptc 档）');
-    assert.ok(/const batchDeclared = applyMemberBatch\(ctx, agent, role, notes, disposers\) === true;/.test(runtimeSrc),
-      'applyMemberBatch 的返回值必须被接住（both 是否真声明成功是 purePtc 的前提）');
+    // 2026-10-21：判据从「布尔反推」改成「实际档名」—— 旧式在新语义下两个方向都算反
+    // （batch=true 实际 ptc 却给 false；batch=false 实际 native 却给 true）。
+    assert.ok(/const purePtc = declaredMode === 'ptc';/.test(runtimeSrc),
+      "purePtc 必须等于「实际声明的档 === 'ptc'」（不许从布尔反推）");
+    // 2026-10-21：接住的不是布尔了，是**实际声明的档名**（见 purePtc 那条回归）。
+    assert.ok(/const declaredMode = applyMemberBatch\(ctx, agent, role, notes, disposers\);/.test(runtimeSrc),
+      'applyMemberBatch 的返回值（实际档名）必须被接住 —— purePtc 的唯一真值来源');
     // 2026-10-16 真机 P0（researcher-ops 白跑一轮 + 每步翻转）：预设 ptc + 关批量的队员，
     // 必须在**自己那层同步** presentAs('ptc')。只靠异步预设重绑会带来两个后果：第一次请求跑在
     // 继承来的 native 组合上；而且实测不是「晚一次」而是**每步翻转**（native→ptc→native→ptc）。
@@ -2773,11 +2776,24 @@ function functionBodyOf(source, needle) {
       'declareMemberMode 必须只在非 native 档探 ptcRuntime（native 装配根本不碰它），然后再 presentAs');
     // 关掉批量 = 明确钉 native（2026-10-21 第二次修正：不再是「沿用预设」。
     // 交付态里 12 个角色全是 preset ptc，沿用预设会让开关两端都是 ptc = 拨了没反应）。
-    assert.ok(/declareMemberMode\(ctx, agent, 'native', who, notes, disposers\);/.test(runtimeSrc),
+    // 2026-10-21：返回值改成档名后，这一句变成 `const declared = declareMemberMode(…'native'…) === true;`，
+    // 断言跟着放宽到「必须调用 declareMemberMode 且传 native」。
+    assert.ok(/declareMemberMode\(ctx, agent, 'native', who, notes, disposers\)/.test(runtimeSrc),
       'applyMemberBatch 关掉批量的那一支必须**明确声明 native**（否则开关拨到「关」与「开」没有可观测差异）');
     const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
-    assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes('return true;'),
-      'applyMemberBatch 的 both 成功路径必须 return true（purePtc 判据依赖这个返回值）');
+    assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes("return 'both';"),
+      "applyMemberBatch 的 both 成功路径必须返回 'both'（不是布尔）—— purePtc 判据依赖它");
+    // 2026-10-21 回归（本轮真机体检抓到）：purePtc 原来写成 `!batchDeclared && preset==='ptc'`，
+    // 而语义改成「开=ptc / 关=native」之后这个式子**两个方向都算反**：
+    //   batch=true  -> 实际 ptc  -> 旧式给 false（该 true）；
+    //   batch=false -> 实际 native -> 旧式给 true（该 false）。
+    // 后果是 ops 的告警判据反向：该报的不报、不该报的乱报。
+    // 现在唯一的真值来源是 applyMemberBatch **返回的实际档**。
+    assert.ok(/const purePtc = declaredMode === 'ptc';/.test(runtimeSrc),
+      "purePtc 必须由 applyMemberBatch 返回的实际档决定（declaredMode === 'ptc'）");
+    // 负向只盯 **purePtc 那一行**：别处出现 !batchDeclared 与本判据无关。
+    assert.ok(!/const purePtc = !batchDeclared/.test(runtimeSrc),
+      '又用布尔反推 purePtc 了 —— 新语义下它是反的');
 
     // ②c 队员 model 显示链路（2026-10-16 session-3c654f6e P1 的形状闸门）：
     //     runtime 必须在**真的把覆盖写进请求对象之后**才记账（记早了会把「解析出但没采用」的写进去），
