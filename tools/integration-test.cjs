@@ -661,7 +661,7 @@ async function main() {
   // 复现 2026-09-28 用户截到的「宿主诊断（配置文件可能有问题）」假警报：
   //   ① 信息性记录（DSH 主目录 / 配置文件）与真故障共用一条通道，页面在**一切正常**时
   //      也渲染成红色告警；
-  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:509）与
+  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:520）与
   //      `writeStatusFile()`（同文件 :625 调用 → :672 定义，内部 :692 `getConfigPath`）都是 fire-and-forget，
   //      而旧实现把「已算过」的检查放在 `await settings.prepareDocument()` **之前**、
   //      赋值放在 await **之后**，于是第二个调用者从同一个窗口挤进来又算了一遍。
@@ -1869,6 +1869,20 @@ async function main() {
       if (!/schema\(\{ mode \}\)/.test(body)) return '探测没有把候选值喂给 Config schema（判据失效）';
       if (!/constructor\?\.Config/.test(body)) return '没有从构造函数取 Config（实例上没有这个字段）';
       if (!/return undefined;/.test(body)) return '取不到 schema 时必须返回 undefined（不知道），不能当成不支持';
+      return true;
+    });
+    // 2026-10-21 真机体检：detailOf 的失败分支只给 note、不给 error，而所有消费方都读 error
+    // （前端 client.js:5745 与 5778 都是 `result.error ?? ''`），于是展开层显示成「详情读取失败：」空提示。
+    // 路由层必须把 note 兜成 error —— 判据：ok:false 且没有 error 是**不允许**的形状。
+    check('team-detail 的失败回包必须带 error（note 兜底）—— 否则前端显示空错误', () => {
+      const routeSrc = realFs.readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+      const at = routeSrc.indexOf("case 'team-detail': {");
+      if (at < 0) return '找不到 team-detail 路由分支';
+      const body = routeSrc.slice(at, at + 1400);
+      if (!/error: String\(result\.note/.test(body)) {
+        return 'team-detail 路由没有把 note 兜成 error —— 失败时前端会显示「详情读取失败：」后面空白';
+      }
+      if (!/result\.ok !== true/.test(body)) return '兜底没有以 ok !== true 为前提（成功回包不许被改写）';
       return true;
     });
     // 检测层必须如实报告"PTC 组件挂着但本作用域拿不到批量工具"，并给出**本插件**的修法。
