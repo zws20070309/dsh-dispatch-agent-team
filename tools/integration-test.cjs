@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:472-482），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:705），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -419,6 +419,47 @@ async function main() {
       if (root.get('tools').get('skill', key) !== skillTool) return `${label} 看不到 skill 工具（被收窄摘掉了？）`;
     }
     return true;
+  });
+
+  // ── 6.1) own 层工具也要拦得住（2026-10-17 真机 P1：subagent 摘不掉、还漏进了模型清单）────
+  // 官方事实（从 0.2.0-rc.2 的 app.asar 实读）：
+  //   * restrict 只遮**继承面** —— dsh-tools/lib/index.js:2891「scope-local names … fail」的注释原话，
+  //     实现见 :2970-2978：先按继承面建 restrictableNames 与 visible，own 层只往 visible 里塞、永不受限；
+  //   * 而 dsh-tool-subagent 恰恰把 subagent 注册进**每个 agent 自己的层**
+  //     （dsh-tool-subagent/lib/index.js:648-659 的 installScoped + ctx.on('agent/created')）。
+  // 真机后果：本机 299 个队员会话里 **21 个**的工具清单里出现被 deny 的名字（7 个是重绑后又被装回来，
+  // 14 个从头就带着），而且它会跟着整段工具文档进 system，重排提示词。
+  // 唯一能按 agent 生效、又拦得住 own 层的官方口子是 tools.guard
+  // （dsh-tools/lib/index.js:2911-2926 注释 + :2928-2936 的 guardReason 在**执行前**统一判定）。
+  check('注册在队员 own 层的工具也要被拦住（restrict 管不到 own 层，guard 兜底）', () => {
+    const own = scoutScope.ctx.get('tools');
+    if (typeof own.guard !== 'function') return '本版 dsh-tools 没有 tools.guard，无法验证兜底路径';
+    // 夹具：把 subagent 注册进队员**自己的层**，复刻官方 dsh-tool-subagent 的做法。
+    const disposer = own.register(syntheticTool('subagent'));
+    if (typeof disposer !== 'function') return '夹具注册失败';
+    try {
+      // 先确认「restrict 真的管不到 own 层」这条官方语义还成立（否则本用例的前提变了）。
+      // 必须先记下 disposer 再判定：restrict 挂的是**永久生效**的作用域过滤器，
+      // 不复位就会把 scout 后面的用例全污染（2026-10-17 实测：那条 'disable 后队员的工具目录退回
+      // preset 面' 就是被这里漏掉的 deny 打红的，与本用例无关）。
+      let restrictThrew = false;
+      let restrictDisposer;
+      try { restrictDisposer = own.restrict({ deny: ['subagent'] }); } catch { restrictThrew = true; }
+      try { if (typeof restrictDisposer === 'function') restrictDisposer(); } catch { /* 回卷失败不影响判定 */ }
+      const stillVisible = root.get('tools').view(KEY.scout).visible.has('subagent');
+      if (restrictThrew && !stillVisible) return '夹具自检不成立：restrict 这次真的摘掉了 own 层工具，说明官方语义变了，本用例要重写';
+      if (!stillVisible) return 'own 层的 subagent 没进 visible —— 夹具没生效，断言无意义';
+      // 真正的断言：这一版的队员身上必须有拦截守卫，且它认得出 subagent。
+      // guardReason 的 agent 参数是**作用域 key**（dsh-tools/lib/index.js:2932 直接把它喂给
+      // chainLayers(exec.agent)），不是 agent 对象 —— 传对象会静默变成 undefined（台架实测）。
+      const reason = root.get('tools').guardReason({ name: 'subagent', agent: KEY.scout });
+      if (typeof reason !== 'string' || !reason.includes('subagent')) {
+        return 'own 层的 subagent 没有被守卫拦住（guardReason=' + String(reason) + '）：队员能调用一个策略上不给它的工具';
+      }
+      return true;
+    } finally {
+      disposer();
+    }
   });
 
   const runPreStep = async (agent) => {
@@ -516,10 +557,11 @@ async function main() {
     });
 
     check('系统提示词前缀规模在预算内（这段前缀每次请求都要付钱）', () => {
-      // 上限与 selftest 的预算表同步（2026-10-09 上调：新增 PTC 借鉴纪律 + 修回误删细节）。
+      // 上限与 selftest 的预算表 / INTERFACES §2.1 同步（2026-10-14 上调 5000→5150、1650→1800：
+      // 唯一来源是任务板闭环那条新纪律，依据与「先删再加」的记账见 INTERFACES §2.1 注记）。
       // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
-      if (ownLead > 5000) return `Lead 侧自有段落 ${ownLead} 字符 > 5000`;
-      if (ownMate > 1650) return `队员侧自有段落 ${ownMate} 字符 > 1650`;
+      if (ownLead > 5150) return `Lead 侧自有段落 ${ownLead} 字符 > 5150`;
+      if (ownMate > 1800) return `队员侧自有段落 ${ownMate} 字符 > 1800`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
       if (scoutPrompt.length < playbook.TEAMMATE_CARD.length) return '渲染结果比队员卡还短（卡没注册上？）';
@@ -619,8 +661,8 @@ async function main() {
   // 复现 2026-09-28 用户截到的「宿主诊断（配置文件可能有问题）」假警报：
   //   ① 信息性记录（DSH 主目录 / 配置文件）与真故障共用一条通道，页面在**一切正常**时
   //      也渲染成红色告警；
-  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()`（lib/index.js:282）与
-  //      `writeStatusFile()`（lib/index.js:336 → :369 `getConfigPath`）都是 fire-and-forget，
+  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:520）与
+  //      `writeStatusFile()`（同文件 :625 调用 → :672 定义，内部 :692 `getConfigPath`）都是 fire-and-forget，
   //      而旧实现把「已算过」的检查放在 `await settings.prepareDocument()` **之前**、
   //      赋值放在 await **之后**，于是第二个调用者从同一个窗口挤进来又算了一遍。
   // 这里用**全新的模块实例**（带 query 的 URL = 新的 ESM 记录），否则会被上面 §7 已缓存的 state 影响。
@@ -900,6 +942,367 @@ async function main() {
     });
   }
 
+  // ── 7.9) 队员 agent 预设重绑（2026-10-15 用户需求：12 个队员各自可选 PTC / 标准 / 极简灰度）──
+  //
+  // 这一节**不拿替身验证机制**。官方重绑的全部实质就是「把队员作用域的父链接换到另一份
+  // preset 的 standing mount」（registry 的 bind → bindScopeParent(...).rebind），而 dsh-tools
+  // 的 view() 每次调用都重走 scopeChainOf（dsh-scope 的 chainLayers）。所以这里用**真的 dsh-scope**：
+  // 换完之后队员能看见的工具集与继承到的提示词段**真的**变了 —— 这才是本功能成立与否的判据，
+  // 不是「我调了个函数」。
+  const STAND_KEYS = {
+    'dispatch-mode': { name: 'stand-dispatch-mode' },
+    standard: { name: 'stand-standard' },
+    ptc: { name: 'stand-ptc' },
+    'minimal-grayscale': { name: 'stand-minimal-grayscale' },
+  };
+  const stands = new Map();
+  for (const [id, key] of Object.entries(STAND_KEYS)) {
+    const standScope = createScope(root, key);
+    const standTools = standScope.ctx.get('tools');
+    const standPrompt = standScope.ctx.get('systemPrompt');
+    standTools.register(syntheticTool('stand_tool__' + id.split('-').join('_')));
+    // 每份组合都有自己的 persona：persona 是**继承面**贡献，所以「装配出来的提示词里是哪一句
+    // persona」能证明换的是整份组合，不只是工具表。**2026-10-16 起注意**：真的换继承面时
+    // installMember 会在队员自己那层钉一句 persona（遮蔽继承面那句 —— 最近的一层赢），
+    // 因为 persona 排在第一屏，让它翻面就等于把从它往后的整段前缀缓存打掉（不是「整段前缀」——它前面
+  // 那 60 字节身份行仍可复用）。见 §7.9b。
+    standPrompt.section({
+      name: 'deployment:persona-prefix',
+      order: standPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
+      text: 'STAND PERSONA :: ' + id,
+    });
+    stands.set(id, { key, scope: standScope });
+  }
+  /** scopeKey → {binding, id}。官方 registry 的 bindings 就是这个形状（join() 里存 binding）。 */
+  const joins = new Map();
+  const keyOfCtx = (ctx) => scopePkg.scopeOf(ctx);
+  const idOfCtx = (ctx) => {
+    const parent = scopePkg.scopeParentOf(keyOfCtx(ctx));
+    for (const [id, stand] of stands) if (stand.key === parent) return id;
+    return presetIdByScope.get(keyOfCtx(ctx));
+  };
+  const joinOrRebind = (ctx, id) => {
+    const key = keyOfCtx(ctx);
+    const stand = stands.get(id);
+    if (stand === undefined) {
+      const error = new Error('Unknown agent preset: ' + id);
+      error.code = 'agent-preset/not-found';
+      throw error;
+    }
+    const existing = joins.get(key);
+    if (existing === undefined) joins.set(key, { binding: scopePkg.bindScopeParent(key, stand.key), id });
+    else { existing.binding.rebind(stand.key); existing.id = id; }
+    return id;
+  };
+  Object.assign(fakeAgentPresets, {
+    async list() {
+      return [...stands.keys()].map((id) => (id === 'dispatch-mode' ? { id, name: '调度模式' } : { id }));
+    },
+    composedPreset: idOfCtx,
+    composeFrom(childCtx, parentCtx) { return joinOrRebind(childCtx, idOfCtx(parentCtx)); },
+    async mount(ctx, id) { return { id: joinOrRebind(ctx, id) }; },
+    async select(agent, id) {
+      const boundary = root.get('sessionProjections').stateOf(agent.session, 'turnBoundary');
+      if (boundary !== undefined && (boundary.openTurnStartSeq !== null || boundary.lastTurn > 0)) {
+        const error = new Error('This session has already started');
+        error.code = 'agent-preset/locked';
+        throw error;
+      }
+      const bound = joinOrRebind(agent.ctx, id);
+      agent.session.append('agent-preset/selected', { agentPreset: bound });
+      return bound;
+    },
+  });
+  /** 会话投影：官方 agentPreset 投影 = header 起步、被 agent-preset/selected 推进。这里如实复刻。 */
+  const projections = new Map();
+  root.plugin({
+    name: 'fake-session-projections',
+    apply(ctx) {
+      ctx.provide('sessionProjections', {
+        stateOf(session, key) {
+          const row = session === undefined || session === null ? undefined : projections.get(session.id);
+          if (row === undefined) return void 0;
+          if (key === 'agentPreset') return row.agentPreset;
+          if (key === 'turnBoundary') return row.turnBoundary;
+          return void 0;
+        },
+      });
+    },
+  });
+  await tick();
+  const makeStandSession = (id, presetId, started) => {
+    const log = [];
+    projections.set(id, {
+      agentPreset: presetId,
+      turnBoundary: started === true ? { openTurnStartSeq: null, lastTurn: 2 } : void 0,
+    });
+    return {
+      id,
+      header: { id, cwd: tempHome, agentPreset: presetId },
+      log,
+      append(type, data) {
+        log.push({ type, data });
+        if (type === 'agent-preset/selected') projections.get(id).agentPreset = data.agentPreset;
+        return { seq: log.length };
+      },
+    };
+  };
+  const selectedOf = (session) => session.log.filter((row) => row.type === 'agent-preset/selected');
+  /** 派一名队员：作用域**不带父**创建（与生产同形：agent scope 由注册表 join），再复刻 composeFrom。 */
+  const spawnStandMember = (scopeName, sessionId, memberName, lead, inheritId) => {
+    const key = { name: scopeName };
+    const scope = createScope(root, key);
+    const session = makeStandSession(sessionId, inheritId, false);
+    const agent = { id: sessionId, ctx: agentCtx(scope.ctx), options: {}, session };
+    agents.push(agent);
+    membershipById.set(agent.id, { root: lead, id: agent.id, role: 'teammate', name: memberName });
+    joinOrRebind(agent.ctx, inheritId);
+    return { key, agent, session };
+  };
+
+  const standLeadScope = createScope(root, { name: 'stand-lead-scope' });
+  const standLeadSession = makeStandSession('stand-lead', 'dispatch-mode', false);
+  const standLead = { id: 'stand-lead', ctx: agentCtx(standLeadScope.ctx), options: {}, session: standLeadSession };
+  agents.push(standLead);
+  membershipById.set(standLead.id, { root: standLead, id: standLead.id, role: 'lead', name: 'lead' });
+  joinOrRebind(standLead.ctx, 'dispatch-mode');
+  await runtime.enable(root, standLead, { source: 'integration-test' });
+
+  const mateA = spawnStandMember('stand-member-a', 'stand-scout', 'scout', standLead, 'dispatch-mode');
+  const mateB = spawnStandMember('stand-member-b', 'stand-builder', 'builder', standLead, 'dispatch-mode');
+
+  check('现状基线：不配预设的队员继承 Lead 的调度模式（用户截图里那个现象）', () => {
+    if (idOfCtx(mateA.agent.ctx) !== 'dispatch-mode') return '队员 preset 不是 dispatch-mode：' + idOfCtx(mateA.agent.ctx);
+    if (!visibleNames(mateA.key).includes('stand_tool__dispatch_mode')) return '调度模式那份组合的工具没被继承（父子链搭错了）';
+    if (visibleNames(mateA.key).includes('stand_tool__standard')) return '还没换预设就已经看得到标准组合的工具';
+    return true;
+  });
+
+  const notesBefore = runtime.notes().length;
+  await runtime.saveConfig(root, {
+    version: roster.CONFIG_VERSION,
+    roles: { scout: { preset: 'standard' }, tester: { preset: 'ptc' }, verify: { preset: 'minimal-grayscale' } },
+  });
+  root.emit('agent/created', { agent: mateA.agent });
+  await tick();
+  await tick();
+  await tick();
+  const promptA = await promptOf(mateA.key);
+
+  check('角色配了预设：队员作用域真的换到那一份组合（继承面工具跟着变）', () => {
+    const after = visibleNames(mateA.key);
+    if (idOfCtx(mateA.agent.ctx) !== 'standard') return '队员 preset 仍是 ' + idOfCtx(mateA.agent.ctx) + '（重绑没发生）';
+    if (!after.includes('stand_tool__standard')) return '换过去了却看不到标准组合的工具：' + after.join(', ');
+    if (after.includes('stand_tool__dispatch_mode')) return '调度模式组合的工具还看得到（父链接没换掉）';
+    return true;
+  });
+
+  check('换预设的队员：persona 是本层钉住的那一句，继承面两句都不再出现在提示词里', () => {
+    // 这一条同时是「缓存断裂修复」的正例：第一屏文字与「挂哪份组合」解耦了。
+    if (!promptA.includes(roster.MEMBER_PERSONA_PIN)) {
+      return '提示词的第一屏不是钉住的那句（' + roster.MEMBER_PERSONA_PIN + '）：' + promptA.slice(0, 200);
+    }
+    for (const id of ['dispatch-mode', 'standard', 'ptc', 'minimal-grayscale']) {
+      if (promptA.includes('STAND PERSONA :: ' + id)) return '继承面的 persona 还在提示词里（第 ' + id + ' 份）：own 层没赢';
+    }
+    return true;
+  });
+
+  check('钉住只换第一屏那一句：工具表照样真的换了（不许把钉 persona 做成换预设的替代）', () => {
+    const after = visibleNames(mateA.key);
+    if (!after.includes('stand_tool__standard')) return 'persona 钉住了但组合没换：' + after.join(', ');
+    if (after.includes('stand_tool__dispatch_mode')) return '组合没真的换掉：调度模式的工具还在';
+    return true;
+  });
+
+  check('重绑不伤 own 层：团队工具与队员卡仍在（它们注册在队员自己那一层）', () => {
+    const after = visibleNames(mateA.key);
+    for (const name of [roster.REPORT_TOOL_NAME, 'send_message', 'list_agents']) {
+      if (!after.includes(name)) return '重绑后队员丢了自有团队工具 ' + name + '；现在：' + after.join(', ');
+    }
+    if (!promptA.includes(playbook.TEAMMATE_CARD.slice(0, 40))) return '队员卡（own 层段）在重绑后消失了';
+    return true;
+  });
+
+  check('重绑必须落盘：会话日志有 agent-preset/selected，投影被推进（冷读与角标才不撒谎）', () => {
+    const rows = selectedOf(mateA.session);
+    if (rows.length !== 1) return '期望 1 条 agent-preset/selected，实得 ' + rows.length;
+    if (rows[0].data.agentPreset !== 'standard') return '事件里的 preset 不是 standard：' + JSON.stringify(rows[0].data);
+    if (projections.get('stand-scout').agentPreset !== 'standard') return '投影没被推进（官方重建读的是投影，不是 header）';
+    return true;
+  });
+
+  check('没配预设的角色不受影响（builder 仍跟随 Lead），Lead 自己更不会被换', () => {
+    if (idOfCtx(mateB.agent.ctx) !== 'dispatch-mode') return 'builder 队员被换了：' + idOfCtx(mateB.agent.ctx);
+    if (selectedOf(mateB.session).length !== 0) return 'builder 队员竟然被写了预设切换事件';
+    if (idOfCtx(standLead.ctx) !== 'dispatch-mode') return 'Lead 的 preset 被改了：' + idOfCtx(standLead.ctx);
+    return true;
+  });
+
+  // 这条负对照必须**真的走过安装路径**：第一版只 spawn 了 builder 却没 emit agent/created，
+  // 于是它当然没被钉 —— 那是一条空转的门（变异 M32-b「每个队员都钉」当时没能咬住它，
+  // 是变异测试把这件事暴露出来的）。现在先装再读提示词。
+  root.emit('agent/created', { agent: mateB.agent });
+  await tick();
+  await tick();
+  await tick();
+  const promptB = await promptOf(mateB.key);
+  check('没被重绑的队员**不钉** persona：沿用继承面那一句（零行为改动，负对照）', () => {
+    if (promptB.includes(roster.MEMBER_PERSONA_PIN)) return 'builder 没配预设却被钉了 persona（本包不该管的队员被管了）';
+    if (!promptB.includes('STAND PERSONA :: dispatch-mode')) return 'builder 的继承面 persona 没出现：' + promptB.slice(0, 160);
+    return true;
+  });
+
+  // ── 7.9b) persona 翻面的那笔账（2026-10-16 缓存前缀断裂修复的机制证明）───────────
+  //
+  // 真机数字（读 ~/.dsh/sessions 里 143 个插件队员会话的 session.v4.jsonl.zstd）：队员第一次
+  // 请求渲染「跟随 Lead」的 persona，异步重绑落地后第二次换成角色预设那一份 —— persona 是**第一处**
+  // 分叉，最长公共前缀因此只有 60 字节（官方 harness:identity 那一句）。
+  //
+  // **这份夹具的边界（2026-10-17 更正，别把它当整机事实）**：这里只注册了 persona 一个段，所以
+  // 「钉住 → 换父后逐字节相同」在**本夹具内**成立。真机上两版 system 在 persona 之后还差在**工具
+  // 文档段**：实测 0e572d03 两版工具数都是 1，system 却是 68,016 → 75,511 字节，hunk 级差分 17 处；
+  // 把 persona 那一行中性化后逐对实测公共前缀只有 1,442 ~ 3,033 字节。所以钉住 persona 的真实收益是
+  // 「把第一处分叉从第 60 字节抬到第一处工具文档差异」，**不是**整段复用。
+  // 另外：`request/header` 不是每请求一条，而是**装配变化时**才记 —— 083f416b 有 7 次请求（7 条带
+  // usage 的 assistant/message）却只有 2 条 header。夹具里的一条 header 对应一次装配，别拿它当请求数。
+  //
+  // 这里用**真的 dsh-scope + 真的 dsh-system-prompt**把同一件事做到最小：同一条作用域链，换一次父，
+  // 看装配出来的提示词从哪儿开始分叉。
+  const lcpOf = (a, b) => {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a.codePointAt(i) === b.codePointAt(i)) i += 1;
+    return i;
+  };
+  /** ownPersona=false → 复刻缺陷（persona 由继承面给）；true → 走本包的钉法。 */
+  const personaFlipCase = async (ownPersona) => {
+    const caseKey = { name: ownPersona === true ? 'stand-pin-on' : 'stand-pin-off' };
+    const caseScope = createScope(root, caseKey);
+    const caseCtx = agentCtx(caseScope.ctx);
+    if (ownPersona === true) {
+      // 与 lib/runtime.js 的 pinMemberPersona 同一形状：本层、同名、官方那个 order。
+      caseCtx.systemPrompt.section({
+        name: roster.MEMBER_PERSONA_SECTION,
+        order: roster.MEMBER_PERSONA_ORDER,
+        text: roster.MEMBER_PERSONA_PIN,
+      });
+    }
+    joinOrRebind(caseCtx, 'dispatch-mode');
+    const beforeSwap = await promptOf(caseKey);
+    joinOrRebind(caseCtx, 'standard'); // = 真机里「异步重绑落地」那一步
+    const afterSwap = await promptOf(caseKey);
+    return { beforeSwap, afterSwap };
+  };
+  const flipOff = await personaFlipCase(false);
+  const flipOn = await personaFlipCase(true);
+
+  check('不钉住（修复前的形状）：换继承面让第一屏就分叉，公共前缀只剩身份那一句', () => {
+    if (!flipOff.beforeSwap.includes('STAND PERSONA :: dispatch-mode')) return '基线没拿到继承面的 persona';
+    if (!flipOff.afterSwap.includes('STAND PERSONA :: standard')) return '换父后 persona 没跟着换（这份夹具失效了）';
+    // 判据是「分叉发生在**第一屏之内**」，不是「分叉正好落在 persona 开头」：
+    // 两份夹具 persona 共用 "STAND PERSONA :: " 这 17 个字符，所以公共前缀天然会越过
+    // indexOf(persona) —— 第一版把门写成 at > cut，自己咬自己（真机那次红就是这么来的）。
+    const cut = flipOff.beforeSwap.indexOf('STAND PERSONA :: dispatch-mode');
+    if (cut < 0) return '夹具形状变了：找不到 persona 那一段';
+    // 边界取「persona 那段文字的末尾」，不取行尾：这个夹具作用域不是队员（installMember
+    // 没跑过），persona 可能正是装配结果的最后一段，没有行尾可找 —— 第一版就是这么咬到自己的。
+    const personaEnd = cut + 'STAND PERSONA :: dispatch-mode'.length;
+    const at = lcpOf(flipOff.beforeSwap, flipOff.afterSwap);
+    if (at >= personaEnd) return '公共前缀越过了 persona 全文（' + at + ' >= ' + personaEnd + '）：第一屏断裂复现不了，本包的依据要重读';
+    if (at >= flipOff.beforeSwap.length) return '两版提示词竟然完全相同：这份夹具根本没换继承面';
+    if (at < 20) return '公共前缀短得不合理（' + at + '）：连身份段都没对齐，夹具形状变了';
+    return true;
+  });
+
+  check('钉住（本包的修法）：同一份作用域链换父，本夹具内装配结果逐字节相同（夹具只有 persona 段，真机还会在工具文档段分叉）', () => {
+    if (!flipOn.beforeSwap.includes(roster.MEMBER_PERSONA_PIN)) return '本层钉的那句没出现在换父之前：' + flipOn.beforeSwap.slice(0, 160);
+    if (flipOn.beforeSwap !== flipOn.afterSwap) {
+      return '换父后 system 变了（公共前缀 ' + lcpOf(flipOn.beforeSwap, flipOn.afterSwap)
+        + ' / 全长 ' + flipOn.beforeSwap.length + '）：own 层没赢过继承面';
+    }
+    if (flipOn.beforeSwap.includes('STAND PERSONA ::')) return '继承面的 persona 漏进来了（同名段没被遮蔽）';
+    return true;
+  });
+
+  check('钉住的代价是可算的：修复前公共前缀 60 量级，修复后 = 全长', () => {
+    const offAt = lcpOf(flipOff.beforeSwap, flipOff.afterSwap);
+    const onAt = lcpOf(flipOn.beforeSwap, flipOn.afterSwap);
+    if (!(offAt < onAt)) return '修复没有把断裂点往后推：off=' + offAt + ' on=' + onAt;
+    if (onAt !== flipOn.beforeSwap.length) return '钉住后不是整段相同：' + onAt + ' != ' + flipOn.beforeSwap.length;
+    return true;
+  });
+
+  // 已开播的队员（宿主重启后恢复的那一类）：官方 select() 会抛 agent-preset/locked，
+  // 我们**不许**绕过它去改历史会话的记录 —— 只把活体作用域对齐到日志说的那一份。
+  const mateCKey = { name: 'stand-member-c' };
+  const mateCScope = createScope(root, mateCKey);
+  const mateCSession = makeStandSession('stand-tester', 'dispatch-mode', true);
+  const mateC = { id: 'stand-tester', ctx: agentCtx(mateCScope.ctx), options: {}, session: mateCSession };
+  agents.push(mateC);
+  membershipById.set(mateC.id, { root: standLead, id: mateC.id, role: 'teammate', name: 'tester' });
+  joinOrRebind(mateC.ctx, 'dispatch-mode');
+  root.emit('agent/created', { agent: mateC });
+  await tick();
+  await tick();
+  await tick();
+
+  check('已开播的队员不许被改：官方锁定就保持原样，并记下原因（下次派活才生效）', () => {
+    if (idOfCtx(mateC.ctx) !== 'dispatch-mode') return '已开播的队员被强行换到 ' + idOfCtx(mateC.ctx) + '（绕过官方 locked 闸门）';
+    if (selectedOf(mateCSession).length !== 0) return '给已开播的会话补写了 agent-preset/selected（历史被改写）';
+    const tail = runtime.notes().slice(notesBefore).join(' | ');
+    if (!/stand-tester/.test(tail) || !/ptc/.test(tail)) return '没有一条说明「哪个队员、哪个预设、为什么没生效」的记录：' + tail.slice(-260);
+    return true;
+  });
+
+  const promptC = await promptOf(mateCKey);
+  check('官方锁住（换不成继承面）的队员也不钉：钉了就是凭空多造一次翻面', () => {
+    if (promptC.includes(roster.MEMBER_PERSONA_PIN)) {
+      return '已开播、重绑必然失败的队员被钉了 persona（memberSessionStarted 那道预判没生效）：' + promptC.slice(0, 160);
+    }
+    if (!promptC.includes('STAND PERSONA :: dispatch-mode')) return '锁住的队员连继承面 persona 都没了（作用域形状变了）';
+    return true;
+  });
+
+  // 注册表里没有这一份组合（换台机器、或用户卸了这个预设）：报一条诊断，队员退回跟随 Lead。
+  // 负例：注册表里没有这一份组合（换台机器、或用户把它卸了）。
+  // 注意**必须还原**：stands 这张表是共享的 fake 注册表，后面的路由层断言还要读它
+  // （第一版没还原，直接把后面那条 get 闸门弄成假失败 —— 测试之间的状态泄漏）。
+  const removedStand = stands.get('minimal-grayscale');
+  stands.delete('minimal-grayscale');
+  const mateDKey = { name: 'stand-member-d' };
+  const mateDScope = createScope(root, mateDKey);
+  const mateDSession = makeStandSession('stand-verify', 'dispatch-mode', false);
+  const mateD = { id: 'stand-verify', ctx: agentCtx(mateDScope.ctx), options: {}, session: mateDSession };
+  agents.push(mateD);
+  membershipById.set(mateD.id, { root: standLead, id: mateD.id, role: 'teammate', name: 'verify' });
+  joinOrRebind(mateD.ctx, 'dispatch-mode');
+  root.emit('agent/created', { agent: mateD });
+  await tick();
+  await tick();
+  await tick();
+
+  check('预设不在注册表里时不炸：记一条能照着办的诊断，队员保持跟随 Lead', () => {
+    if (idOfCtx(mateD.ctx) !== 'dispatch-mode') return '拿不到预设却被换到了 ' + idOfCtx(mateD.ctx);
+    if (selectedOf(mateDSession).length !== 0) return '重绑失败还给会话写了切换事件';
+    const tail = runtime.notes().slice(notesBefore).join(' | ');
+    if (!/stand-verify/.test(tail) || !/minimal-grayscale/.test(tail)) return '诊断里点不出「哪个队员、哪个预设」：' + tail.slice(-260);
+    return true;
+  });
+
+  const promptD = await promptOf(mateDKey);
+  check('注册表里没这一份组合：钉住照旧生效（这一种失败预判不了），队员只是没换成组合', () => {
+    // 设计上的不对称，写清楚：「会话已开播」能同步预判（官方那道闸的判据我们镜像了），
+    // 「这个 id 本机没装」只能等 select() 抛出来 —— 而钉必须在 await 之前才赶得上第一次装配。
+    // 少钉的代价是这名队员整段前缀重算，多钉的代价只是第一屏那一句身份文字，所以选多钉。
+    if (!promptD.includes(roster.MEMBER_PERSONA_PIN)) return '拿不到组合的队员连钉住都没生效：' + promptD.slice(0, 160);
+    if (promptD.includes('STAND PERSONA ::')) return '钉住没盖住继承面的 persona（own 层没赢）';
+    return true;
+  });
+
+  // 还原 stand：负例只在这一个检查点里要求它缺席。
+  if (removedStand !== undefined) stands.set('minimal-grayscale', removedStand);
+
   /** 造一个最小的 req/res，然后走真实路由 handler。 */
   async function callApi(method, headers, payload) {
     const req = new EventEmitter();
@@ -947,13 +1350,21 @@ async function main() {
       && (/^(DSH 主目录|配置文件)[:：]/u.test(line) || line.startsWith('团队已')));
     if (leaked.length > 0) return `正常事实漏进故障通道：${leaked.join(' | ')}`;
     const hostNotes = got.payload.notes;
-    if (!Array.isArray(hostNotes) || hostNotes.length === 0) return `notes 为空：${JSON.stringify(hostNotes)}`;
-    if (!hostNotes.some((line) => typeof line === 'string' && line.startsWith('配置文件：'))) {
-      return `notes 里没有配置文件路径：${hostNotes.join(' | ')}`;
-    }
-    if (!hostNotes.some((line) => typeof line === 'string' && line.startsWith('团队已开启'))) {
-      return `notes 里没有「团队已开启」这条回执：${hostNotes.join(' | ')}`;
-    }
+    if (!Array.isArray(hostNotes) || hostNotes.length === 0) return 'notes 为空：' + JSON.stringify(hostNotes);
+    // 回执断言的形状必须是「在，或者环已满」：runtime 的 push() 是只留最后
+    // DIAGNOSTIC_CAP 条的环形缓冲。本轮测试装了 4 名队员，最早的「配置文件：」
+    // 「团队已开启」两条被挤出去是设计行为。写成「一定在」的话，谁多派一名队员
+    // 这条门就假红（2026-10-16 加 persona 负对照时就是这么红的 —— 那次红的是门，不是代码）。
+    const receipt = (prefix) => {
+      if (hostNotes.some((line) => typeof line === 'string' && line.startsWith(prefix))) return '';
+      if (hostNotes.length === runtime.DIAGNOSTIC_CAP) return '';
+      return 'notes 里没有「' + prefix + '」这条回执，而环又没满（' + hostNotes.length
+        + ' < ' + runtime.DIAGNOSTIC_CAP + '）= 它根本没被记过：' + hostNotes.join(' | ').slice(0, 300);
+    };
+    const missConfig = receipt('配置文件：');
+    if (missConfig !== '') return missConfig;
+    const missTeam = receipt('团队已开启');
+    if (missTeam !== '') return missTeam;
     return true;
   });
 
@@ -1006,6 +1417,699 @@ async function main() {
     if (Object.keys(reset.payload.config.roles).length !== 0) return JSON.stringify(reset.payload.config);
     return true;
   });
+
+  // ── 7.10) 批量调用档（both）：2026-10-15 用户选路径 1 —— 在队员**自己的作用域**声明 presentAs
+  //
+  // 为什么这一节必须用**真 dsh-tools**：「ptc 把送给模型的工具裁成一个 run_code」这件事只有
+  // 官方那份 wireSchemas 能证明（dsh-tools/lib/index.js:2831-2848），而「自己那一层压得住
+  // 预设那一层」也只有官方 modeFor + 真 ScopedLayers 能证明（:2767-2774 + dsh-scope:155-169）。
+  // 上面 §7.9 的 fake 注册表只管组合继承，管不到呈现档。
+  {
+    check('守卫先跑对：没有 ptcRuntime 时安装路径不开这一档，并留下一条点名的诊断', () => {
+      const lines = runtime.notes().join('\n');
+      // 2026-10-21：文案随语义调整（不再说 both），判据跟着改成「已开但未生效」。
+      if (!lines.includes('批量调用已开但未生效')) return '安装路径没记「批量调用已开但未生效」这条诊断（守卫没跑？）';
+      if (!lines.includes('ptcRuntime')) return '诊断没点名 ptcRuntime，用户照着改不了：' + lines.slice(-320);
+      return true;
+    });
+
+    // 现在把 PTC 运行时补进部署面（官方 requirePtcRuntime 读的就是这个服务名）。
+    root.plugin({
+      name: 'fake-ptc-runtime',
+      apply(ctx) {
+        ctx.provide('ptcRuntime', {
+          language: 'typescript',
+          resolve: (spec) => spec,
+          run: async () => ({ output: '', diagnostics: [] }),
+        });
+      },
+    });
+    await tick();
+    if (root.get('ptcRuntime') === undefined) {
+      console.error('[integration-test] 假 ptcRuntime 没起来：ctx.provide 的语义或 root.plugin 的时机变了。');
+      process.exit(2);
+    }
+
+    const wireOf = (scopeKey) => root.get('tools').wireSchemas(scopeKey);
+
+    // 纯 ptc 的对照组合：一份 preset 作用域声明 ptc，一名队员挂在它下面。
+    const ptcStandKey = { name: 'stand-ptc-presentation' };
+    const ptcStandScope = createScope(root, ptcStandKey);
+    ptcStandScope.ctx.get('tools').register(syntheticTool('stand_native_tool'));
+    ptcStandScope.ctx.get('tools').presentAs('ptc');
+    const mateFKey = { name: 'stand-member-f' };
+    const mateFScope = createScope(root, mateFKey, { parent: ptcStandKey });
+    mateFScope.ctx.get('tools').register(syntheticTool('mate_own_tool'));
+
+    check('对照基线：纯 ptc 档送给模型的工具真的只剩 run_code（用户截图「移除 35 个」那一行）', () => {
+      const names = wireOf(mateFKey).knownNames;
+      if (names.length !== 1 || names[0] !== 'run_code') return 'ptc 档没把工具裁成一个：' + names.join(', ');
+      return true;
+    });
+
+    check('在队员自己那一层声明 both：原生工具全部回来，run_code 也留着', () => {
+      mateFScope.ctx.get('tools').presentAs('both');
+      const names = wireOf(mateFKey).knownNames;
+      if (!names.includes('run_code')) return 'both 档丢了 run_code（批量能力就没了）：' + names.join(', ');
+      if (!names.includes('stand_native_tool')) return 'both 档没把继承面的工具放回来：' + names.join(', ');
+      if (!names.includes('mate_own_tool')) return 'both 档丢了队员自有工具：' + names.join(', ');
+      return true;
+    });
+
+    // 本文件的 check **不等 Promise**（与 selftest 不同）：要 await 的东西一律在外面先取好。
+    const bothPrompt = await promptOf(mateFKey);
+    const ptcPrompt = await promptOf(ptcStandKey);
+
+    check('both 档不再教模型「只能直接调 run_code」（PTC_ONLY 段只属于 ptc 档）', () => {
+      // 官方那句的原文在 dsh-tools/lib/index.js:2517：'run_code is the only tool you can call directly …'。
+      // 判据取它**独有**的片段；别拿报错文案里的 'callable directly' 当钥匙（第一版就是这么写错的，
+      // 症状是「正向断言假通过 + 负对照报空转」）。
+      const PTC_ONLY = 'is the only tool you can call directly';
+      if (bothPrompt.includes(PTC_ONLY)) return 'both 档的提示词里出现了 ptc-only 那句：模型会被它误导';
+      if (!ptcPrompt.includes(PTC_ONLY)) return '负对照不成立：ptc 档里也没有那句，本条断言是空转的';
+      return true;
+    });
+
+    check('both 档仍然拿到 SDK 段（程序内 tools.x() 的说明书，批量能力靠它）', () => {
+      if (!bothPrompt.includes('mate_own_tool') && !bothPrompt.includes('run_code')) {
+        return 'both 档的提示词里没有 SDK/工具声明：' + bothPrompt.slice(0, 200);
+      }
+      return true;
+    });
+
+    // 真安装路径：装了 ptcRuntime 之后，agent/created 上的 applyMemberBatch 必须自己把这一档声明上。
+    const mateEKey = { name: 'stand-member-e' };
+    const mateEScope = createScope(root, mateEKey);
+    const mateESession = makeStandSession('stand-verify-e', 'dispatch-mode', false);
+    const mateE = { id: 'stand-verify-e', ctx: agentCtx(mateEScope.ctx), options: {}, session: mateESession };
+    agents.push(mateE);
+    membershipById.set(mateE.id, { root: standLead, id: mateE.id, role: 'teammate', name: 'verify' });
+    joinOrRebind(mateE.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateE });
+    await tick();
+    await tick();
+    await tick();
+
+    check('真安装路径：默认开的一档让队员的 wire 里同时有 run_code 与团队工具', () => {
+      const names = wireOf(mateEKey).knownNames;
+      if (!names.includes('run_code')) return '安装路径没把 both 档声明上（wire 里没有 run_code）：' + names.join(', ');
+      if (!names.includes(roster.REPORT_TOOL_NAME)) return 'both 档下团队工具 report_result 不见了：' + names.join(', ');
+      return true;
+    });
+
+    // 关掉批量的角色：先落配置、再派队员，最后同步断言（同上，check 不等 Promise）。
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { scout: { preset: 'standard', batch: false } },
+    });
+    const mateGKey = { name: 'stand-member-g' };
+    const mateGScope = createScope(root, mateGKey);
+    const mateGSession = makeStandSession('stand-scout-g', 'dispatch-mode', false);
+    const mateG = { id: 'stand-scout-g', ctx: agentCtx(mateGScope.ctx), options: {}, session: mateGSession };
+    agents.push(mateG);
+    membershipById.set(mateG.id, { root: standLead, id: mateG.id, role: 'teammate', name: 'scout' });
+    joinOrRebind(mateG.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateG });
+    await tick();
+    await tick();
+    await tick();
+
+    // 2026-10-21：关掉的含义变了 —— 不再是「沿用预设」，而是**明确钉 native**。
+    check('角色显式关掉批量：新队员的 wire 里就不该有 run_code（关掉 = 明确钉 native 档）', () => {
+      const names = wireOf(mateGKey).knownNames;
+      if (names.includes('run_code')) return 'batch:false 的角色还是拿到了 run_code（开关没接上）：' + names.join(', ');
+      if (!names.includes(roster.REPORT_TOOL_NAME)) return '关掉批量把团队工具也弄丢了：' + names.join(', ');
+      return true;
+    });
+
+    // 2026-10-16 真机 P0 的回归：预设 ptc + 关批量 = 纯 PTC 档，**第一次装配**就得是纯 PTC 形状。
+    // 上一版这一支什么都不做（"沿用预设自己的档"），档要等异步预设重绑才落地，于是第一次请求
+    // 用继承来的组合跑 —— 真机 researcher-ops 的 seq13 是 76 个工具、无 run_code、无 ops_batch，
+    // 它据此把「通路没通」报给 Lead，白跑一轮再自我更正。这里断言的就是**同步那一刻**。
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { preset: 'ptc', batch: false } },
+    });
+    const mateHKey = { name: 'stand-member-h' };
+    const mateHScope = createScope(root, mateHKey);
+    const mateHSession = makeStandSession('stand-researcher-h', 'dispatch-mode', false);
+    const mateH = { id: 'stand-researcher-h', ctx: agentCtx(mateHScope.ctx), options: {}, session: mateHSession };
+    agents.push(mateH);
+    membershipById.set(mateH.id, { root: standLead, id: mateH.id, role: 'teammate', name: 'researcher' });
+    joinOrRebind(mateH.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateH });
+    // **故意不 await tick()**：要判的就是「agent/created 同步返回之后」那一刻的装配形状。
+    // 2026-10-21 语义：batch:false 现在**明确钉 native**（不再是「沿用预设 ptc」）。
+    // 所以这条断言的期望从「恰好 [run_code]」改成「同步那一刻就已经没有 run_code」——
+     // 判的仍然是同一件事：**同步声明赶上了第一次装配**，不等异步重绑。
+    check('关批量档队员：agent/created 同步返回后第一次装配就已经是 native 形状（没有 run_code，不等异步重绑）', () => {
+      const names = wireOf(mateHKey).knownNames;
+      if (names.includes('run_code')) {
+        return `同步声明没生效，第一次装配里还有 run_code（${names.length} 个）：` + names.slice(0, 12).join(', ');
+      }
+      if (names.length === 0) return '第一次装配是空的';
+      return true;
+    });
+    await tick();
+    await tick();
+    await tick();
+    check('异步重绑落地后仍是 native 档（同步声明与重绑两种机制不打架，档不会被换回 ptc）', () => {
+      const names = wireOf(mateHKey).knownNames;
+      if (names.includes('run_code')) return '重绑之后档被换掉了（又出现 run_code）：' + names.join(', ');
+      return true;
+    });
+    const hNotes = runtime.notes().join('\n');
+    check('这一档的声明在安装记录里留了痕（用户/Lead 能看见队员本次是什么档）', () => {
+      // 2026-10-21：回执分档位写（native 与 ptc 各一句），所以判「本层同步声明」这个共同片段。
+      if (!hNotes.includes('已在本层同步声明')) return '安装记录里没有那条声明回执：' + hNotes.slice(-300);
+      if (!hNotes.includes('原生档已在本层同步声明')) return '回执没说是哪一档（batch:false 应是 native）：' + hNotes.slice(-300);
+      return true;
+    });
+
+    // 这一节改过配置，后面的路由层断言要从干净状态起算。
+    await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
+
+  }
+  // ── 7.11) ops 原生链接（2026-10-15 改版）：真装配事实 × 本包的合法杠杆 ──
+  //
+  // 为什么这一节必须存在：交付要求「有 ops 就把它的四个组件的工具用起来」，而 ops 的 PTC
+  // 组件只服务**纯 PTC 呈现档**（dsh-ops lib/ptc/index.js:16-22 要求装配工具恰好只有 run_code）。
+  // 用户明令**不改 ops 源码**，所以适配只能在本包这一侧：角色预设 ptc + 关掉批量档 = 纯 PTC 档。
+  // 这里做三件事：① 用真台架产出 native / ptc / both 三份真实装配，把原版门的判据来源钉死；
+  // ② 走真安装路径证明那条杠杆确实产出「只有 run_code」的形状（含对照：批量档开着就不是）；
+  // ③ 检测层如实报告缺席并给出本包侧修法（两个负对照：拿得到时不催、PTC 关掉时不催）。
+  {
+    // 下面几段要碰真实文件系统（临时 profile 夹具）与真 profile：用 require 的 fs/os，
+    // 不要用本文件上面那个被测试隔离改写过的 process.env.DSH_HOME。
+    const realFs = require('node:fs');
+    const realOs = require('node:os');
+
+    // ops_* 由第三方插件注册。这里注册进**各自作用域自己的层**而不是全局层：
+    // 全局层一旦多出两个工具，本文件后面的路由/缓存断言就不是原来的面了。
+    const opsNativeKey = { name: 'ops-native-mate' };
+    const opsBothKey = { name: 'ops-both-mate' };
+    const opsPtcKey = { name: 'ops-ptc-mate' };
+    const opsNativeScope = createScope(root, opsNativeKey);
+    const opsBothScope = createScope(root, opsBothKey);
+    const opsPtcScope = createScope(root, opsPtcKey);
+    for (const scope of [opsNativeScope, opsBothScope, opsPtcScope]) {
+      scope.ctx.get('tools').register(syntheticTool('ops_grep'));
+      scope.ctx.get('tools').register(syntheticTool('ops_batch'));
+    }
+    opsBothScope.ctx.get('tools').presentAs('both');
+    opsPtcScope.ctx.get('tools').presentAs('ptc');
+    await tick();
+
+    const asmNative = await root.get('systemPrompt').assemble({ scope: opsNativeKey });
+    const asmBoth = await root.get('systemPrompt').assemble({ scope: opsBothKey });
+    const asmPtc = await root.get('systemPrompt').assemble({ scope: opsPtcKey });
+    const hasTool = (assembly, toolName) => assembly.tools.some((tool) => tool.name === toolName);
+    const sectionState = (assembly, sectionName) => {
+      const hit = assembly.sections.find((section) => section.name === sectionName);
+      if (hit === undefined) return 'absent';
+      return String(hit.text).trim() === '' ? 'empty' : 'non-empty';
+    };
+
+    // 三档装配事实 = 原版 PTC 门读的**同一份**公开判据（dsh-ops lib/ptc/index.js:16-22
+    // 要求装配工具恰好只有 run_code + tools:ptc-only 段非空）。本包不改 ops，
+    // 所以「拿得到 ops_batch/ops_result」这件事只能靠把角色配成纯 PTC 档来达成 ——
+    // 下面这两条先钉住宿主侧的事实，产品侧的杠杆由 §7.11 末尾那两条真安装路径断言负责。
+    check('三档装配事实（原版 PTC 门的判据来源）：ptc 只剩 run_code+非空 PTC_ONLY 段；both 是全部+run_code+SDK 段', () => {
+      if (hasTool(asmNative, 'run_code')) return 'native 档不该有 run_code：' + asmNative.tools.map((tool) => tool.name).join(', ');
+      if (!hasTool(asmNative, 'ops_grep')) return 'native 档看不到自己层里的 ops_grep';
+      if (!hasTool(asmBoth, 'run_code')) return 'both 档没有 run_code：批量能力无从谈起';
+      if (!hasTool(asmBoth, 'ops_grep')) return 'both 档丢了 ops_grep（presentAs(both) 把工具挡掉了？）';
+      if (asmBoth.tools.length < 3) return 'both 档的工具数不像「全部 + run_code」：' + asmBoth.tools.length;
+      if (sectionState(asmBoth, 'tools:sdk') !== 'non-empty') return 'both 档没有非空 tools:sdk 段：' + sectionState(asmBoth, 'tools:sdk');
+      if (sectionState(asmBoth, 'tools:ptc-only') === 'non-empty') return 'both 档出现了非空 PTC_ONLY 段（模型会被教成只能直调 run_code）';
+      if (asmPtc.tools.length !== 1 || !hasTool(asmPtc, 'run_code')) return 'ptc 档没裁成一个 run_code：' + asmPtc.tools.map((tool) => tool.name).join(', ');
+      if (sectionState(asmPtc, 'tools:ptc-only') !== 'non-empty') return 'ptc 档的 PTC_ONLY 段是空的：原版门的另一半判据不成立';
+      return true;
+    });
+    check('ptc 档下 ops_* 仍在 view 里（程序内可调用），只是不进 wire（不送给模型）', () => {
+      const visible = [...root.get('tools').view(opsPtcKey).visible.keys()];
+      if (!visible.includes('ops_grep')) return 'ptc 档的 view 里没有 ops_grep：run_code 程序里调不到它，适配的前提不成立';
+      const wire = root.get('tools').wireSchemas(opsPtcKey).knownNames;
+      if (wire.includes('ops_grep')) return 'ptc 档的 wire 里出现了 ops_grep：与官方裁工具语义不符';
+      return true;
+    });
+
+    // lib/ops-adapter.js 的链接行为：ops 不在场 = 零字节；在场 = 注册逐字节相同的指引段。
+    const adapter = await import(libUrl('ops-adapter.js'));
+    const fakeCtxWith = (rows, toolNames) => ({
+      get: (service) => {
+        // 夹具刻意让 fiber.state **不随 disabled 变化**（真 loader 里 disabled 行的 fiber 是空的，
+        // 但闸门要测的是"我们同时看 disabled 与 phase"这条判据本身 —— 若把 disabled 编码进
+        // phase，"忽略 disabled 只看 phase"的写法就测不出来（第一版正是这样空转的）。
+        if (service === 'loader') return { entries: () => rows.map((row) => ({ options: { id: row.id, name: 'dsh-ops/' + row.component }, disabled: row.disabled, fiber: { state: 2 } })) };
+        if (service === 'tools') return { get: (toolName) => (toolNames.includes(toolName) ? { name: toolName } : undefined) };
+        return undefined;
+      },
+    });
+    const fakeScoped = (sink) => ({ systemPrompt: { section: (spec) => { sink.push(spec); return () => {}; } } });
+    const realProfileDir = process.env.DSH_PROFILE_DIR;
+
+    const emptyProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-noprofile-'));
+    tempDirs.push(emptyProfile);
+    process.env.DSH_PROFILE_DIR = emptyProfile;
+    const absentSink = []; const absentNotes = [];
+    const absentLinked = adapter.linkOpsForMember(
+      fakeCtxWith([{ id: 'dsh-ops-file', component: 'file', disabled: false }], ['ops_grep']),
+      fakeScoped(absentSink), { id: 'a', ctx: {} }, absentNotes, []);
+
+    const presentProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-hasprofile-'));
+    tempDirs.push(presentProfile);
+    realFs.mkdirSync(path.join(presentProfile, 'node_modules', 'dsh-ops'), { recursive: true });
+    realFs.writeFileSync(path.join(presentProfile, 'package.json'), '{"name":"fake-profile"}', 'utf8');
+    realFs.writeFileSync(path.join(presentProfile, 'node_modules', 'dsh-ops', 'package.json'), '{"name":"dsh-ops","version":"9.9.9-test"}', 'utf8');
+    process.env.DSH_PROFILE_DIR = presentProfile;
+    const rowsAll = adapter.OPS_ROWS.map((row, index) => ({ id: row.id, component: row.component, disabled: index === 3 }));
+    const sinkA = []; const sinkB = []; const notesA = []; const notesB = [];
+    const disposersA = []; const disposersB = [];
+    const linkedA = adapter.linkOpsForMember(fakeCtxWith(rowsAll, ['ops_grep', 'ops_batch']), fakeScoped(sinkA), { id: 'm1', ctx: {} }, notesA, disposersA);
+    const linkedB = adapter.linkOpsForMember(fakeCtxWith(rowsAll, ['ops_grep', 'ops_batch']), fakeScoped(sinkB), { id: 'm2', ctx: {} }, notesB, disposersB);
+    // 两份 probe 必须在**恢复 DSH_PROFILE_DIR 之前**算：恢复后 resolveOpsPackage 会读到本机
+    // 真装的 dsh-ops（0.3.0），断言里的 9.9.9-test 就对不上了（第一版就是这么错的）。
+    const probeRows = adapter.detectOpsComponents(fakeCtxWith(rowsAll, ['ops_grep', 'ops_batch']), { id: 'x' });
+    const probeAllOff = adapter.detectOpsComponents(
+      fakeCtxWith(adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: true })), ['ops_grep']), { id: 'x' });
+    if (realProfileDir === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = realProfileDir;
+
+    check('ops 不在场：linkOpsForMember 零注册、零 note（没装 ops 的用户提示词一个字节都不涨）', () => {
+      if (absentLinked !== false) return '没装 dsh-ops 却返回了 true（resolveOpsPackage 的隔离没生效？）';
+      if (absentSink.length !== 0) return '没装 ops 也注册了段：' + absentSink.map((spec) => spec.name).join(', ');
+      if (absentNotes.length !== 0) return '没装 ops 也留了 note：' + absentNotes.join(' / ');
+      return true;
+    });
+
+    check('ops 在场：注册 dispatch:ops-link 段，两名队员的正文逐字节相同（共享前缀纪律）', () => {
+      if (linkedA !== true || linkedB !== true) return 'ops 在场却没链接上';
+      if (sinkA.length !== 1 || sinkA[0].name !== adapter.OPS_LINK_SECTION) return '段名/段数不对：' + JSON.stringify(sinkA.map((spec) => spec.name));
+      if (sinkA[0].text !== sinkB[0].text) return '两名队员的 ops 段正文不同：会把共享前缀切碎，缓存命中率归零';
+      if (sinkA[0].text.indexOf('m1') >= 0 || sinkA[0].text.indexOf('m2') >= 0) return '正文里出现了队员身份（按角色分叉 = 切碎缓存）';
+      if (typeof disposersA[0] !== 'function') return '没拿到 disposer，卸载时回卷不了';
+      if (notesA.join(' ').indexOf('ops 链接') < 0) return '没留 ops 链接的诊断 note：' + notesA.join(' / ');
+      if (notesA.join(' ').indexOf('9.9.9-test') < 0) return 'note 里没带 ops 版本号：' + notesA.join(' / ');
+      return true;
+    });
+
+    check('检测表与装机 ops 的注册面对齐：四组件行名 + 18 个公开工具名 + 无 ops_run', () => {
+      if (adapter.OPS_ROWS.length !== 4) return 'OPS_ROWS 不是四行：' + adapter.OPS_ROWS.map((row) => row.id).join(', ');
+      // 2026-10-21：11 → 18。ops 0.3.2 的 file 组件发布 **11** 个工具
+      // （lib/policy.js:7 的 FILE_TOOLS：inspect_local_file/grep/glob/replace/write_file/edit_file/diff/stat/copy/move/remove），
+      // 而本包原来只列了 0.3.0 时代的前四个 —— 七个真在跑的工具从来没进过能力盘点。
+      // 11(file) + 1(bash) + 4(background，0.3.2 已移除但保留兼容) + 2(ptc) = 18。
+      if (adapter.OPS_FILE_TOOL_NAMES.length !== 11) return 'OPS_FILE_TOOL_NAMES 数量变了（' + adapter.OPS_FILE_TOOL_NAMES.length + '）：与 ops 的 FILE_TOOLS 不再一致';
+      if (adapter.OPS_TOOL_NAMES.length !== 18) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      if (!adapter.OPS_REMOVED_COMPONENTS.includes('background')) return 'OPS_REMOVED_COMPONENTS 必须含 background（0.3.2 已移除该组件）';
+      if (adapter.OPS_TOOL_NAMES.indexOf('ops_run') >= 0) return '名单里出现了 ops_run：0.3.0 任何组合都不发布它（docs/manual-validation.md:17）';
+      const probe = probeRows;
+      if (probe.mounted.length !== 3) return 'disabled 的那一行不该算挂载：' + probe.mounted.join(', ');
+      if (probe.mounted.indexOf('ptc') >= 0) return 'dsh-ops-ptc 被标 disabled 却仍算挂载';
+      if (probe.visibleTools.length !== 2) return '可见 ops_* 采集不对：' + JSON.stringify(probe.visibleTools);
+      if (String(probe.summary).indexOf('9.9.9-test') < 0) return 'summary 没带版本：' + probe.summary;
+      return true;
+    });
+
+    // ops-enable.cjs 的 plan()：四组件启用的唯一真值（drift-check 复用它）。
+    const enable = require('./ops-enable.cjs');
+    const { plan: planEnable, SHELL_OVERRIDE_TEXT } = enable;
+    const sampleProfile = '- id: agent-team\n  config:\n    maxMembers: 48\n\n'
+      + '- id: dsh-ops-shell\n  disabled: true\n\n- id: llm-deepseek\n  name: x\n';
+    const pass1 = planEnable(sampleProfile);
+    const pass2 = planEnable(pass1.text);
+    const passEmpty = planEnable('- id: agent-team\n  config:\n    a: 1\n');
+    // 用**装机的真 dsh-ops 代码**验证迁移标记（P1）：带标记 = updatedConfig 必须原样返回；
+    // 不带标记 = 它必须把 allowSystemShellFallback 翻成 false（这就是陷阱本身，负对照）。
+    let opsMigrate = null;
+    let opsMigrateNote = '';
+    let opsMigrateBroken = false;
+    {
+      // 包根 = resolveOpsPackage() 给的 package.json 的目录（不靠字符串切路径）。
+      const opsPkg = adapter.resolveOpsPackage();
+      if (opsPkg === null) opsMigrateNote = '本机没有已安装的 dsh-ops：跳过迁移标记核对';
+      else {
+        try { opsMigrate = await import(pathToFileURL(path.join(path.dirname(opsPkg.path), 'lib', 'config-updates.js')).href); }
+        catch (error) { opsMigrateNote = '载入 dsh-ops 的 config-updates.js 失败：' + (error && error.message ? error.message : String(error)); opsMigrateBroken = true; }
+      }
+    }
+    if (opsMigrate === null) console.log('  SKIP  装机 dsh-ops 的配置迁移（' + opsMigrateNote + '）');
+    const BG_ROW = { promptPolicy: true, enableShellTools: true, required: false, toolCallTimeoutMs: 300000,
+      allowSystemShellFallback: true, configUpdateVersion: 1 };
+    const BG_UNMARKED = { ...BG_ROW };
+    delete BG_UNMARKED.configUpdateVersion;
+
+    check('真 ops 的 updatedConfig：带 configUpdateVersion 的行必须**逐字节原样**返回（保住 job 工具的门槛）', () => {
+      if (opsMigrateBroken) return opsMigrateNote;
+      if (opsMigrate === null) return true;
+      const after = opsMigrate.updatedConfig(BG_ROW);
+      if (JSON.stringify(after) !== JSON.stringify(BG_ROW)) {
+        return '迁移改写了我们的 background 行：allowSystemShellFallback=' + after.allowSystemShellFallback
+          + '（四个 job 工具的发布门会失效）。修法见 ops-enable.cjs 头部注释。';
+      }
+      return true;
+    });
+
+    check('负对照：不带标记时**真 ops 代码确实会把它翻成 false**（证明上面那条不是空转）', () => {
+      if (opsMigrateBroken) return opsMigrateNote;
+      if (opsMigrate === null) return true;
+      const after = opsMigrate.updatedConfig(BG_UNMARKED);
+      if (after.allowSystemShellFallback !== false) {
+        return '未标记的行没被迁移改写（' + after.allowSystemShellFallback + '）：陷阱已消失，'
+          + '本仓库的标记要求与 drift-check 那条闸门需要重新核对（别留着误导后人）。';
+      }
+      return true;
+    });
+
+    // 「预设 ptc + 关批量档 = 纯 PTC 档，于是原版 ops 给 ops_batch/ops_result」这条**合法杠杆**
+    // （用户明令不改 ops 源码，所以适配只能在本包这一侧）分两半证明，各在能证的地方：
+    //   * 本包负责的那半：batch:false 时**不覆盖成 both**。§7.10 的 mateG（预设 standard + 关批量）
+    //     断言 wire 里没有 run_code = 没被改成 both；下面 matePtc（预设 ptc + 关批量）断言 wire
+    //     恰好只剩 run_code = 纯 PTC 档本来的形状，两种预设下本包都没有强加 both。
+    //   * 官方负责的那半：ptc 预设的作用域 wire 恰好只剩 run_code —— 那是
+    //     dsh-agent-tool-presentation 的行为，本文件的 preset 组合是 mock 的（没有真挂那一行），
+    //     所以**在这里证不了**；端到端证据在 tools/ops-mount-check.mjs（真挂原版 ops 的 PTC
+    //     组件，ptc 档拿到、both 档拿不到，四个独立 Context；A 段还真调一次 ops_batch 证明可调用）。
+    // 这里只钉住台架能证的那半：两种角色配置下，本包对 wire 的影响符合预期。
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { preset: 'ptc', batch: false } },
+    });
+    const matePtcKey = { name: 'stand-member-ptc-only' };
+    const matePtcScope = createScope(root, matePtcKey);
+    const matePtcSession = makeStandSession('stand-researcher-ptc', 'dispatch-mode', false);
+    const matePtcAgent = { id: 'stand-researcher-ptc', ctx: agentCtx(matePtcScope.ctx), options: {}, session: matePtcSession };
+    agents.push(matePtcAgent);
+    membershipById.set(matePtcAgent.id, { root: standLead, id: matePtcAgent.id, role: 'teammate', name: 'researcher' });
+    joinOrRebind(matePtcAgent.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: matePtcAgent });
+    await tick(); await tick(); await tick();
+    const ptcOnlyWire = root.get('tools').wireSchemas(matePtcKey).knownNames;
+
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { preset: 'ptc' } },
+    });
+    const mateBothKey = { name: 'stand-member-ptc-batch' };
+    const mateBothScope = createScope(root, mateBothKey);
+    const mateBothSession = makeStandSession('stand-researcher-both', 'dispatch-mode', false);
+    const mateBothAgent = { id: 'stand-researcher-both', ctx: agentCtx(mateBothScope.ctx), options: {}, session: mateBothSession };
+    agents.push(mateBothAgent);
+    membershipById.set(mateBothAgent.id, { root: standLead, id: mateBothAgent.id, role: 'teammate', name: 'researcher' });
+    joinOrRebind(mateBothAgent.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: mateBothAgent });
+    await tick(); await tick(); await tick();
+    const ptcBatchWire = root.get('tools').wireSchemas(mateBothKey).knownNames;
+    await runtime.saveConfig(root, { version: roster.CONFIG_VERSION, roles: {} });
+
+    // 判据（2026-10-16 改）：这一档的诚实语义是「本包**不**把它声明成 both」，而不是「wire 里没有
+    // run_code」。上一版拿「没有 run_code」当判据，恰好把真机那个 P0 写成了期望 —— 纯 PTC 档的
+    // wire 本来就该只剩 run_code（官方 wireSchemas 的 ptc 支，dsh-tools:2840-2843），
+    // 所以正确断言是：**恰好等于 ['run_code']**，一个不多一个不少；
+    // 团队工具仍在**它自己的层**里（SDK 面可见、在 run_code 程序内可调 —— 真机 researcher-ops
+    // 就是这样成功调用 report_result 的），只是不进送给模型的 schema。
+    // 2026-10-21 语义再改：**关批量 = 明确钉 native**，不再是「沿用预设」。
+    // 原因（真机交付态）：12 个角色全部 preset 'ptc'，沿用预设会让开关两端都是 ptc ——
+    // 拨动开关没有任何可观测差异，与 both 时代那个静默缺陷同类。
+    // 现在的判据：关 -> wire 里**没有** run_code 且**有**原生工具；开 -> 有 run_code。
+    check('关批量档：本包明确钉 native，wire 里有原生工具、没有 run_code', () => {
+      if (ptcOnlyWire.includes('run_code')) {
+        return '关掉批量后 wire 里仍有 run_code（说明没有钉到 native 档）：' + ptcOnlyWire.slice(0, 12).join(', ');
+      }
+      if (ptcOnlyWire.length === 0) return '关掉批量后 wire 是空的';
+      const visible = [...root.get('tools').view(matePtcKey).visible.keys()];
+      if (!visible.includes(roster.REPORT_TOOL_NAME)) {
+        return '团队工具连 SDK 面都没了（那 run_code 程序里也调不到 report_result）：' + visible.slice(0, 12).join(
+);
+      }
+      return true;
+    });
+
+    check('同一预设但批量档开着：wire 里有 run_code —— 两档的差别确实由这个开关决定', () => {
+      if (!ptcBatchWire.includes('run_code')) return '批量档没声明上（wire 里没有 run_code）：' + JSON.stringify(ptcBatchWire);
+      // 这一条是整段的**核心**：同一个预设、只拨开关，两档的 wire 必须不同。
+      if (ptcOnlyWire.join(',') === ptcBatchWire.join(',')) return '开与关的 wire 完全相同 = 开关没作用到这一档上';
+      return true;
+    });
+
+    // ── 2026-10-21：新宿主形状（both 已被官方删除）的覆盖 ──────────────────────────
+    // 本文件这一节加载的是 profile junction 的 @deepseek-ai/dsh-tools（0.2.0-rc.2，**还认 both**），
+    // 而真机宿主是 0.2.1-rc.2（**不认 both**）。只测前者等于只测了过去。
+    // 但 presentAs 本身不校验取值、也没有「移除一档」的口子，无法在真库上模拟「拒绝 both」。
+    // 所以这里改用**纯函数级**断言：presentationModeSupported 的判据就是「把候选值喂给
+    // tools 行的 Config schema」，而那个 schema 的形状已经从宿主真身核对过
+    // （.probe/deep/asar/dsh-tools.js:2763 是 z.union(["native","ptc"])）。
+    // 这里直接断言「runtime.js 里那句探测确实是这么写的」，并在 drift-check 里
+    // 持续核对宿主那份 schema 的真身（双向夹住，缺一不可）。
+    check('新宿主形状的判据接线仍在：presentationModeSupported 把候选值喂给 tools 行的 Config', () => {
+      const src = realFs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+      const at = src.indexOf('function presentationModeSupported');
+      if (at < 0) return 'runtime.js 里没有 presentationModeSupported';
+      const body = src.slice(at, at + 900);
+      if (!/schema\(\{ mode \}\)/.test(body)) return '探测没有把候选值喂给 Config schema（判据失效）';
+      if (!/constructor\?\.Config/.test(body)) return '没有从构造函数取 Config（实例上没有这个字段）';
+      if (!/return undefined;/.test(body)) return '取不到 schema 时必须返回 undefined（不知道），不能当成不支持';
+      return true;
+    });
+    // 2026-10-21 真机体检：detailOf 的失败分支只给 note、不给 error，而所有消费方都读 error
+    // （前端 client.js:5745 与 5778 都是 `result.error ?? ''`），于是展开层显示成「详情读取失败：」空提示。
+    // 路由层必须把 note 兜成 error —— 判据：ok:false 且没有 error 是**不允许**的形状。
+    check('team-detail 的失败回包必须带 error（note 兜底）—— 否则前端显示空错误', () => {
+      const routeSrc = realFs.readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+      const at = routeSrc.indexOf("case 'team-detail': {");
+      if (at < 0) return '找不到 team-detail 路由分支';
+      const body = routeSrc.slice(at, at + 1400);
+      if (!/error: String\(result\.note/.test(body)) {
+        return 'team-detail 路由没有把 note 兜成 error —— 失败时前端会显示「详情读取失败：」后面空白';
+      }
+      if (!/result\.ok !== true/.test(body)) return '兜底没有以 ok !== true 为前提（成功回包不许被改写）';
+      return true;
+    });
+    // 检测层必须如实报告"PTC 组件挂着但本作用域拿不到批量工具"，并给出**本插件**的修法。
+    const gateProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-gateprofile-'));
+    tempDirs.push(gateProfile);
+    const gatePkgDir = path.join(gateProfile, 'node_modules', 'dsh-ops');
+    realFs.mkdirSync(path.join(gatePkgDir, 'lib', 'ptc'), { recursive: true });
+    // resolveOpsPackage 的入口条件是「profile 目录自己有 package.json」（它拿这个建 require 基准），
+    // 漏了这一行 pkg 就是 null、summary 是 undefined —— 上一版就是这么真失败的。
+    realFs.writeFileSync(path.join(gateProfile, 'package.json'), '{"name":"fake-gate-profile"}', 'utf8');
+    realFs.writeFileSync(path.join(gatePkgDir, 'package.json'), '{"name":"dsh-ops","version":"0.0.0-gate"}', 'utf8');
+    const realProfileDir2 = process.env.DSH_PROFILE_DIR;
+    process.env.DSH_PROFILE_DIR = gateProfile;
+    const rowsPtcOn = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: false }));
+    // 第三个参数 = 该作用域是否纯 PTC 档（由调用方按实测呈现档给，2026-10-16 改版）
+    const detectWith = (toolNames, rows, purePtc) => adapter.detectOpsComponents(fakeCtxWith(rows, toolNames), { id: 'gate' }, purePtc);
+    // ① 纯 PTC 档 + PTC 挂着 + 看不到那两个工具 → missingPtcTools=true（ops 的门没放行）
+    const nag = detectWith(['ops_grep'], rowsPtcOn, true);
+    // ② 纯 PTC 档 + 看得到 → 不催
+    const satisfied = detectWith(['ops_grep', 'ops_batch', 'ops_result'], rowsPtcOn, true);
+    // ②b 非纯 PTC 档（Lead 原生档 / 批量档队员）+ 看不到 → **不许催**：那是 ops 的设计（dsh-ops/lib/ptc/index.js:16-22）
+    const leadView = detectWith(['ops_grep'], rowsPtcOn, false);
+    // ②c 判据省略（undefined）时同样不许催 —— 保守方向是"不报警"，不是"误报"
+    const omittedView = detectWith(['ops_grep'], rowsPtcOn);
+    // ③ PTC 行被用户关掉 → 根本不该提这件事
+    const ptcOff = detectWith(['ops_grep'], rowsAll, true);
+    if (realProfileDir2 === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = realProfileDir2;
+
+    check('检测如实报告批量工具缺席，给的修法是本插件的角色配置（不是改 ops）', () => {
+      if (nag.missingPtcTools !== true) return 'PTC 挂着却看不到 ops_batch 时没报缺席：' + JSON.stringify(nag.visibleTools);
+      if (String(nag.summary).indexOf('ops_batch') < 0) return 'summary 没点名缺什么：' + nag.summary;
+      if (String(nag.summary).indexOf('batch') < 0 && String(nag.summary).indexOf('批量') < 0) {
+        return 'summary 没给出「关批量档/改角色配置」这条本包侧修法：' + nag.summary;
+      }
+      if (String(nag.summary).indexOf('dsh-ops') < 0) return 'summary 丢了版本与在场组件：' + nag.summary;
+      // 纪律：修法的措辞只能落在"ops 的 ptc 组件是否启用/它的门"上，**绝不许**让用户去改 ops 源码。
+      for (const forbidden of ['补丁', 'patch', '改 ops 的', '源码']) {
+        if (String(nag.summary).indexOf(forbidden) >= 0) return 'summary 给出了改 ops 源码的修法（违令）：' + nag.summary;
+      }
+      return true;
+    });
+
+    check('非纯 PTC 档（Lead / 批量档队员）看不到 ops_batch 时**不误报**（2026-10-16 修的设计缺陷）', () => {
+      if (leadView.missingPtcTools !== false) return 'Lead/both 档被误判成"需要处理"：' + JSON.stringify(leadView.visibleTools);
+      if (String(leadView.summary).indexOf('ops_batch') >= 0) return 'summary 里出现了不该有的缺席提示：' + leadView.summary;
+      if (omittedView.missingPtcTools !== false) return '省略 purePtc 时应当不报警，却报了：' + JSON.stringify(omittedView.visibleTools);
+      return true;
+    });
+
+    check('负对照：拿得到批量工具时不催；PTC 组件被关掉时也不催', () => {
+      if (satisfied.missingPtcTools !== false) return '明明看得到 ops_batch/ops_result 却仍报缺席';
+      if (String(satisfied.summary).indexOf('ops_batch') >= 0) return '不该出现批量工具缺席的提示：' + satisfied.summary;
+      if (ptcOff.missingPtcTools !== false) return 'PTC 行 disabled 却仍算"该给批量工具"：' + JSON.stringify(ptcOff.mounted);
+      if (String(ptcOff.summary).indexOf('ops_batch') >= 0) return 'PTC 组件没挂载却催用户改配置：' + ptcOff.summary;
+      if (String(ptcOff.summary).indexOf('0.0.0-gate') < 0) return 'summary 丢了版本：' + ptcOff.summary;
+      return true;
+    });
+
+    check('ops-enable.plan()：翻转 true→false、补齐缺行、二次幂等，且绝不碰别的行', () => {
+      if (pass1.flipped.join(',') !== 'dsh-ops-shell') return '第一遍该翻转 shell，实得 ' + JSON.stringify(pass1.flipped);
+      if (pass1.appended.join(',') !== 'dsh-ops-file,dsh-ops-background,dsh-ops-ptc') return '该补三行，实得 ' + JSON.stringify(pass1.appended);
+      if (!/- id: dsh-ops-shell\n  disabled: false/.test(pass1.text)) return '翻转后 shell 行没变成 disabled: false';
+      if (pass1.flipped.length + pass1.appended.length !== 4) return '四组件没全被处理：' + JSON.stringify([pass1.flipped, pass1.appended]);
+      if (pass2.flipped.length !== 0 || pass2.appended.length !== 0) return '第二遍仍有动作 = 不幂等（重启循环的隐患）';
+      if (pass1.text.indexOf('maxMembers: 48') < 0 || pass1.text.indexOf('name: x') < 0) return '改写了别人的行（agent-team / llm-deepseek 必须原样）';
+      if (passEmpty.appended.length !== 4) return '空 profile 应补四行，实得 ' + passEmpty.appended.length;
+      if (!/- id: dsh-ops-ptc\n  disabled: false\n  config:\n    required: false\n$/.test(passEmpty.text)) return '追加块结尾不是 ptc 行（顺序或缩进漂了）';
+      return true;
+    });
+
+    // 2026-10-16 真机：宿主 dsh-plugin-manager 保存 profile 是用 YAML AST **重写整个文件**，
+    // 会把长标量折行（本机实测 extraGuidance 那句被折成 4 行，值逐字节不变）。旧实现按
+    // 「整行文本」比对，于是每次 --check 都报「需要处理：补齐键 dsh-ops-shell(extraGuidance)」，
+    // 还会把折行改回单行 —— 与宿主互相改写、永不收敛。现在按**值**比对（scalarSpan/scalarValue）。
+    const LF3 = String.fromCharCode(10);
+    // 按**词边界**折成 3 段（YAML 折叠标量把换行接成一个空格，所以只能在空格处断，
+    // 在单词中间断会造出一个与原文不同的值，那就不是在测"宿主折行"而是在测"值变了"）。
+    const foldWords = (text, groups) => {
+      const words = text.split(' ');
+      const per = Math.ceil(words.length / groups);
+      const out = [];
+      for (let i = 0; i < words.length; i += per) out.push(words.slice(i, i + per).join(' '));
+      return out;
+    };
+    const FAKE_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe';
+    const foldedChunks = foldWords(SHELL_OVERRIDE_TEXT, 3);
+    const foldedRow = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
+      '    publishBashTool: true', '    shellPolicy: advise', '    allowSystemShellFallback: false',
+      '    configUpdateVersion: 1',
+      '    extraGuidance: "' + foldedChunks[0],
+      '      ' + foldedChunks[1],
+      '      ' + foldedChunks[2] + '"',
+      // 2026-10-21：夹具改用**正确的 YAML 标量写法**（单引号）。原来这里跟着实现一起用了
+      // JSON.stringify —— 那会写出 "C:\\\\Program Files\\\\..."（反斜杠转义两遍），
+      // 既是错的 YAML 写法，也让「按值比较」永远不相等（每次 --check 都重写那一行）。
+      '    bashPath: ' + enable.yamlScalar(FAKE_BASH)].join(LF3);
+    const foldedOnce = planEnable(foldedRow, { bashPath: FAKE_BASH });
+    check('宿主把 extraGuidance 折行后：--check 不许误报，值真改了仍要报（2026-10-16 真机）', () => {
+      if (foldedOnce.patched.length !== 0) return '折行被当成缺键（每次启动都要重写 profile = 与宿主互相改写）：' + JSON.stringify(foldedOnce.patched);
+      const wrong = planEnable(foldedRow.replace('OPS-TEAM OVERRIDE:', 'SOMETHING ELSE:'), { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      if (!wrong.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '值真的不同却没报（折行容差不许吞掉真问题）：' + JSON.stringify(wrong.patched);
+      // 截词要作用在**折行的最后一段**上（extraGuidance 不是文件最后一行，早先用 $ 锚定
+      // 根本没替换成功 → clipped 与输入完全相同 → 那条断言是空转，闸门当场拒绝，对的）。
+      const tail = foldedChunks[2].replace(/ as bash\.$/u, ' bash.');
+      if (tail === foldedChunks[2]) return '夹具末段没有 " as bash."，截词控制无效：' + foldedChunks[2];
+      const clippedSrc = foldedRow.replace(foldedChunks[2] + '"' , tail + '"');
+      if (clippedSrc === foldedRow) return '截词没作用到夹具上（末段文本对不上）';
+      const clipped = planEnable(clippedSrc, { bashPath: FAKE_BASH });
+      if (!clipped.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '折行里被截词却没报：' + JSON.stringify(clipped.patched);
+      const again = planEnable(wrong.text, { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      if (again.patched.length !== 0) return '修完第二遍仍在改 = 不幂等：' + JSON.stringify(again.patched);
+      return true;
+    });
+    check('ops-enable.plan() 逐键收敛：已有行里 publishBashTool:false 会被改成 true 并补 extraGuidance/bashPath', () => {
+      const LF2 = String.fromCharCode(10);
+      const stale = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
+        '    publishBashTool: false', '    shellPolicy: advise', '    allowSystemShellFallback: false',
+        '    configUpdateVersion: 1', '', '- id: dsh-ops-background', '  disabled: false', '  config:',
+        '    enableShellTools: true', '    allowSystemShellFallback: true', '    configUpdateVersion: 1', ''].join(LF2);
+      const once = planEnable(stale, { bashPath: 'C:/Fake/git/bin/bash.exe' });
+      if (once.patched.length !== 2) return '两行都该收敛，实得 ' + JSON.stringify(once.patched);
+      if (once.text.indexOf('publishBashTool: true') < 0) return 'publishBashTool 没被改成 true（ROWS 改了但 profile 不收敛 = 静默失真）';
+      if (once.text.indexOf('extraGuidance') < 0) return '没补 extraGuidance（ops_bash 的冲突口径就没人说了）';
+      if (once.text.indexOf('bashPath') < 0) return 'background 行没补 bashPath';
+      const twice = planEnable(once.text, { bashPath: 'C:/Fake/git/bin/bash.exe' });
+      if (twice.patched.length + twice.flipped.length + twice.appended.length !== 0) {
+        return '第二遍仍有动作 = 不幂等（每次启动都重写 profile）：' + JSON.stringify([twice.patched, twice.flipped, twice.appended]);
+      }
+      // 别人的行不许动
+      if (once.text.indexOf('shellPolicy: advise') < 0) return '改写了不该碰的键';
+      return true;
+    });
+
+    check('ops-enable.plan() 对**真** profile 的判断与 drift-check 一致（本机交付态）', () => {
+      // realFs 已在 §7.11 开头声明
+      const candidates = [process.env.DSH_PROFILE_DIR,
+        path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop')].filter(Boolean);
+      let file = null;
+      for (const dir of candidates) {
+        const candidate = path.join(dir, 'cordis.patch.yml');
+        if (realFs.existsSync(candidate)) { file = candidate; break; }
+      }
+      if (file === null) return true; // 没有 profile：本机不是交付环境，跳过不算失败
+      const result = planEnable(realFs.readFileSync(file, 'utf8'));
+      if (result.flipped.length + result.appended.length !== 0) {
+        return '本机 profile 的四组件启用态不干净（翻转 ' + result.flipped.join(',') + ' / 缺 ' + result.appended.join(',')
+          + '）：node tools/ops-enable.cjs 后重启 DSH。文件：' + file;
+      }
+      if (result.kept.length !== 4) return '四行没全部识别为已启用：' + JSON.stringify(result.kept);
+      return true;
+    });
+
+    check('负对照：四行全 disabled 时 mounted 为空且 summary 指向插件页（不误报可用）', () => {
+      const allOff = adapter.OPS_ROWS.map((row) => ({ id: row.id, component: row.component, disabled: true }));
+      const probe = probeAllOff;
+      if (probe.mounted.length !== 0) return '全 disabled 却仍报挂载：' + probe.mounted.join(', ');
+      if (String(probe.summary).indexOf('插件页') < 0) return '全关时的 summary 没给出可执行指引：' + probe.summary;
+      const sink = []; const notes = [];
+      const linked = adapter.linkOpsForMember(fakeCtxWith(allOff, ['ops_grep']), fakeScoped(sink), { id: 'y', ctx: {} }, notes, []);
+      if (linked !== false || sink.length !== 0) return '四组件全关却仍给队员注册了 ops 段（会教模型用不存在的工具）';
+      return true;
+    });
+  }
+
+  // ── 队员预设：路由层的形状与白名单（2026-10-15）────────────────────────────
+  const presetSaved = await callApi('POST', GATE, {
+    op: 'set',
+    args: { roles: { scout: { preset: 'standard' } }, revision: (await callApi('POST', GATE, { op: 'get' })).payload.revision },
+  });
+  check('set 接受「只配预设不配模型」，并原样落盘', () => {
+    if (presetSaved.payload === undefined || presetSaved.payload.ok !== true) return JSON.stringify(presetSaved.payload);
+    const scout = presetSaved.payload.config.roles.scout;
+    if (scout === undefined || scout.preset !== 'standard') return '落盘结果里没有 scout.preset=standard：' + JSON.stringify(scout);
+    if (scout.provider !== undefined || scout.model !== undefined) return '不该凭空补模型：' + JSON.stringify(scout);
+    return true;
+  });
+
+  const presetBack = await callApi('POST', GATE, { op: 'get' });
+  check('get 读回来是同一份（存进去 = 读回来，面板不会显示成「跟随 Lead」的假象）', () => {
+    const scout = presetBack.payload.config.roles.scout;
+    if (scout === undefined || scout.preset !== 'standard') return '读回：' + JSON.stringify(presetBack.payload.config.roles);
+    return true;
+  });
+
+  check('get 回包带 agentPresets 可用性表：三个白名单 id 齐全，available 是真布尔', () => {
+    const table = presetBack.payload.agentPresets;
+    if (table === undefined || !Array.isArray(table.presets)) return '回包里没有 agentPresets.presets：' + JSON.stringify(Object.keys(presetBack.payload));
+    const byId = new Map(table.presets.map((row) => [row.id, row]));
+    for (const id of roster.TEAMMATE_PRESET_IDS) {
+      const row = byId.get(id);
+      if (row === undefined) return '白名单里的 ' + id + ' 没出现在可用性表中';
+      if (typeof row.available !== 'boolean') return id + ' 的 available 不是布尔：' + JSON.stringify(row);
+      if (row.available !== true) return id + ' 在本机不可用（' + row.reason + '）—— 白名单该改，或把那份预设装回来';
+    }
+    return true;
+  });
+
+  const presetBogus = await callApi('POST', GATE, {
+    op: 'set',
+    args: { roles: { scout: { preset: 'cordis' } }, revision: presetSaved.payload.revision },
+  });
+  check('白名单外的预设：路由层直接拒绝并列出可选项（不静默丢掉，那会显示成「保存成功」）', () => {
+    if (presetBogus.payload === undefined || presetBogus.payload.ok !== false) return '竟然保存成功：' + JSON.stringify(presetBogus.payload);
+    const error = String(presetBogus.payload.error);
+    if (!error.includes('cordis')) return '错误里没点出问题的那个 id：' + error;
+    for (const id of roster.TEAMMATE_PRESET_IDS) {
+      if (!error.includes(id)) return '错误里没列出可选清单（缺 ' + id + '）：' + error;
+    }
+    return true;
+  });
+
+  const presetUnknownRole = await callApi('POST', GATE, {
+    op: 'set',
+    args: { roles: { researcher: { preset: 'ptc' } }, revision: presetSaved.payload.revision },
+  });
+  check('roles 是**整表替换**（不是逐角色合并）：钉住这条语义，客户端必须每次提交全部 12 行', () => {
+    if (presetUnknownRole.payload === undefined || presetUnknownRole.payload.ok !== true) return JSON.stringify(presetUnknownRole.payload);
+    const roles = presetUnknownRole.payload.config.roles;
+    if (roles.researcher === undefined || roles.researcher.preset !== 'ptc') return 'researcher 没落上：' + JSON.stringify(roles.researcher);
+    // 这是**真语义**，不是缺陷：lib/index.js 的 set 用 checked.roles 整个替换 roles 段（合并只发生在
+    // roles 与 cache 两个字段组之间）。配置页因此必须每次带上全部角色（rolesFromDraft 就是遍历 roleIds），
+    // 否则用户改一行会抹掉其余十一行。这条断言防的是「以后有人以为可以只发一行」。
+    if (roles.scout !== undefined) return '宿主竟然做了逐角色合并 —— 与 lib/index.js 的 set 语义不符，客户端的提交方式要重写：' + JSON.stringify(roles.scout);
+    return true;
+  });
+
+  await callApi('POST', GATE, { op: 'reset' });
 
   const unknownOp = await callApi('POST', GATE, { op: 'no-such-op' });
   check('未知 op → {ok:false} 而不是挂住连接', () => (unknownOp.payload !== undefined && unknownOp.payload.ok === false ? true : JSON.stringify(unknownOp.payload)));
@@ -1291,6 +2395,8 @@ async function main() {
     // 截断账本的读口也委托给真 runtime：noteTurnEndReason 是它的写入点，
     // list_agents 通过这里取值（被测的就是生产路径）。
     truncatedMemberIds: () => runtime.truncatedMemberIds(),
+    // model 校正的读口同样委托真 runtime：noteAppliedRoute 是它的写入点（生产路径同一个函数）。
+    appliedMemberRoutes: () => runtime.appliedMemberRoutes(),
   };
   const reportTeams = {
     // 与真域服务同形：队员名只能从 membership 拿（ReactLoopAgent 上没有 name 字段，
@@ -1584,6 +2690,83 @@ async function main() {
     if ((done.diagnostics || []).length !== 0) return '正常收尾后标志没被清掉：' + JSON.stringify(done.diagnostics);
     return true;
   });
+  // 真链路：noteAppliedRoute 就是 installRouteOverride 里覆盖合进请求对象后调的那个写入点
+  // （lib/runtime.js），测试与生产共用同一函数；list_agents 必须据此把队员行的 model 换掉。
+  // 现场（2026-10-16 session-3c654f6e）：官方给的是继承自 Lead 的 options.model，Lead 问「scout-qa
+  // 在用什么模型」拿到 qfmodel，而它每一次真实请求都是 workbuddy/step-5-preview。
+  const rowsBeforeModel = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  runtime.noteAppliedRoute('scout-agent', { provider: 'workbuddy', model: 'step-5-preview', reasoningEffort: 'high' });
+  runtime.noteAppliedRoute('builder-agent', { model: '' });   // 脏值：不该动那一行
+  const rowsWithModel = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  runtime.clearAppliedRoute('scout-agent');
+  const rowsCleared = await listTool.execute({}, { agent: leadAgent, signal: new AbortController().signal });
+  check('list_agents 的队员 model = 它最近一次请求真的用上的那份（不是继承来的 Lead 模型）', () => {
+    const scoutOf = (rows) => rows.find((row) => row.target === 'scout');
+    if (scoutOf(rowsBeforeModel).model !== undefined) return '前提不成立：测试替身本来就有 model';
+    if (scoutOf(rowsWithModel).model !== 'step-5-preview') return JSON.stringify(scoutOf(rowsWithModel));
+    const builder = rowsWithModel.find((row) => row.target === 'builder');
+    if (builder.model !== undefined) return '脏值（空串 model）被当成事实写进来了：' + JSON.stringify(builder);
+    if (scoutOf(rowsCleared).model !== undefined) return '记账作废后还在校正：' + JSON.stringify(scoutOf(rowsCleared));
+    const lead = rowsWithModel.find((row) => row.target === 'lead');
+    if (lead.model !== undefined) return 'Lead 行不许被校正（它没有覆盖）：' + JSON.stringify(lead);
+    // 关键：校正后的行必须仍然过**官方返回值校验器**。生产路径上 dsh-tools 的
+    // createSuccessResult 会 validateJsonSchemaValue(tool.output.schema, value)
+    // （@deepseek-ai/dsh-tools/lib/index.js:3541-3544），不合就抛 ToolOutputError ——
+    // 「execute 返回值对了」不等于「模型真能拿到」。model 是 MEMBER_VIEW_SCHEMA 里的
+    // 可选字段（lib/tools.js:235），所以写它不新增字段、不动 Lead 的工具目录。
+    const violations = dshTools.validateJsonSchemaValue(listTool.output.schema, rowsWithModel, 'value');
+    if (violations.length > 0) return '校正后的行过不了官方 schema：' + JSON.stringify(violations).slice(0, 200);
+    return true;
+  });
+
+  // ── 7.9c) 队员「结束」之后，list_agents 仍须报出它真的用过的模型 ──────────────────────
+  // 真机起因（2026-10-17 session-d7eb7e28，用户那轮验收测试）：同一次 list_agents 里，
+  //   running 的 builder/verify → model=step-5-preview（对）
+  //   inactive 的 researcher   → model=deepseek-v4.1-flash（= Lead 的模型，错）
+  // 根因：可续期子代理**每一轮结束**都会触发 agent/disposed（官方 dsh-subagent 的 finishDisposal
+  // 结算后调 activation.handle.dispose()，dsh-agent 的 detachEntered 随即 emit），于是本包的
+  // disposeInstalled 被调用，而它当时会 clearAppliedRoute —— 账本一清，list_agents 就退回官方那份
+  // 继承自 Lead 的 options.model。这正是 2026-10-16 那条修复要消灭的错数据，只是延后到
+  // 「队员结束之后」这个最常见的询问时刻才冒出来。
+  // 这条用例走**生产路径**：真 runtime.enable → 真 agent/created → 真 agent/disposed → 真 list_agents。
+  {
+    const dKey = { name: 'stand-dispose-member' };
+    const dScope = createScope(root, dKey);
+    const dSession = makeStandSession('stand-dispose', 'dispatch-mode', false);
+    const dMate = { id: 'stand-dispose', ctx: agentCtx(dScope.ctx), options: {}, session: dSession };
+    agents.push(dMate);
+    membershipById.set(dMate.id, { root: standLead, id: dMate.id, role: 'teammate', name: 'tester' });
+    joinOrRebind(dMate.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: dMate });
+    await tick();
+    await tick();
+    // 模拟「它真的发过一次请求，宿主上报了 workbuddy/step-5-preview」—— 这正是 installRouteOverride
+    // 在覆盖合进请求对象之后调的那个唯一写入点。
+    runtime.noteAppliedRoute('stand-dispose', { provider: 'workbuddy', model: 'step-5-preview' });
+    const dList = toolsModule.teamToolDefinitions({
+      runtime: { ...runtime, appliedMemberRoutes: () => runtime.appliedMemberRoutes() },
+      agentTeams: { listMembers: () => [{ id: 'stand-dispose', name: 'tester', role: 'teammate', status: 'inactive', diagnostics: [], model: 'deepseek-v4.1-flash' }], tryMembership: () => undefined },
+      include: roster.MEMBER_TEAM_TOOL_NAMES,
+    }).find((definition) => definition.name === 'list_agents');
+    const beforeDispose = await dList.execute({}, { agent: standLead, signal: new AbortController().signal });
+    // 队员结束（真机就是这一步把账本抹掉的）
+    root.emit('agent/disposed', { agent: dMate });
+    await tick();
+    const afterDispose = await dList.execute({}, { agent: standLead, signal: new AbortController().signal });
+    check('队员结束（agent/disposed）之后，list_agents 仍报它真用过的模型，不退回继承值', () => {
+      const pick = (rows) => rows.find((row) => row.target === 'tester');
+      const before = pick(beforeDispose);
+      const after = pick(afterDispose);
+      if (before === undefined || after === undefined) return '夹具没拿到 tester 行';
+      if (before.model !== 'step-5-preview') return '前提不成立：结束前的 model 就不对（' + String(before.model) + '）';
+      if (after.model !== 'step-5-preview') {
+        return '队员一结束就退回继承模型（' + String(after.model) + '）：账本被 agent/disposed 清掉了 —— '
+          + '真机表现就是 list_agents 对已完成的队员报 Lead 的模型';
+      }
+      return true;
+    });
+  }
+
   // ── 工具返回值的**形状**校验（官方同一个校验器）────────────────────────────────────
   // 为什么单列一段：上面所有断言都是直调 definition.execute(...)，而**生产路径**上
   // dsh-tools 的 createSuccessResult 会先 validateJsonSchemaValue(tool.output.schema, value)
@@ -1810,6 +2993,232 @@ async function main() {
       if (typeof leadTarget === 'string') return '被拒了：' + leadTarget;
       return true;
     });
+  })();
+
+
+
+  // ── 7.6) 任务板闭环（复现 session-dfd6c62d，2026-10-14）─────────────────────────
+  // 现场事实（逐条从会话日志核出来，不是推测）：
+  //   * 14:13:09 Lead 用 team_task_create 建了四条（seq 81/84/87/90，全 pending、无 owner、rev 1），
+  //     18:54:48 turn/end（seq 1697）—— 中间**再没有一条** team/task 记录；
+  //   * Lead 的 329 次 tool/call 里 team_task_update / _list / _get 各 0 次；
+  //   * 7 个队员会话的 tool/call 里 team_task_* **总计 0 次**，而它们的工具目录里确实有
+  //     team_task_update（每个队员 72 个工具，从各自 request/header 里数出来的）；
+  //   * 7 个队员全部交了 report_result（status 全 completed，verify-final 中途一次 blocked）。
+  // 内核侧（dsh-experimental-agent-team/lib/types/task-board.js）：状态只在 create/update 里写，
+  //   :145-149 complete 只接受 in_progress；:110-117 claim 把 owner 钉成**调用者自己**。
+  // 所以这不是显示 bug：面板如实投影了账本（client-ui-agent-team/lib/client.js:239 + :55-63）。
+  // 缺的是「把报告与任务板对齐」这一层，下面钉住它。
+  console.log('');
+  console.log('任务板闭环（report_result / spawn_teammate / list_agents / wait_agent）');
+
+  await (async () => {
+    const execSignal = () => new AbortController().signal;
+    /** 现场形状：4 条 pending、无 owner，Lead 建完就没回看。 */
+    const openBoard = () => ([
+      { id: 'task-1', revision: 1, subject: 's1', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/a'], ready: true, writeScopeWarnings: [] },
+      { id: 'task-2', revision: 1, subject: 's2', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/b'], ready: true, writeScopeWarnings: [] },
+      { id: 'task-3', revision: 1, subject: 's3', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/c'], ready: true, writeScopeWarnings: [] },
+      { id: 'task-4', revision: 1, subject: 's4', description: 'd', status: 'pending', blockedBy: [], writeScopes: ['src/d'], ready: true, writeScopeWarnings: [] },
+    ]);
+    let closureBoard = openBoard();
+    const closureCalls = [];
+    const closureTeams = {
+      tryMembership: (agent) => membershipById.get(agent && agent.id),
+      listMembers: () => ([
+        { id: 'lead-agent', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+        { id: 'scout-agent', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+        // builder 恒 running：让 wait_agent 走「有活着的对端」那条正常路径，而不是 no-active-peer 短路。
+        { id: 'builder-agent', name: 'builder', role: 'teammate', status: 'running', diagnostics: [] },
+      ]),
+      listTasks: () => { closureCalls.push({ method: 'listTasks' }); return closureBoard.map((task) => ({ ...task })); },
+      getTask: (caller, taskId) => {
+        closureCalls.push({ method: 'getTask', taskId });
+        return closureBoard.find((task) => task.id === taskId);
+      },
+      updateTask: (caller, request) => {
+        closureCalls.push({ method: 'updateTask', request });
+        const task = closureBoard.find((row) => row.id === request.taskId);
+        if (task === undefined) throw new Error('TEAM_TASK_NOT_FOUND');
+        if (request.expectedRevision !== task.revision) throw new Error('TEAM_TASK_STALE_REVISION');
+        task.revision += 1;
+        if (request.action === 'reassign') { task.status = 'in_progress'; task.ownerName = request.owner; }
+        if (request.action === 'complete') task.status = 'completed';
+        if (request.action === 'release') { task.status = 'pending'; task.ownerName = undefined; }
+        return { ...task };
+      },
+      sendMessage: () => ({ messageId: 'm-closure', status: 'accepted' }),
+      waitForChange: () => ({ timedOut: true }),
+      spawnTeammate: async (caller, request) => ({
+        member: {
+          id: 'agent-' + String(request.name),
+          name: request.name,
+          role: 'teammate',
+          status: 'inactive',
+          description: request.description,
+          context: 'fresh',
+          provider: 'spawn',
+          diagnostics: [],
+        },
+      }),
+    };
+    const closureMemberDefs = new Map(toolsModule.teamToolDefinitions({
+      runtime: reportRuntime, agentTeams: closureTeams, include: roster.MEMBER_TEAM_TOOL_NAMES,
+    }).map((definition) => [definition.name, definition]));
+    const closureLeadDefs = new Map(toolsModule.teamToolDefinitions({
+      runtime: reportRuntime, agentTeams: closureTeams, include: roster.LEAD_TEAM_TOOL_NAMES,
+    }).map((definition) => [definition.name, definition]));
+    const closureReport = closureMemberDefs.get(roster.REPORT_TOOL_NAME);
+    const closureSpawn = closureLeadDefs.get('spawn_teammate');
+    const closureList = closureLeadDefs.get('list_agents');
+    const closureListByMember = closureMemberDefs.get('list_agents');
+    const closureWait = closureLeadDefs.get('wait_agent');
+    const closureWaitByMember = closureMemberDefs.get('wait_agent');
+    const argsOf = (over) => Object.assign({
+      summary: '改完并跑过验收', evidence: ['node tools/e2e.mjs -> 0 failed'], acceptance: '同上', unresolved: [], changed_files: ['src/a.js'],
+    }, over);
+
+    // ① 现场形状：队员没被挂上任何条目 -> 不报错，也不往队员上下文里灌任务板噪音。
+    closureBoard = openBoard();
+    closureCalls.length = 0;
+    const unbound = await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() });
+    check('report_result：队员没有 claim 任何条目时**不报错也不唠叨**任务板（现场正是 4 条 pending 无人认领）', () => {
+      if (unbound.ok !== true || unbound.delivered !== true) return JSON.stringify(unbound);
+      if ((unbound.diagnostics ?? []).some((note) => note.includes('任务板'))) return JSON.stringify(unbound.diagnostics);
+      return true;
+    });
+
+    // ② 队员 claim 了条目、报了 completed -> 必须点名让它 complete。
+    closureBoard = openBoard();
+    closureBoard[0] = Object.assign({}, closureBoard[0], { status: 'in_progress', ownerName: 'scout', revision: 2 });
+    const ownCompleted = await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() });
+    check('report_result：completed 而自己 claim 的条目还挂在 in_progress -> diagnostics 点名条目 + complete + 当前 revision', () => {
+      const note = (ownCompleted.diagnostics ?? []).find((item) => item.includes('task-1'));
+      if (note === undefined) return '没有点名 task-1：' + JSON.stringify(ownCompleted.diagnostics);
+      if (!note.includes('complete')) return '没指 complete：' + note;
+      if (!note.includes('2')) return '没给 CAS 要用的当前 revision：' + note;
+      return true;
+    });
+    check('report_result：只点自己名下那条（task-2/3/4 与本次报告无关，不许混进来）', () => {
+      const notes = (ownCompleted.diagnostics ?? []).join(' ');
+      for (const other of ['task-2', 'task-3', 'task-4']) if (notes.includes(other)) return '串了：' + notes;
+      return true;
+    });
+
+    // ③ 报 blocked -> 指路 release，别占着 in_progress。
+    const ownBlocked = await closureReport.execute(
+      { status: 'blocked', summary: '卡在契约上', evidence: [], acceptance: '未跑', unresolved: ['需要 Lead 定 §3.1'], changed_files: [] },
+      { agent: scoutAgent, signal: execSignal() },
+    );
+    check('report_result：blocked / needs_decision -> 指路 release（条目不该被占着）', () => {
+      const note = (ownBlocked.diagnostics ?? []).find((item) => item.includes('task-1'));
+      if (note === undefined || !note.includes('release')) return JSON.stringify(ownBlocked.diagnostics);
+      return true;
+    });
+
+    // ④ spawn 时把条目绑给新队员：走 reassign（claim 会把 owner 钉成调用者 = Lead）。
+    closureBoard = openBoard();
+    closureCalls.length = 0;
+    const bound = await closureSpawn.execute(
+      { role: 'builder', name: 'builder-x', description: 'x', prompt: 'y', task_id: 'task-1' },
+      { agent: leadAgent, signal: execSignal() },
+    );
+    const reassigns = closureCalls.filter((call) => call.method === 'updateTask').map((call) => call.request);
+    check('spawn_teammate：给了 task_id -> 创建后 reassign 给这个队员（pending 到 in_progress + owner），并回显新 revision', () => {
+      if (reassigns.length !== 1) return 'updateTask 调了 ' + reassigns.length + ' 次：' + JSON.stringify(reassigns);
+      const request = reassigns[0];
+      if (request.action !== 'reassign' || request.taskId !== 'task-1' || request.owner !== 'builder-x') return JSON.stringify(request);
+      if (request.expectedRevision !== 1) return 'expected_revision 不是 getTask 读来的当前值：' + JSON.stringify(request);
+      if (closureBoard[0].status !== 'in_progress' || closureBoard[0].ownerName !== 'builder-x') return '假域服务没被真的改到（用例自身失效）';
+      const notes = (bound.diagnostics ?? []).join(' ');
+      if (!notes.includes('task-1') || !notes.includes('builder-x')) return '回执没说绑定：' + notes;
+      if (!notes.includes('2')) return '回执没给绑定后的 revision（Lead 接着要用它做 CAS）：' + notes;
+      return true;
+    });
+    check('spawn_teammate：绑定用 reassign 而不是 claim（task-board.js:117 claim 把 owner 钉成调用者=Lead）', () => (
+      reassigns.some((request) => request.action === 'claim') ? '用了 claim：条目会归到 Lead 名下' : true
+    ));
+    check('spawn_teammate：绑定前先读一次 getTask（不读拿不到 revision，CAS 必失败）', () => {
+      const order = closureCalls.map((call) => call.method);
+      if (!order.includes('getTask')) return '没读 getTask：' + JSON.stringify(order);
+      if (order.indexOf('getTask') > order.indexOf('updateTask')) return '先写后读：' + JSON.stringify(order);
+      return true;
+    });
+
+    // ⑤ 不给 task_id -> 完全不碰任务板（不替 Lead 猜归属）。
+    closureCalls.length = 0;
+    await closureSpawn.execute({ role: 'builder', name: 'builder-y', description: 'x', prompt: 'y' }, { agent: leadAgent, signal: execSignal() });
+    check('spawn_teammate：不给 task_id 时**不碰**任务板', () => (
+      closureCalls.some((call) => call.method === 'updateTask' || call.method === 'getTask')
+        ? JSON.stringify(closureCalls.map((call) => call.method))
+        : true
+    ));
+
+    // ⑥ 绑定失败不许毁掉 spawn（队员已经创建出来了）。
+    closureBoard = openBoard();
+    const bindFailed = await closureSpawn.execute(
+      { role: 'builder', name: 'builder-z', description: 'x', prompt: 'y', task_id: 'task-404' },
+      { agent: leadAgent, signal: execSignal() },
+    );
+    check('spawn_teammate：任务板绑定失败**不毁掉 spawn**，失败原因进 diagnostics（含下一步动作）', () => {
+      if (bindFailed?.member?.target !== 'builder-z') return '队员没创建出来：' + JSON.stringify(bindFailed);
+      const notes = (bindFailed.diagnostics ?? []).join(' ');
+      if (!notes.includes('task-404')) return '没点名失败的条目：' + notes;
+      if (!notes.includes('team_task_list') && !notes.includes('team_task_update')) return '没给下一步动作：' + notes;
+      return true;
+    });
+
+    // ⑦ Lead 侧的收尾闸门：list_agents 与 wait_agent 都要带上未闭环条数。
+    closureBoard = openBoard();
+    const leadRows = await closureList.execute({}, { agent: leadAgent, signal: execSignal() });
+    check('list_agents：Lead 的行带「任务板未闭环 4 条」并点名条目（现场：Lead 全程没回看任务板）', () => {
+      const row = leadRows.find((item) => item.target === 'lead');
+      if (row === undefined) return JSON.stringify(leadRows.map((item) => item.target));
+      const note = (row.diagnostics ?? []).join(' ');
+      if (!note.includes('任务板未闭环 4 条')) return JSON.stringify(row.diagnostics);
+      if (!note.includes('task-1')) return '没点名条目：' + note;
+      return true;
+    });
+    const memberRows = await closureListByMember.execute({}, { agent: scoutAgent, signal: execSignal() });
+    check('list_agents：队员调用时不带这份提示（收尾是 Lead 的责任，不灌进队员上下文）', () => {
+      const notes = memberRows.map((row) => (row.diagnostics ?? []).join(' ')).join(' | ');
+      return notes.includes('任务板') ? notes : true;
+    });
+    const waitLead = await closureWait.execute({}, { agent: leadAgent, signal: execSignal() });
+    check('wait_agent：Lead 每次等待都看到同一份未闭环提示（Lead 收尾前一定会调它）', () => {
+      if (waitLead.timedOut !== true) return JSON.stringify(waitLead);
+      if (!String((waitLead.diagnostics ?? []).join(' ')).includes('任务板未闭环 4 条')) return JSON.stringify(waitLead);
+      return true;
+    });
+    const waitMember = await closureWaitByMember.execute({}, { agent: scoutAgent, signal: execSignal() });
+    check('wait_agent：队员调用时不附加该提示', () => (waitMember.diagnostics === undefined ? true : JSON.stringify(waitMember)));
+
+    // ⑧ 全闭环后不许继续唠叨。
+    closureBoard = openBoard().map((task) => Object.assign({}, task, { status: 'completed', ownerName: 'builder-x' }));
+    const closedRows = await closureList.execute({}, { agent: leadAgent, signal: execSignal() });
+    const closedWait = await closureWait.execute({}, { agent: leadAgent, signal: execSignal() });
+    check('list_agents / wait_agent：任务板全完成后闭环节消失（长期噪音 = 会被模型忽略）', () => {
+      const rowNote = ((closedRows.find((item) => item.target === 'lead').diagnostics) ?? []).join(' ');
+      if (rowNote.includes('任务板')) return 'list_agents 还在唠叨：' + rowNote;
+      if ((closedWait.diagnostics ?? []).join(' ').includes('任务板')) return 'wait_agent 还在唠叨：' + JSON.stringify(closedWait.diagnostics);
+      return true;
+    });
+
+    // ⑨ 形状闸门：官方用 output.schema 校验工具返回值（dsh-tools/lib/index.js:3541-3544），
+    //    additionalProperties:false 意味着漏声明的新字段在模型侧变成 ToolOutputError。
+    closureBoard = openBoard();
+    const shapeValues = [
+      ['list_agents', closureList, await closureList.execute({}, { agent: leadAgent, signal: execSignal() })],
+      ['wait_agent', closureWait, await closureWait.execute({}, { agent: leadAgent, signal: execSignal() })],
+      ['report_result', closureReport, await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() })],
+      ['spawn_teammate', closureSpawn, await closureSpawn.execute({ role: 'builder', name: 'builder-s', description: 'x', prompt: 'y' }, { agent: leadAgent, signal: execSignal() })],
+    ];
+    const violations = [];
+    for (const [label, definition, value] of shapeValues) {
+      if (definition === undefined) { violations.push(label + ' 没拿到定义'); continue; }
+      violations.push(...dshTools.validateJsonSchemaValue(definition.output.schema, value, label));
+    }
+    check('闭环改动后的四个返回值都过官方 output schema（新字段必须进 schema）', () => (violations.length === 0 ? true : JSON.stringify(violations)));
   })();
 
 
@@ -2094,10 +3503,13 @@ async function main() {
       if (!names.includes('scout') || !names.includes('builder')) return `两个队员没都画出来：${names.join(',')}`;
       const notes = graphOnLead.notes ?? [];
       // 无活体（graph-ghost-1）+ 无 sessionPersistence → 必须记降级 note；有活体的 graph-member-1 不该记。
-      if (!notes.some((line) => line.includes('graph-ghost-1') && line.includes('sessionPersistence'))) {
+      // 2026-10-15：note 是结构化 {code, params}（句子由浏览器按语言拼），所以这里断
+      // code + params.sessionId —— 原来断的是中文字面上的 'sessionPersistence'，
+      // 那是拿文案当断言：改一个字这条就红，而行为没变。
+      if (!notes.some((note) => note.code === 'noLiveAgent' && note.params?.sessionId === 'graph-ghost-1')) {
         return `没记降级 note（读不到持久化必须说明，不能显示成 0）：${JSON.stringify(notes)}`;
       }
-      if (notes.some((line) => line.includes('graph-member-1'))) return `有活体的队员不该被记成降级：${JSON.stringify(notes)}`;
+      if (notes.some((note) => note.params?.sessionId === 'graph-member-1')) return `有活体的队员不该被记成降级：${JSON.stringify(notes)}`;
       return true;
     });
 
@@ -2115,6 +3527,158 @@ async function main() {
       return true;
     });
 
+    // ── 官方标签表：下发、指纹、按需省略（本轮新增，先于下面几条 check）──
+    // graphOnLead 就是第一次采集（上面 :2316），复用而不是再调一次：
+    // teamGraph 里 statsForSession 有缓存，多调一次虽无害，但语义上「第一次」应当只有一个。
+    const labelsFirst = graphOnLead;
+    const labelsFirstAgain = await restarted.teamGraph(root, 'graph-session-1');
+    // ── 官方标签表的下发与「不逐轮重发」（2026-10-15）───────────────────────
+    // ① 抓到一个真 bug：collectGraph 算了 toolLabels、runtime 原样透传，但
+    //    **lib/index.js 的 respond 里从来没有这个字段**（git show HEAD:lib/index.js
+    //    里 toolLabels 出现 0 次）。客户端 :4772 一直在读它 → 真机上 state.toolLabels
+    //    恒为 null：流式覆盖层的工具行退成泛泛「工具调用」，上一轮我做的
+    //    「英文界面按语言挑标签」在真机上**完全没生效**。
+    //    探针当时是绿的，因为它的手工 fixture 里塞了 toolLabels —— fixture 比真实路由
+    //    大方，这就是「探针给假绿灯」的成因。所以这里既测数据层，也钉路由转发。
+    const slim = await restarted.teamGraph(root, 'graph-session-1', labelsFirst.toolLabelsHash);
+    const stale = await restarted.teamGraph(root, 'graph-session-1', 'stale0000000000000000');
+    check('teamGraph：随图下发**双语**官方标签表 + 内容指纹', () => {
+      if (labelsFirst.ok !== true) return JSON.stringify(labelsFirst);
+      const labels = labelsFirst.toolLabels;
+      if (labels === undefined) return '没有 toolLabels（客户端拿不到官方标签，工具行只能显示中文/泛称）';
+      if (!labels.titles || !labels.titlesEn) return 'toolLabels 缺双语任一份：' + JSON.stringify(Object.keys(labels));
+      if (labels.titles.read !== '读取' || labels.titlesEn.read !== 'Read') {
+        return '表内容不对：read=' + labels.titles.read + '/' + labels.titlesEn.read;
+      }
+      if (labels.titles.grep !== '搜索文件内容' || labels.titlesEn.grep !== 'Grep') {
+        return 'grep 两侧不对：' + labels.titles.grep + '/' + labels.titlesEn.grep;
+      }
+      if (typeof labelsFirst.toolLabelsHash !== 'string' || labelsFirst.toolLabelsHash.length < 16) {
+        return '没有随表下发 toolLabelsHash（省掉每轮重发所依据的令牌）：' + JSON.stringify(labelsFirst.toolLabelsHash);
+      }
+      return true;
+    });
+
+    check('teamGraph：同一张表两次采集的指纹相同（否则「没变」永远判不出来）', () => {
+      // ⚠️ 先确认两边都是非空字符串再比：上一版直接比 !=，两侧都是 undefined 时
+      // 反而「相等」而绿 —— 那是空洞通过（本仓库抓到过好几次这类假绿灯）。
+      if (typeof labelsFirst.toolLabelsHash !== 'string' || labelsFirst.toolLabelsHash === '') {
+        return '第一次采集没有指纹：' + JSON.stringify(labelsFirst.toolLabelsHash);
+      }
+      if (typeof labelsFirstAgain.toolLabelsHash !== 'string' || labelsFirstAgain.toolLabelsHash === '') {
+        return '第二次采集没有指纹：' + JSON.stringify(labelsFirstAgain.toolLabelsHash);
+      }
+      if (labelsFirstAgain.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '同一份表两次算出不同 hash（' + labelsFirst.toolLabelsHash + ' vs ' + labelsFirstAgain.toolLabelsHash
+          + '）—— 拿进程时间/对象遍历顺序这类会变的值当指纹是错的';
+      }
+      return true;
+    });
+
+    check('teamGraph：客户端带上次的 hash 时省略表本体（每轮少发约 7KB）', () => {
+      // 用户 2026-10-15 的原话：「再把那张表的每轮重发省掉」。
+      // 实测代价：整张双语表 7,286 字节，同一次回包 graph 本体 30,656 字节 → 约 19% 白送。
+      if (slim.toolLabels !== undefined) return 'hash 对上了还重发表：' + JSON.stringify(slim.toolLabelsHash);
+      if (slim.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '省略时没回同一个 hash（客户端会误判成变了、下轮又全量要一次）：' + JSON.stringify(slim.toolLabelsHash);
+      }
+      if (!Array.isArray(slim.graph?.nodes)) return '省略表的同时把 graph 也弄丢了：' + JSON.stringify(Object.keys(slim));
+      const fullBytes = JSON.stringify(labelsFirst).length;
+      const slimBytes = JSON.stringify(slim).length;
+      const tableBytes = JSON.stringify(labelsFirst.toolLabels).length;
+      if (fullBytes - slimBytes < tableBytes - 200) {
+        return '省掉的字节不对（full=' + fullBytes + ' slim=' + slimBytes + ' 表=' + tableBytes + '）';
+      }
+      return true;
+    });
+
+    check('teamGraph：hash 过期/错误必须回全量表（否则升级过一次的浏览器永久停在旧文案）', () => {
+      if (stale.toolLabels === undefined) return '带了过期 hash 却没重发表（客户端缓存会停在旧文案）';
+      if (stale.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '重发表时 hash 反而变了：' + JSON.stringify(stale.toolLabelsHash);
+      }
+      return true;
+    });
+
+    check('lib/index.js 的 team-graph 必须把 toolLabels 与 hash 一起 respond（漏的就是这一步）', () => {
+      // 钉的是「算了但没发」这一整类：数据层算出的字段，回包层必须对得上。
+      const idxText = fs.readFileSync(path.join(PLUGIN_DIR, 'lib', 'index.js'), 'utf8');
+      const at = idxText.indexOf("case 'team-graph'");
+      if (at < 0) return '找不到 team-graph 分支（改名了？同步这条闸门）';
+      const block = idxText.slice(at, idxText.indexOf("case 'team-conversation'", at));
+      if (!block.includes('toolLabels')) return 'team-graph 的 respond 里没有 toolLabels（客户端永远拿不到官方标签表）';
+      if (!block.includes('toolLabelsHash')) return 'team-graph 的 respond 里没有 toolLabelsHash（省略机制无从比对）';
+      if (!/args\.toolLabelsHash/.test(block)) return '没读客户端传来的 args.toolLabelsHash（省略就无从触发）';
+      return true;
+    });
+
+    check('客户端：轮询要把上次的 hash 发回去，且省略时不清空已缓存的表', () => {
+      const cliText = fs.readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+      if (!/apiCall\('team-graph', \{ sessionId: state\.sessionId, toolLabelsHash:/.test(cliText)) {
+        return 'team-graph 轮询没带 hash 上去（服务端永远发全量，等于没省）';
+      }
+      // 断的是**行为**而不是花括号写法（上一版断的是 `…) {`，那等于规定必须换行写块）：
+      // 收表那一行必须被 undefined/null 守卫，否则省略那一轮会把缓存的表清掉。
+      if (!/if \(result\.toolLabels !== undefined && result\.toolLabels !== null\)[\s\S]{0,4}state\.toolLabels = result\.toolLabels/.test(cliText)) {
+        return '收表处没有被 undefined/null 守卫（省略那一轮会把缓存的官方标签表清空）';
+      }
+      if (!/if \(typeof result\.toolLabelsHash === 'string'\) state\.toolLabelsHash = result\.toolLabelsHash/.test(cliText)) {
+        return '客户端没把响应里的 hash 记下来（下一轮无从带上，省略永远不触发）';
+      }
+      return true;
+    });
+
+    // ── 真路由回包（上一轮漏的就是这一层）─────────────────────────────────
+    // 探针实测：路由 handler 用的是**顶层 runtime 实例**的记账，那里只有 resume-session-1
+    // 开着团（上面 :2248 的 runtime.enable(root, resumeOld)）；graph-session-1 是 restarted
+    // 那个新实例开的，走路由会被 isEnabled 挡成 notEnabled —— 不是 bug，是「模块实例 = 一份
+    // 独立记账」的正常表现（本文件重启那组就是这么设计的）。所以回包用 resume-session-1 验，
+    // 数据层用 graph-session-1 验（上面那几条）。
+    const routeFull = await callApi('POST', GATE, { op: 'team-graph', args: { sessionId: 'resume-session-1' } });
+    const routeFullBody = JSON.stringify(routeFull.payload);
+    const routeSlim = await callApi('POST', GATE, { op: 'team-graph',
+      args: { sessionId: 'resume-session-1', toolLabelsHash: routeFull.payload?.toolLabelsHash } });
+    const routeSlimBody = JSON.stringify(routeSlim.payload);
+    const routeStale = await callApi('POST', GATE, { op: 'team-graph',
+      args: { sessionId: 'resume-session-1', toolLabelsHash: 'stale0000000000000000' } });
+
+    check('真路由 team-graph：首次回包**带着**双语标签表与指纹（漏的那一层就在这）', () => {
+      if (routeFull.payload?.ok !== true) return '路由没出图：' + JSON.stringify(routeFull.payload);
+      const keys = Object.keys(routeFull.payload);
+      if (!keys.includes('toolLabels')) return '回包里没有 toolLabels（客户端永远拿不到官方标签表 → 工具行只能显示中文/泛称）';
+      if (!keys.includes('toolLabelsHash')) return '回包里没有 toolLabelsHash（省略机制无从比对）：' + keys.join(',');
+      if (!routeFull.payload.toolLabels.titlesEn) return '回包的表缺英文侧（英文界面挑不到）：' + JSON.stringify(Object.keys(routeFull.payload.toolLabels));
+      if (routeFull.payload.toolLabelsHash !== labelsFirst.toolLabelsHash) {
+        return '路由回的指纹与数据层不一致（省略永远对不上）：' + routeFull.payload.toolLabelsHash + ' vs ' + labelsFirst.toolLabelsHash;
+      }
+      return true;
+    });
+
+    check('真路由 team-graph：带 hash 的第二轮回包**不含**表本体，graph 与 notes 照旧', () => {
+      // 这条是「每轮重发省掉」的端到端证据：不是我以为省了，是回包字节里真的没有。
+      const parsed = JSON.parse(routeSlimBody);
+      if (parsed.toolLabels !== undefined) return '第二轮回包仍带着整张表（省不掉）：' + Object.keys(parsed).join(',');
+      if (parsed.toolLabelsHash !== routeFull.payload.toolLabelsHash) return '省略时回的指纹变了：' + parsed.toolLabelsHash;
+      if (!Array.isArray(parsed.graph?.nodes)) return '省略表时把 graph 也弄丢了：' + Object.keys(parsed).join(',');
+      if (!Array.isArray(parsed.notes)) return 'notes 通道被省略逻辑误伤：' + Object.keys(parsed).join(',');
+      // ⚠️ 用**字节**而不是字符串长度：正文里大量中文，UTF-8 一个字 3 字节，
+      // 拿 .length 当字节数会系统性低估（首轮 6966 字符 ≠ 6966 字节）。
+      const saved = Buffer.byteLength(routeFullBody, 'utf8') - Buffer.byteLength(routeSlimBody, 'utf8');
+      const table = Buffer.byteLength(JSON.stringify(routeFull.payload.toolLabels), 'utf8');
+      if (saved < table - 60) {
+        return '实际省下的字节远小于表体积（full=' + Buffer.byteLength(routeFullBody, 'utf8')
+          + ' slim=' + Buffer.byteLength(routeSlimBody, 'utf8') + ' 表=' + table + '，全部按字节）';
+      }
+      console.log('    team-graph 回包（字节）：首轮 ' + Buffer.byteLength(routeFullBody, 'utf8')
+        + ' B → 省略轮 ' + Buffer.byteLength(routeSlimBody, 'utf8') + ' B（省 ' + saved + ' B，表本体 ' + table + ' B）');
+      return true;
+    });
+
+    check('真路由 team-graph：过期 hash 时回包重新带表（浏览器升级后不会停在旧文案）', () => {
+      if (routeStale.payload?.toolLabels === undefined) return '过期 hash 却没回表：' + Object.keys(routeStale.payload ?? {}).join(',');
+      if (routeStale.payload.toolLabelsHash !== routeFull.payload.toolLabelsHash) return '回表时指纹反而变了';
+      return true;
+    });
     const graphNotEnabled = await restarted.teamGraph(root, 'fresh-session-1');
     check('teamGraph：没开团的会话 → notEnabled（页面据此提示先 /team，而不是画一张空图）', () => {
       if (graphNotEnabled.ok !== false) return JSON.stringify(graphNotEnabled);
@@ -2145,6 +3709,39 @@ async function main() {
     const convoPrefixed = await restarted.teamConversation(root, 'graph-session-1', 'session-graph-session-1');
     check('teamConversation：带 session- 前缀的合法 id 不被误拒（归一化两侧都做）', () => {
       if (convoPrefixed.ok !== true) return `被误拒了：${JSON.stringify(convoPrefixed)}`;
+      return true;
+    });
+    // ── 浮窗展开层：teamDetail（2026-10-14，工具行/正文行的「输入/输出」取数）──────
+    // 授权必须与 teamConversation **同一条白名单**：这个 op 读的是会话事件正文，
+    // 放开了就等于能翻任意会话的全部工具输出。共用 teamAllowedSessions 的判据由下面
+    // 两条越权用例守住（前缀与裸 id 各一条）。
+    const detailForeign = await restarted.teamDetail(root, 'graph-session-1', 'someone-elses-session', 'call:c1');
+    check('teamDetail：越权 targetId 被拒（与 teamConversation 同一条白名单）', () => {
+      if (detailForeign.ok !== false) return JSON.stringify(detailForeign);
+      if (!String(detailForeign.error).includes('本团队')) return String(detailForeign.error);
+      return true;
+    });
+    const detailForeignPrefixed = await restarted.teamDetail(root, 'graph-session-1', 'session-someone-elses-session', 'call:c1');
+    check('teamDetail：带前缀的越权 id 仍被拒（前缀不能绕过白名单）', () => {
+      if (detailForeignPrefixed.ok !== false) return '越权成功了：' + JSON.stringify(detailForeignPrefixed);
+      return true;
+    });
+    const detailMissingKey = await restarted.teamDetail(root, 'graph-session-1', 'graph-session-1', '');
+    check('teamDetail：缺 key 如实失败（不返回半份数据）', () => {
+      if (detailMissingKey.ok !== false) return JSON.stringify(detailMissingKey);
+      return true;
+    });
+    const detailSelf = await restarted.teamDetail(root, 'graph-session-1', 'graph-session-1', 'call:c1');
+    check('teamDetail：合法 target 不报越权；事件读不到时如实失败并给出原因', () => {
+      // 与 teamConversation **故意不同**的一条契约（2026-10-14 写这条时先跑了一次才知道会分叉，
+      // 于是把理由钉在这儿）：teamConversation 在同样情形下回 ok:true + rows:[] + note，
+      // 因为对话区必须**有东西可画**（空态里显示那句 note，不能让抽屉一片空白）。
+      // teamDetail 没有可降级的内容 —— 用户点开的就是这一份正文，取不到就是取不到，
+      // 报 ok:false + 原因才是真话；硬包装成 ok:true 会让浮窗显示一个空框，
+      // 看起来像「这次调用没有输出」，而那与「读不到」是两件不同的事。
+      if (String(detailSelf.error ?? '').includes('本团队')) return '合法 target 被判越权：' + JSON.stringify(detailSelf);
+      if (detailSelf.ok !== false) return '没有活体 agent 又没有持久化时必须如实失败：' + JSON.stringify(detailSelf);
+      if (!String(detailSelf.error).includes('读不到')) return '失败原因不可读：' + detailSelf.error;
       return true;
     });
     const convoForeignPrefixed = await restarted.teamConversation(root, 'graph-session-1', 'session-someone-elses-session');
@@ -2236,6 +3833,51 @@ async function main() {
         return true;
       });
     }
+    // ── teamSendImages 的分流（2026-10-14 审查 P1-2：这块此前**零覆盖**，
+    //   所以 Lead 分支写死的 mode:'queue' / 队员分支写死的 delivery:'queue' 一直没被发现）──
+    // 与 teamSend 必须同一条判据：官方判决式 dsh-api-session-controller/lib/index.js:882-883
+    // `request.mode === 'steer' ? agent.steer(message) : agent.followup(message)`，
+    // dsh-subagent/lib/index.js:1264 `parent.status === 'idle' ? 'queue' : 'steer'`。
+    // 不同步的后果：同一个人**带图**发消息只能排队，**不带图**就能插话 —— 用户 2026-10-13
+    // 报的就是「回复是排队不是插话」，那次只修了 teamSend 这一条路。
+    // 把 Lead 与一个队员切成 running —— 判据读的就是 agent.status，
+    // 不翻转状态的话两边都会得到 'queue'，那条断言就成了**永真**的空壳。
+    graphLead.status = 'running';
+    const runningMember = agents.find((a) => a.id === memberId);
+    if (runningMember !== undefined) runningMember.status = 'running';
+    const imagesLead = await restarted.teamSendImages(chatCtx, 'graph-session-1', 'graph-session-1', '看图',
+      [{ data: Buffer.from('fake').toString('base64'), mediaType: 'image/png', name: 'a.png' }]);
+    check('teamSendImages：Lead 在跑时带图消息也走 steer（与 teamSend 同判据，不许写死 queue）', () => {
+      if (imagesLead.ok !== true) return JSON.stringify(imagesLead);
+      const req = sentPrompts[sentPrompts.length - 1];
+      if (req.mode !== 'steer') return 'Lead 在跑时带图消息应插话（steer），实际 mode=' + req.mode + '（写死 queue 就是这里）';
+      return true;
+    });
+    // 图片本身要成 image 块（文字在前，与官方 hasPromptContent 一致）
+    check('teamSendImages：content = 文字块 + image 块（base64/mediaType 原样给官方落盘）', () => {
+      const req = sentPrompts[sentPrompts.length - 1];
+      if (req.content[0]?.type !== 'text' || req.content[0]?.text !== '看图') return JSON.stringify(req.content[0]);
+      if (req.content[1]?.type !== 'image') return '第二个块不是 image：' + JSON.stringify(req.content[1]?.type);
+      if (typeof req.content[1]?.data !== 'string' || req.content[1].data === '') return '缺 base64 data';
+      if (req.content[1]?.mediaType !== 'image/png') return 'mediaType 没透传';
+      if (typeof req.requestId !== 'string' || req.requestId === '') return '缺 requestId';
+      return true;
+    });
+    const imagesMember = memberId === undefined ? null : await restarted.teamSendImages(chatCtx, 'graph-session-1', memberId, '看图',
+      [{ data: Buffer.from('fake').toString('base64'), mediaType: 'image/png' }]);
+    if (imagesMember !== null) {
+      check('teamSendImages：队员分支同样不写死 queue（delivery 跟着 running 走）', () => {
+        if (imagesMember.ok !== true) return JSON.stringify(imagesMember);
+        const req = sentSubagents[sentSubagents.length - 1];
+        if (req.mode !== 'continuable') return 'mode 应该仍是 continuable：' + req.mode;
+        if (runningMember !== undefined && req.delivery !== 'steer') return '队员在跑却排了队：delivery=' + req.delivery;
+        if (!Array.isArray(req.content) || req.content[1]?.type !== 'image') return 'image 块没构造出来';
+        return true;
+      });
+    }
+
+    graphLead.status = 'active';
+    if (runningMember !== undefined) runningMember.status = 'inactive';
     // check() 是同步的，所以先把异步结果取出来再断言。
     const emptyBefore = sentPrompts.length;
     const emptySend = await restarted.teamSend(chatCtx, 'graph-session-1', 'graph-session-1', '   ');

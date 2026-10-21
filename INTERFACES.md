@@ -62,7 +62,7 @@
 **验证为对、可以继续依据的条目**（本次逐条复核过）：§7.5 的 `agent/request` payload 形状与
 `mode=waterfall`、`ctx.llm` 六个方法、`ctx.webServer.register` 契约、`plugins.bundle.config` 槽位与
 `registration` 声明、`dsh-commands` 的 `COMMAND_NAME` 正则与 `normalizeResult`、
-`createUserMessage` 的 message 形状、mcp-manager 的 API 通道写法、`agent/created` 的安装时机
+`createUserMessage` 的 message 形状、第三方 `@xxxyz/dsh-mcp-manager` 的 API 通道写法、`agent/created` 的安装时机
 （0.1.7 是 `await ctx.serial(...)`，逐个 await 监听器；`create()` 的调用者要等它 resolve）。
 
 ## 0. 运行环境事实（先读，避免写错 API）
@@ -104,6 +104,12 @@ export const LEAD_ONLY_TEAM_TOOL_NAMES;   // ['spawn_teammate','interrupt_agent'
 export const MEMBER_TEAM_TOOL_NAMES;      // 队员可见的 9 个 = 九个减去上面两个，再加队员专用的 report_result 与 ask_lead
 export const TEAMMATE_TOOL_DENY;          // 队员身上要摘掉的工具名（继承面来的）。**不许含 'skill'**：见 §3.5
 export const TEAMMATE_SECTION_MUTES;      // 队员身上要清空的提示词段（[{name,orderKey,fallbackOrder}]）
+export const TEAMMATE_PRESET_IDS;         // 2026-10-15：可指派给队员的 agent preset id 白名单（用户定案：只放 ptc / standard / minimal-grayscale）。
+                                          //    存 id 不存显示名（注册表只回 id，名字是官方客户端本地化的）；配置里空 = 跟随 Lead。契约见 §3.6，页面那一列的渲染见 §6:1060「队员 agent 预设这一列」。
+// 2026-10-16 新增（缓存前缀断裂修复，见 §3.6 末「persona 钉住」）：
+export const MEMBER_PERSONA_SECTION;      // 'deployment:persona-prefix' —— 官方 persona 槽位名（本包不 import 宿主包，故在这里存字面量）
+export const MEMBER_PERSONA_ORDER;        // 0 = 官方 DEPLOYMENT_PERSONA_PREFIX 的排序值；drift-check 钉住官方那张表
+export const MEMBER_PERSONA_PIN;          // 钉给队员的那一句 persona：**常量**，不含 {{…}}、不含模型名、不按角色分叉
 // 以下 4 个是 2026-09-30 起的既有导出（工具名与 Lead 名单的真值都在这里）：
 export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
 export const REPORT_TOOL_NAME;            // 'report_result'（队员专用）
@@ -120,6 +126,19 @@ export function annotateTruncatedMembers(rows, truncatedIds);
 export const RETRY_DIAGNOSTIC_PREFIX;     // '最近一次请求被宿主自动重试：'（同样进成员行 diagnostics）
 export function annotateRetriedMembers(rows, retryBy);
                                     // -> 新数组；有重试记录的队员行追加该前缀 + 摘要，不改入参
+// 2026-10-14 新增（任务板闭环；现场 session-dfd6c62d，见 §2.1 的预算上调记录）：
+export const BOARD_CLOSURE_PREFIX;        // '任务板未闭环 '（进 Lead 行与 wait_agent 的 diagnostics）
+export const BOARD_CLOSURE_ID_LIMIT;      // 6：提示里最多点名的条目数
+export function boardClosureNote(tasks, idLimit?);  // -> 一句提示 | undefined（全闭环或读不到）；纯函数
+export function annotateBoardClosure(rows, note);
+                                    // -> 新数组；只把 note 追加到 role==='lead' 那一行的 diagnostics，不改入参
+export function annotateMemberModels(rows, routesByAgentId);
+                                    // -> 新数组；把队员行的 model 换成该队员最近一次请求**真的用上**的那份；
+                                    //    官方那份是继承自 Lead 的 options.model；记不到就不动那一行
+export const ROLE_RECOMMENDATIONS;      // 角色 id → {preset, batch}：「推荐」按钮的取值（12 个角色全覆盖）
+export function recommendedRoleConfig(roleId);
+                                    // -> {preset, batch} | undefined（表里没这个角色的推荐；调用方跳过它，不猜）
+export const RECOMMENDATION_RULE;       // 那句规则文本（按钮 title 直接用，页面不复制一份）
 export function askLeadMessage(question, blocking);  // -> 投递给 lead 的正文（含固定前缀）
 export function deriveRole(name);   // 'verify-2' / 'verify-deep' -> 'verify'（最长角色前缀）；
                                     // 形状不是官方队员名 -> undefined（'scout-' / 'Scout' / 'lead'）
@@ -128,6 +147,14 @@ export function nextTeammateName(role, taken);
 export function defaultConfig();    // {version, roles:{}}
 export function sanitizeConfig(raw, log?);   // 永不抛错；坏字段丢弃并 log(msg)
 export function resolveRoleRoute(config, role); // {provider,model,reasoningEffort?}|undefined
+export function resolveRolePreset(config, role); // -> preset id | undefined（undefined = 跟随 Lead，不重绑）。
+                                          //    与 resolveRoleRoute 的关键差别：模型/强度每请求实时读，preset **只在派队员那一刻读一次**
+                                          //    （官方 select() 在会话已开播时抛 agent-preset/locked）。
+export function roleBatchOn(config, role); // -> boolean（**默认 true**：只有显式 batch:false 才关）
+                                           //    = 这名队员要不要在**自己的作用域**上声明官方第三档呈现 both
+                                           //    （原生工具照常直调 + 另加 run_code 程序内批量调用）。声明口
+                                           //    ctx.tools.presentAs(mode)（dsh-tools/lib/index.js:2810）；解析口 modeFor
+                                           //    :2767-2774「最近的一层赢」；守卫：没有 ptcRuntime 就不声明（:2863-2865 装配期会抛）。
 export function resolveMemberRoute(explicitRoute, roleRoute, explicitEffort);
     // -> {provider,model,reasoningEffort?}|undefined；2026-10-01 修复的优先级：显式参数 >
     //    角色配置 > 两者都无(=undefined=跟随 Lead)。钉子**只**由显式参数产生（lib/runtime.js），
@@ -156,11 +183,11 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 
 | 文本 | 预算 | 当前 | 谁在读 |
 |---|---|---|---|
-| `PLAYBOOK` | ≤ 4000 | **3988** | 调度模式的**每一次**请求（Lead） |
-| `TEAM_POLICY` | ≤ 800 | **758** | 团队开启后的 Lead |
-| `TEAMMATE_CARD` | ≤ 1250 | **1199** | 每个队员的固定前缀 |
-| Lead 侧合计 | ≤ 5000 | **4746** | |
-| 队员侧合计（卡 + 角色简报） | ≤ 1650 | **1574** | 简报是第一条 user 消息，同样进前缀 |
+| `PLAYBOOK` | ≤ 4250 | **4214** | 调度模式的**每一次**请求（Lead） |
+| `TEAM_POLICY` | ≤ 880 | **841** | 团队开启后的 Lead |
+| `TEAMMATE_CARD` | ≤ 1400 | **1399** | 每个队员的固定前缀 |
+| Lead 侧合计 | ≤ 5150 | **5055** | |
+| 队员侧合计（卡 + 角色简报） | ≤ 1800 | **1766** | 简报是第一条 user 消息，同样进前缀 |
 
 > 2026-10-09 上调上限（3800→3900、1150→1200、合计 4900→5000 / 1550→1600）：新增用户要求的
 > PTC 借鉴纪律（批量取证 / 先过滤后汇报），并修回同一次压缩中**误删的细节**（URL、「不知道就说
@@ -177,6 +204,30 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 同时 `presets/dispatch-mode.patch.yml` 的 `tool-ask-user.timeout` 从 600 改为 **-1**：有限期限到期
 > 返回 `{"pending":true}`，等于**在没有答案时把模型放行**，之后的答案以另一条 user 消息在新回合送达 ——
 > 那是同一个「断」的第二条路径（实测本机 4 个会话真出现过 pending）。selftest 有闸门钉住 -1。
+>
+> 2026-10-14 上调四段预算（4000→4250 / 800→880 / 1250→1400 / 合计 5000→5150 与 1650→1800）：
+> 唯一来源是**任务板闭环**这一条新纪律。依据取自 session-dfd6c62d 的会话日志——Lead 在 14:13:09
+> 用 `team_task_create` 建了 4 条任务（seq 81/84/87/90，全 pending 无 owner），到 18:54:48
+> turn/end（seq 1697）**再没有一条** `team/task` 记录；Lead 的 329 次 tool/call 里
+> `team_task_update` 为 0，7 个队员的 tool/call 里 `team_task_*` 总计为 0（工具都在它们的
+> 目录里，从各自 request/header 数出来的），而 7 个队员全部交了 `report_result` completed。
+> 旧文本提过 `team_task_create` 的名字（所以「装了没人提」那条闸门是绿的），却没有任何一句
+> **要求收尾** —— 这次补的就是那一句，加四处联动（report_result 对账 / spawn 绑定 / list_agents 与
+> wait_agent 报未闭环数）。按「先删再加」已合并一处同义表述（队员卡「别灌整段 dump」与
+> 「不贴整段日志、整个文件或长篇代码」同义，删前者），并逐句收紧新文案。
+>
+> 2026-10-15 **下调** 1740→1732（唯一来源是删掉简报首行的英文角色名）：用户先问「双语会不会
+> 让模型读一遍中文、读一遍英文」，我量完账才动手 —— 12 个 `labelEn` 里 **11 个就是 `role.id`
+> 的 Title-Case 改写**（scout→Scout、red-team→Red Team…，唯一例外 verify→Verifier 也只是同词形
+> 变化），而 id 在同一行里已经用反引号给过，所以英文侧对模型是**纯重述**；承载区分度的是中文
+> `label`（五个审查类角色的英文侧全是 …Auditor/Critic/Verifier，靠英文分不出来）。
+> 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
+> 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
+> 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2700`），字段契约见 §1 的 ROLES 行；
+> 删的只是「进模型读的那半」。
+> selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
+> （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
 
 改这四段文本后必须重跑 `node tools/selftest.cjs`：那条闸门会拿上面的数字与模块实测长度对账
 （`README` 里的旧副本已随文档精简移除，现在这份表是唯一真值）。
@@ -195,6 +246,9 @@ export function peekConfig();                    // -> 最近一次成功读到�
 export async function saveConfig(ctx, raw);      // -> {ok:true, config} | {ok:false, error:string}
                                                  //    净化后原子落盘（write tmp + rename），并立即更新 peekConfig()
 export async function listModelCatalog(ctx);     // -> {groups:[{id,name,models:[{id,name,reasoning?:{efforts:[{id,name}],defaultEffort?}}]}], failures:[]}
+export async function listTeammatePresets(ctx);  // 2026-10-15：-> {presets:[{id,name,available,reason,detail?}], notes:string[]}
+                                                 //    白名单三个 id 乘 注册表现状：现读 agentPresets.list() 并筛掉 broken（与官方选择器同源），
+                                                 //    只发事实（reason = not-registered / broken / 空），句子由页面拼；永不抛错。
 export async function preflightRoute(ctx, route);// -> {ok:boolean, route, diagnostics:string[]}
                                                  //    有 reasoningEffort 但该模型未广告 / 不在列表里 => 丢掉该字段并记 diagnostics，
                                                  //    route 仍可用（ok 保持 true）。provider/model 无法解析 => ok:false。
@@ -232,13 +286,36 @@ export function markReportDelivered(entry, delivered);
                                             //   「页面显示已交报告、Lead 从未收到」（2026-10-05 审查 §1-⑤）
 export function truncatedMemberIds();      // -> Set<agentId>；上一轮撞输出上限且未交付的队员（list_agents 标注用）
 export function retriedMemberIds();         // -> Map<agentId, 摘要>；最近一次 llm/retry 的记录（list_agents 标注用）
+export function appliedMemberRoutes();      // -> Map<agentId, {provider?, model?, reasoningEffort?}>；该队员
+                                            //    最近一次请求**实际写进请求对象**的路由（list_agents 校正 model 用；
+                                            //    覆盖失败退回原配置时不记 = 宁缺毋滥）
 export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点（监听器与测试共用）
 export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
 export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
+export function noteAppliedRoute(agentId, route); // 路由账本的唯一写入点（installRouteOverride 与
+                                            //   测试共用）；provider/model/reasoningEffort 三个键都只收非空白字符串，
+                                            //   全空则整条不记（宁缺毋滥：记了就是把没用上的报成用过）
+export function clearAppliedRoute(agentId);      // 作废该队员的记账（卸载时调用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
 export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
                                             //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。
+                                            //    每个节点带 `taskTip` = **结构化**归属清单
+                                            //    `{total, rows:[{id,status,revision,subject?}], omitted}`（该成员名下
+                                            //    未删除的共享任务条目；`rows: []` = 没有）。归属在**服务端**算
+                                            //    （只有宿主读得到 listTasks），**句子在浏览器拼**（2026-10-14 i18n）：
+                                            //    服务端拼中文等于把界面语言焊死在宿主半，而知道 active 的只有浏览器。
+                                            //    同一理由用在折叠工具组（只发 `count`）与回合结局（只发
+                                            //    `reason/message/code`）。判据见 §6:1023「服务端发事实，浏览器拼句子」那条。
                                             //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
+                                            //    返回另带两个**结构化**字段（2026-10-14/15 加的）：
+                                            //    `historyRecovered` —— 成员名单是否来自历史恢复。浏览器半原来靠
+                                            //    `notes.some(n => n.includes('团队可能已结束'))` 判断，那是把**界面
+                                            //    文案当协议**用：换语言或改一个标点，琥珀色快照标记就静默消失，
+                                            //    而底栏仍写「真实会话日志」—— 用户以为团队还在跑。
+                                            //    `toolLabels` —— 官方 tool.title.* 的**两种语言各一份**
+                                            //    `{titles, titlesEn, generic, genericEn}`（同一条展开规则：驼峰键 +
+                                            //    下划线小写键 + 别名表）。服务端不知道界面语言，所以两份都发、
+                                            //    浏览器按 active 挑。与官方逐字一致由 drift-check 两侧都比对。
                                             //    **口径**：每个会话只统计「它自己的事件」，必须跳过
                                             //    fork 继承来的父会话前缀（官方 eventAt(seq) 是裸下标、
                                             //    含前缀；ownEvents()/isOwnSeq() 才是排掉它的 API）。
@@ -252,6 +329,15 @@ export async function teamConversation(ctx, sessionId, targetId, limit?);
                                             //    （Lead 或任一成员）的会话，越权 targetId 直接拒绝。
                                             //    同样跳过 fork 继承前缀（否则浮窗里显示的是 Lead 的对话）。
                                             //    白名单与 teamImage 共用 teamAllowedSessions（防两处漂移）。
+export async function teamDetail(ctx, sessionId, targetId, key);
+                                            //    浮窗展开层（2026-10-14）：按**行身份**取那一行的
+                                            //    输入/输出全文。key 三种形状与 lib/graph.js 的 detailKey
+                                            //    同源：`call:<callId>` / `turn:<turn>:<step>` / `msg:<id>`。
+                                            //    授权与 teamConversation/teamImage 共用 teamAllowedSessions
+                                            //    （拿到的是会话正文，放开一边就是越权读取的口子）。
+                                            //    对话行只带 hasDetail 标记，**用户点开才调这个 op**：
+                                            //    抽屉每 1.2~3 秒轮询，把全部工具参数与结果挂上行
+                                            //    等于每轮把载荷放大几十倍（单次返回另有 DETAIL_MAX 上限）。
 export async function teamSendImages(ctx, sessionId, targetId, text, images);
                                             //    工作区抽屉：**带图片**发消息（与官方对话页一致的
                                             //    上传能力）。用户 2026-10-10：「要支持直接在弹窗上传
@@ -399,8 +485,8 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:472-482`）。
-   注意 `lib/tools.js:621-622` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:705`）。
+   注意 `lib/tools.js:671-675` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
    **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），
@@ -427,6 +513,333 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 断言队员与 Lead 都拿到目录、`disable-model-invocation` 的技能被过滤掉，并有负对照
 （显式 `deny: ['skill']` 后工具与目录**同时**消失）。
 
+### 3.6 队员的 agent 预设（2026-10-15，用户功能）
+
+**一句话**：Lead 用调度模式，但 12 个队员可以各自跑 PTC / 标准 / 极简灰度中的任一份组合。
+
+**为什么必须插件自己做**：官方子代理的组合是硬编码继承父的实时 preset，
+`dsh-subagent/lib/types/child-agent.js:157-158` 的 `applyChildComposition` 第一行就是
+`composeFrom(childCtx, parent.ctx)`，而 `composeFrom(ctx, parent)`（官方
+`dsh-agent-preset-registry/lib/index.js:708-718`）**没有 preset 参数**。
+官方给的口子是**换挂载**：`select(agent, id)` → `recompose` → `bind` →
+`binding.parent.rebind(新代际.key)`（同文件 `:661-674`）。生效机制是**读时**的：
+`dsh-tools/lib/index.js:2959-2984` 的 `view(scope)` 每次都走 `layers.chainLayers(scope)`
+→ `scopeChainOf(key)`（`dsh-scope/lib/index.js:162-169`），所以换父 = 换继承面；
+队员 **own 层**（我们注册的队员卡段与团队工具）按自己的 key 存，不受影响 —— `view()`
+的注释原话：restrict 只过滤继承面，「and never what its OWN layer registers」。
+
+**落点**：`lib/runtime.js` 的 `rebindMemberPreset(ctx, agent, role, notes)`，由
+`installMember` 在**最前面**发起（不 await；句柄存进 `state.installed` 的 `rebind` 字段）。
+三条规则，按顺序判：
+
+| 情况 | 判据 | 动作 | 依据 |
+|---|---|---|---|
+| 重启后恢复的老队员 | 会话投影 `agentPreset` ≠ 活体 `composedPreset` | `mount(agent.ctx, 投影值)` 对齐回**日志** | 官方 `dsh-agent-preset-registry/lib/index.js:31-58`：重建读投影不读 header |
+| 新队员且配了预设 | 投影 == 活体（都还是 Lead 的）且 `want` 非空 | `select(agent, want)`：换挂载 + 落 `agent-preset/selected` | 官方同文件 `:753-771` |
+| 已开播却改了配置 | `select` 抛 `agent-preset/locked` | **不绕**：记一条「面板改动只对之后新派的队员生效」 | 官方同文件 `:739-745` 的 turnBoundary 锁 |
+
+任何失败（服务缺席 / id 没装 / 那份组合 broken）都只记诊断，队员保持跟随 Lead —— 与
+`restrictTeammateTools` 同一套「逐个 try/catch，绝不打掉 spawn」的纪律。
+
+**配置形状**：`roles.<id>.preset`（白名单见 `TEAMMATE_PRESET_IDS`：`ptc` / `standard` /
+`minimal-grayscale`，用户 2026-10-15 定案只放这三个）。空 / 缺省 = 跟随 Lead = 不重绑。
+`sanitizeConfig` 允许**只配预设不配模型**（旧写法在 provider/model 不配对时 `continue`
+会把整行丢掉）；路由层 `validateRoles` 对白名单外**直接拒绝** —— 表单输入被静默丢掉等于骗用户。
+
+**代价（必须告诉用户）**：混用多种预设会把队员的**工具目录**切成几份，跨组不再命中缓存；
+默认「跟随 Lead」= 零变化，这条只在你主动选之后成立。
+2026-10-16 之前这条代价还要再乘一倍：换预设会连第一屏的 persona 一起换掉，于是**每一名**被重绑
+的队员第二次请求就从第 60 字节翻面（下面「persona 钉住」把**第一处**分叉往后抬到工具文档段，公共前缀 60 → 1,442~3,033 字节；剩下的分组代价仍在工具面）。
+
+**测试覆盖**：`integration-test` §7.9 用**真的** `dsh-scope` 父子链 + 真的 `dsh-tools.view()`
+（不是替身）：每份组合各注册一个独占工具与一句 persona，断言换预设后**工具集真的换了**、
+own 层团队工具不受伤、会话日志落了 `agent-preset/selected` 且投影被推进、已开播的不绕锁、
+id 没装时降级并留诊断；第一屏的 persona 则断言**不再跟着换**（那是下面的「persona 钉住」）。
+§7.9b 再加三条物理断言（同一份作用域链换父：不钉 → 公共前缀落在 persona 那一行之内；
+钉了 → **在本夹具内**装配结果逐字节相同——夹具只注册了 persona 一个段，真机还会在工具文档段分叉，见下面那两处更正；并把两者的差额钉成可算的量）。路由层另有 5 条（只配预设能落盘 /
+读回来一致 / 可用性表形状 / 白名单外拒绝 / `roles` 整表替换语义）。
+`drift-check` 钉住上面引用的每一处官方实现（含 persona 槽位、dsh-subagent 的同类覆盖、
+dsh-scope 的「最近一层赢 / 同层同名抛错」、以及官方两份 persona 文字确实不同这五组事实）。
+
+**persona 钉住（2026-10-16，缓存前缀断裂修复 P0）**
+
+真机的账（现算命令：`node tools/cache-prefix-audit.cjs`；要全部队员会话就加 `--tail 0`。读的是 `~/.dsh/sessions` 里的会话日志）：
+
+| 事实 | 数值 |
+|---|---|
+| 队员**第一次**请求渲染的 persona | 143 / 143 都是「跟随 Lead」那一份（灰度短版） |
+| 出现多版本 system 的队员会话 | **15 / 143**，每一对的相邻两版都不同。其中 **12 个**是「队员卡已在第一版里」的 persona/装配翻面；另 3 个（8f140859 / 9269aaa9 / ce68a198）的**第一版根本没有队员卡**（11,560 字节、不含队员标记），第二版才变成 7,059 字节的队员卡 —— 是另一类现象，不算 persona 翻面 |
+| **实测命中率**（读 `assistant/message.usage`；公式同 `lib/cache.js:262-264`） | `node tools/cache-prefix-audit.cjs --tail 0`（全部 **143** 个队员会话、**8,603** 次带 usage 的请求）= **94.9%**（命中 1,209,119,372 / 未命中 64,552,053）。分档：首次请求 **21.2%**（142 次）、**前缀变了的那一次 46.3%**（19 次）、其余 **95.1%**（8,442 次）。不加 `--tail` 时只看最近 40 个会话：**96.8%**（835 次请求）—— 两个数都对，区别只在样本范围 |
+| 两版 system 的最长公共前缀 | **60 字节**（官方 harness:identity 那一句）—— persona 是**第一处**分叉 |
+| 钉住 persona **之后**的最长公共前缀 | **1,442 ~ 3,033 字节**（同一批 12 个会话逐对实测）—— 只抬到第一处**工具文档段**的差异处，**不是**整段相同 |
+| 钉住之后**真机验收**（2026-10-17 用户那轮 `session-d7eb7e28`，3 名新队员、8 个装配） | persona **真的钉住了**：三名队员的两版 system 里 `You are a coding agent.` 都在**第 50 字节**，不再翻面。**但 system 仍然会换版**：第一处分叉从第 60 字节被抬到 **3,105 字节**（researcher `acdebc16`）/ **2,946**（builder `02479538`），断点落在**工具文档段**（`Non-zero exits are reported…` 这段第一次请求里没有、第二次才有）。因此验收的正确写法是「**persona 不再翻面 + 断裂点后移**」，**不是**「system 版本 = 1 / 断裂 = 0」 |
+| 装配对模型（**定位用，不是命中率**） | 最近 40 个会话的 21 对相邻**装配**：完整复用 5（23.8%）、system 断裂 16（76.2%）、字节加权复用率 27.6%、单次最大损失 152,576 字符 |
+| 全部 61 个 ≥2 装配的队员会话 | 完整复用 96/116（82.8%）、字节加权复用率 93.6% |
+| 冷重启恢复的队员 | 4da2b02d 四次请求是 短(76 工具)→长(1)→短(76)→长(1)：**每次 resume 翻两次** |
+
+**两处更正（2026-10-17，我上一轮说错的话，逐条改准）**
+
+1. **「会话日志里没有 usage，只能做理论分析」是假话。** `assistant/message.data.usage` 一直带
+   `cacheReadTokens`：本机 143 个队员会话共 8,606 条 assistant/message，其中 **8,603 条带 usage**、
+   8,041 条带 `cacheReadTokens`（剩下 3 条同属会话 50190f9e，没有 usage）；本包自己的
+   `lib/graph.js:168` 与 `lib/cache.js:240` 也一直在读它。上一轮我把「字节加权 27.6%」
+   （一个只看前缀字节是否相同的**推算模型**）当缓存现状汇报，而同一批会话的**实测**命中率是 **94.9%**。
+2. **「两版 system 只有第一屏那一行不同」也是假的。** 真机上两版还差在**工具文档段**（实测
+   0e572d03：两版工具数都是 1，system 却是 68,016 → 75,511 字节，hunk 级差分 17 处）。persona 是
+   **第一处**分叉，所以钉住它把公共前缀从 60 字节抬到 1,442~3,033 字节 —— 有量可算的收益，但
+   **不是**「整段复用」。整段相同只在我那份只注册 persona 的集成夹具里成立（`integration-test` §7.9b）。
+
+根因由三条官方事实拼成：persona 属于**继承面**贡献（`dsh-persona/lib/index.js:8-11` 的原话——挂在
+预设里就遮蔽部署级 persona，与 `dsh-subagent` 的 per-child persona 同一套路），而重绑换的正是继承面
+（`binding.parent.rebind`）；又因为 `rebindMemberPreset` 不 await（官方在 `agent/created` 之后没有
+可 await 的装配前钩子），翻面必然落在**第二次请求**。
+
+修法：在真的换继承面之前，于队员**自己那一层**注册同名段 `deployment:persona-prefix`——真值在
+`lib/roster.js` 的 `MEMBER_PERSONA_SECTION` / `MEMBER_PERSONA_ORDER` / `MEMBER_PERSONA_PIN`，落点在
+`lib/runtime.js` 的 `pinMemberPersona`。依据是 `dsh-scope/lib/index.js:177-181` 的 merge：「由远及近
+set，最近的一层赢」，所以本层一句就压得住部署级与预设级两份。注册写在两处 `await` **之前**，
+因此第一次装配就用得上。**边界（2026-10-17 实测更正）**：钉住只消掉 persona 这一处分叉；两版 system 在它之后仍会因**工具文档段**不同而分叉，实测公共前缀 60 → 1,442~3,033 字节，**不是**整段相同。
+
+三条边界，每条都有门：
+
+1. **只钉「真的要换继承面」的队员**。`memberSessionStarted` 逐字镜像官方 `select()` 的锁判据
+   （`dsh-agent-preset-registry/lib/index.js:755-759`）：官方必然拒绝的队员不钉——那种情况什么也
+   不会换，钉了等于凭空多造一次翻面。没配预设的角色也不钉（零行为改动）。两条负对照在
+   integration §7.9（builder / tester），并由变异 M32-a / M32-b 证明它们真会咬。
+   「本机没装这份组合」（`not-found`）预判不了，所以照旧钉：少钉的代价是整段前缀重算，
+   多钉的代价只是第一屏一句身份文字。
+2. **Lead 不钉**。量化过：本会话 23 次请求 8 次 system 断裂，其中 5 次最长公共前缀只有 89 字节——
+   触发条件是用户在 `loomy/qwen3.8-flash` 与 `qodercn/qfmodel` 之间来回切。**跨 provider 本来就是
+   两套缓存池**，钉住 persona 换不来命中，只会让用户主会话的身份行少一句模型名：收益≈0 而代价真实。
+   `pinMemberPersona` 只要出现在 Lead 的安装路径里，selftest 当场红。
+3. **第三处断裂源（compaction）判定为不可修**。依据：插件队员会话里 compaction 事件 **0 次**，
+   19 次 system 断裂没有一次落在 compaction 边界 ±8 seq 内；它是 Lead 长会话的宿主行为，重写历史
+   必然断一次前缀。本包能做的只有「不放大它」——已加一条反向门：全仓 `systemPrompt.section`
+   注册的 `text` 只允许标识符或字面量，谁把实时状态塞进段里（那会让**每一轮**都翻面）当场红
+   （变异 M30-k 验过它咬得住）。
+
+**第四处断裂源（工具文档段）判定为不在本包修的范围，理由是实测不是推断**：钉住之后两版 system 仍会在
+**工具文档段**分叉（本机逐对实测公共前缀 1,442~3,033 字节；`session-d7eb7e28` 里 3,105 / 2,946 字节）。
+造成它的是宿主按**当次请求的真实工具集**渲染工具文档：官方 `dsh-system-prompt` 的 `TOOLS_SDK` 段 order 是
+5000（`dsh-system-prompt/lib/index.js:37`），内容随可见工具变化，而这些工具是**异步**装进作用域的 ——
+`session-d7eb7e28` 的 builder `02479538` 在两次请求之间收到 `tool-addition: subagent` / `web_fetch`
+（`developer/message` 里的 `tool-addition` 块，header 工具数 78 → 80），文档段随之重排。
+本包能让它稳定的唯一办法是自己接管工具文档的渲染，那等于改写宿主提示词、**违反「别改 ops/宿主源码」那条硬约束**；
+所以这里只做两件事：① 把自己的段全部写成**逐字节常量**（M30-k 门守着）；② 如实记下这条边界，
+不把「system 版本 = 1」写进验收标准。
+
+**代价（如实）**：队员不再从 persona 那一句读到「我用的是哪个模型」；模型信息不参与任何行为
+（工具目录、能力说明、任务边界都在后面的段里）。官方两份 persona 本来就不一致
+（`minimal.patch.yml:14` 与 `ptc.patch.yml:15`），所以钉的是第三句中性的文本，不是替某一方改口；
+Lead 与用户主会话一个字节都没改。
+
+**两处已修的真机 P1（2026-10-17，`session-d7eb7e28` 那轮验收测试抓出来，都有变异门）**
+
+1. **队员结束后 `list_agents` 报错模型**。可续期子代理**每一轮结束**都会触发 `agent/disposed`
+   （官方 `dsh-subagent/lib/index.js:1176-1179` 的 `finishDisposal` 结算后调 `activation.handle.dispose()`，
+   `dsh-agent/lib/index.js:543-544` 的 `detachEntered` 随即 `emitDisposed`），于是本包的
+   `disposeInstalled` 被调用；旧实现里它 `clearAppliedRoute`，账本一清，`list_agents` 就退回官方那份
+   **继承自 Lead 的** `options.model`。实测同一行数据里 `running` 的队员对、`inactive` 的全错
+   （seq 62 `researcher` 就已是错的）。修法：**卸载单个队员时不再清路由账本**（账本按 agent id 存，
+   永不重用；插件整体卸载时由 `disposeAll` 的 `appliedRoutes.clear()` 统一回收）。门：
+   `integration-test` §7.9c「队员结束（agent/disposed）之后，list_agents 仍报它真用过的模型」；
+   旧闸门（要求 `disposeInstalled` 必须清账本）**本身写错了**，已一并改成反向断言。
+2. **`subagent` 摘不掉、还漏进模型清单**。`tools.restrict` 只遮**继承面**
+   （`dsh-tools/lib/index.js:2891` 注释「scope-local names … fail」、实现 `:2970-2978`：own 层只进
+   `visible`、永不受限），而官方 `dsh-tool-subagent` 把 `subagent` 注册进**每个 agent 自己的层**
+   （`dsh-tool-subagent/lib/index.js:648-659`）。本机 299 个队员会话里 **21 个**中招（7 个是重绑后又被
+   装回来，14 个从头就带着；`ask_user_question` 也在其中）。修法：在队员作用域装 `tools.guard`
+   （官方原话 `dsh-tools/lib/index.js:2911-2926`：注册在 `agent.ctx` 上就只对这名 agent 生效；
+   `:2928-2936` 的 `guardReason` 在**执行前**统一判定，own 层躲不过）。门：
+   `integration-test` §6.1「注册在队员 own 层的工具也要被拦住」；变异 M35-a / M35-b。
+   附带说明：这条同时是**工具文档段断裂**的一条因果链 —— 漏进来的 `subagent` 会进 system 的工具文档，
+   把提示词重排一次。**但 guard 只拦「调用」，拦不住「可见」**（2026-10-17 第二轮真机实测更正，
+   `session-d7eb7e28` 的 builder-2 `b54e219c`）：加了 guard 之后它的 `request/header.tools` 仍然从
+   **78 → 80**（新增 `subagent`、`web_fetch`；同会话 `developer/message` 里就是
+   `tool-addition:subagent` / `tool-addition:web_fetch`），即 `subagent` 依旧在模型清单里、只是**调不动**
+   （`tools.subagent(...)` 抛 `本团队不给队员 subagent…`）。两者分工不同：restrict 管目录
+   （`:2970-2978` 的 `visible` 对 own 层无条件放行）、guard 管执行（`:2928-2936`，执行前判定）。
+   要让工具清单里也不出现只能改宿主渲染，不在本包范围；本包保证的是**调不动**，不是**看不见**。
+
+### 3.7 队员的批量调用档（both，2026-10-15 用户选路径 1）
+
+官方把「工具怎么呈现给模型」做成**三档**，本插件只在队员自己的作用域上换这一档，不开新预设、不改任何官方文件。
+
+| 档 | 送给模型的工具 | 直调别的工具 | run_code | PTC_ONLY 那句提示词 |
+|---|---|---|---|---|
+| native | 全部 | 可 | **没有** | 无 |
+| ptc | 只有 run_code | **报 unknown tool** | 有 | 有 |
+| both | 全部 **+** run_code | 可 | 有 | 无 |
+
+证据（本轮实读 asar，路径都是 dsh-tools/lib/index.js）：三档的 Config 在 :2665-2672；
+wireSchemas 的三个分支在 :2831-2848（ptc 是 schemas.filter(name === RUN_CODE_NAME)，
+both 是 knownNames: [...view.knownNames, RUN_CODE_NAME]）；run_code 只在非 native 时注入（:2979）；
+报错抛出点 :3185、判据 collapses() :3099-3100（**只有 ptc 档会折叠直调**）；
+PTC_ONLY_INSTRUCTION :2517 且 both 渲染为空（:2725 官方注释原话
+「both renders empty: native calls do execute there, so the rule is false」）。
+
+**三条规则**：
+
+1. **默认开**。配置里没有 batch 键 = 开，只有显式 batch: false 才关（roleBatchOn 判 !== false）。
+   老配置因此零迁移。关掉 = 沿用所选预设自己的档（选 PTC 就是纯 PTC），这是「关」的诚实语义。
+   但**「沿用」不能靠等**：2026-10-16 真机证伪了旧实现（那一支什么都不做，等异步预设重绑把档带过来）。
+   实测 researcher-ops（预设 ptc + 关批量）逐请求是 native(76)→ptc(1)→native(76)→ptc(1)，
+   **第一次请求跑在继承来的 native 组合上**，于是它把「没有 run_code、没有 ops_batch」当事实报给 Lead，
+   白跑一轮再自我更正；而 scout-ops（本包同步声明 both 在自己那层）是 both(77)→both(79) 稳定。
+   现在这一支在预设是 ptc 时**同步** presentAs('ptc')（declareMemberMode，与 both 支完全对称、
+   同样先探 ptcRuntime），standard 等原生档仍然什么都不做（那本来就是继承来的档，没有时序要抢）。
+2. **声明在队员自己那一层**：agent.ctx.tools.presentAs('both')（:2810）。它压得住预设那层的 ptc，
+   依据是 modeFor 从作用域链**尾部**往前取第一个声明（:2767-2774）+ chainLayers 的顺序
+   「farthest ancestor first and the exact scope last」（dsh-scope/lib/index.js:155-169）。
+   与 §3.6 的预设重绑**互不依赖**：重绑换的是祖先层，这里写的是自己那层。
+3. **守卫：没有 ptcRuntime 就不声明**。官方在**装配期**才要它（requirePtcRuntime :2863-2865 抛
+   mode "both" requires a PTC runtime），而那句跑在 systemPrompt.assemble 里面 —— 后果是这名队员
+   **每一次请求都失败**，比不开这一档糟得多。所以 applyMemberBatch 先 pick(ctx, 'ptcRuntime') 探一次，
+   探不到就记一条点名原因的诊断（integration-test §7.10 有这条负对照：把守卫反过来写，测试当场崩在官方那句错上）。
+
+**代价（必须让用户看见）**：both 会注册 SDK 段（sdkSection :2745-2757，按作用域现生成）。
+真机实测同一名队员的系统提示词 7,821 字 → 45,874 字（session-94195680 的两名 ptc 队员）。
+这一段进缓存前缀，跨队员按**预设**分组共享（2026-10-16 起模型名已从队员的 persona 里移除，见 §3.6「persona 钉住」；工具清单本身仍随预设与 ops 在场情况分叉）。
+
+**MCP 工具（用户 2026-10-15 点名要考虑）**：MCP 服务器的工具由
+@deepseek-ai/dsh-mcp-client/lib/index.js:153 的 ctx.tools.register(definition) 注册进**该行所在的作用域**；
+本机 profiles/desktop/cordis.patch.yml:58-73 的 mcp-matlab 是**顶层行**，所以落在 host/全局层
+→ Lead 与所有队员都继承得到，公开名 mcp__<serverName>__<tool>（:131）。以后新加 MCP 走同一条路，
+**本插件不需要改任何代码**。呈现档只影响怎么用：ptc 下只能在 run_code 程序里 await tools.mcp__matlab__x(...)
+（SDK 段列的是 view().visible 全量，:3027 sdkSchemas）；both 下**直调与程序内调用两条路都在**。
+真机现状（2026-10-15 实测，别当成「已生效」）：MATLAB MCP 进程在跑（PID 42384/54328），
+历史日志里 mcp__matlab__* 出现在 13,487 次请求中（37 个名字齐全），但**今天这个进程里 Lead 与 4 名队员
+的 wire 都没有它**，只剩 list_mcp_resources 那三个资源工具 —— 即「服务器活着、工具没注册进本进程」，
+与呈现档无关，是另一条待查项。
+
+**已知缺陷（未修，别算进这一档的账）**：§3.6 的预设重绑落在队员**第一个请求之后**
+（真机 seq=7 agent-preset/selected → seq=13 request/header 仍是 35 个工具 → seq=26 才剩 1 个）。
+select() 是先 await recompose() 再落事件（registry :760-761），所以换挂载本身已完成，
+晚生效的原因在装配侧（两个候选：presentAs 只赋 layer.mode 不发 tools/change，或 agent-loop 在回合起点快照工具表）。
+批量档默认开时**恰好掩盖**它：第一发就是 both（自己那层、同步声明），所以看不到「旧档」的现象。
+根因未钉死前不许说已修。
+
+### 3.8 ops 原生链接（dsh-ops 插件，2026-10-15 用户改版：不再内嵌）
+
+**结论先说**：本包**不含**任何 ops 代码。四个组件（shell / file / background / PTC 增强）全部由
+独立插件 `dsh-ops` 自己挂载；本包只做两件事 —— ① 检测它在不在、哪几个组件活着（写进状态文件），
+② 队员安装时注册一段**逐字节相同**的 ops 使用指引。没装 ops 的用户：① 静默、② 一个字节都不加。
+
+历史：2026-10-11 曾 vendor 过 file 组件（`vendor/ops/` + 第 4 组件 `ops-file` 行 +
+`lib/ops-coexist.js` 防重复注册自愈）。2026-10-15 用户明确要求改为两插件各自安装各自启用，
+那三样**已全部删除**（`tools/drift-check.cjs` 10f 盯着它们不许复活）。
+
+**ops_* 工具面**（逐名读自装机 dsh-ops 0.3.0，非文档转述）：
+
+| 组件 | 注册的工具 | 注册在哪一层 | 权限门 |
+|---|---|---|---|
+| file | `ops_inspect_local_file` / `ops_grep` / `ops_glob` / `ops_replace` | 全局层（dsh-ops `lib/file/runtime.js:21-23`、`lib/tools.js:621`） | 无 |
+| shell | `ops_bash`（每授权 agent）+ 把宿主 pwsh-sandbox 指向随包 PS7 | agent 子 fiber（dsh-ops `lib/session-shells.js:72`） | danger-full-access 或可 confine |
+| background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` | agent 子 fiber（dsh-ops `lib/tools.js:358-366`） | **bash 可解析** + 会话 danger-full-access（dsh-ops `lib/tools.js:311-316`） |
+| PTC 增强 | `ops_batch` / `ops_result` | agent 子 fiber（dsh-ops `lib/ptc/index.js:52` 注册，装机 0.3.0 实读） | **仅纯 PTC 档**（`lib/ptc/index.js:20` 要求组合恰好只有一个 run_code），见下 |
+
+`ops_run` 在 0.3.0 **任何组合都不发布**（`docs/manual-validation.md:17` 原话），所以 `OPS_TOOL_NAMES`
+是 11 个而不是 12 个 —— 这条被 integration §7.11 钉住。四组件同时开**不会**重复注册：
+shell 行拿到的 `runtime = undefined`（dsh-ops `lib/index.js:115`），只有 background 构造 FastCtxTools，
+两行的工具集不交（dsh-ops `lib/index.js:79` 决定谁注册什么）。
+
+**PTC 增强组件（`ops_batch` / `ops_result`）—— 只在本包这一侧适配，dsh-ops 的源码一行都不改**
+（用户 2026-10-15 明令）。原版门（dsh-ops `lib/ptc/index.js:16-22`）只把这两个工具注册给
+**纯 PTC 呈现档**的作用域（装配工具恰好只有 run_code + `tools:ptc-only` 段非空）。本包队员默认是
+**批量档 both**（原生直调 + run_code 并存，§3.7），所以默认档下这两个工具不在 —— 那是 ops 自己的设计。
+
+合法杠杆本来就在本包里，不需要新代码：**角色预设选 `ptc` 且把该角色的「批量调用」关掉**
+（`batch: false`）→ 那名队员就是纯 PTC 档 → 原版 ops 自己把 `ops_batch`/`ops_result` 注册给他。
+实测（`tools/ops-mount-check.mjs`，真挂原版组件 + 真宿主注册表，四个独立 Context）：
+ptc 档拿到、both 档拿不到 ⇒ 因果确实只在呈现档这一项上；A 段还**真调一次** `ops_batch`
+（见 §3.8 末），所以「能调用」不是从「能看见」推出来的。§3.7 的 `batch:false` 语义
+（关掉 = 沿用所选预设自己的档）正是这条杠杆的前提 —— 前提成立要求**第一次装配**就是纯 PTC，
+这就是 §3.7 规则 1 那条同步声明存在的理由（真机上它当时不成立）。
+
+检测层如实报告，不假装可用，但**也不误报**（2026-10-16 修）：`missingPtcTools` 的前提是
+调用方告知「该作用域是纯 PTC 档」（`detectOpsComponents(ctx, scope, purePtc)` 第三参）。
+判据不能只看可见性 —— 那会把 Lead（原生档，无 run_code）和批量档队员（both）都误报成「拿不到
+ops_batch 需要处理」，而那两者都是 ops 的设计使然（`dsh-ops/lib/ptc/index.js:20` 的门要
+`assembly.tools.length === 1 && tools[0].name === 'run_code'`）。队员侧的真值由
+`runtime.js installMember` 算：`purePtc = !batchDeclared && resolveRolePreset(...) === 'ptc'`
+（预设 ptc 但本层被 `applyMemberBatch` 声明成 both 时，both 压住它 → 不是纯 PTC 档，所以
+两个条件缺一不可）；Lead 那侧 `index.js` 传 `false`（调度模式下 Lead 保持原生档，是设计）。
+purePtc 省略时**保守方向是不报警**。summary 点名缺什么，措辞只落在「ops 的 ptc 组件是否启用/它的门」，
+三条负对照钉住它 —— 拿得到时不催、PTC 组件被关掉时不催、非纯 PTC 档看不到也不催（integration §7.11）。
+
+**又一个真机 P1（2026-10-16，重启前的状态文件抓出来的）**：`profileDirs()` 的退回链漏了 `.dsh` 那一段。
+上一版是 `process.env.DSH_HOME ?? homedir()` 再 `join(home, 'profiles', 'desktop')` —— 宿主 Electron 进程
+**没有设 DSH_HOME**，于是 base = `C:\Users\ZWS`，去看 `C:\Users\ZWS\profiles\desktop`（不存在）→
+`resolveOpsPackage()` 返回 null → `linkOpsForMember` 提前返回 → **一个队员都收不到 ops 指引段**，
+而状态文件里四个 dsh-ops 组件行都 `phase: 2` 挂着（本机实测 `opsIntegration.package: null` + 四行全在）。
+同一条规矩本仓库早就立过：`tools/lib-dsh-home.cjs:34-53`（2026-10-04 审查 P1-7）—— `DSH_HOME` 是
+**主目录本身**，没给才是 `homedir()/.dsh`。这次是 lib 侧另写了一份、把它漂掉了；测试当时只用
+`DSH_PROFILE_DIR` 注入假目录，**从不走退回链**，所以闸门全绿、真机是坏的（教训：注入式隔离测不到
+默认路径，纯函数要可注入 env/home 才能测这条链）。现在 `profileDirs(env, home)` 与
+`resolveOpsPackage(env, home)` 都导出成可注入纯函数，`selftest` 有专门一组断言钉住（含
+`lib-dsh-home.cjs` 与 `profileDirs` 两侧必须同一条链、以及没装 ops 的机器必须得到 null 不许假红）。
+**profile 层的启用（本机交付）**：`profiles/desktop/package.json` 的 bundles 里加了 `dsh-ops`；
+`profiles/desktop/cordis.patch.yml` 用四行 `disabled: false` 覆盖它自带的关闭（`dsh-app-boot`
+`applyEntryPatches:104-107` 逐键赋值，profile 层在所有 bundle 层之后 → 唯一与启用顺序无关的落点）。
+两个刻意的配置决定（都不改 dsh-ops 一行源码）：
+* `dsh-ops-shell` 开 `ops_bash`，但带 `extraGuidance` —— ops 的 shell 段会写
+  "Prefer bash for command execution … do not switch shells"（dsh-ops 0.3.0 实测 `lib/policy.js:61`），
+  与调度模式 preset 给每个 agent 装的 persistent-pwsh（`presets/dispatch-mode.patch.yml:114-126`）矛盾。
+  2026-10-10 的解法是干脆不开 `ops_bash`（少一个工具）；用户 2026-10-15 要求「所有工具都要能用」，
+  所以改成**开工具 + 用 ops 自己的公开扩展点**：`extraGuidance`（`lib/config.js` 接受、
+  `lib/policy.js:64` 把它追加到该段末尾）把口径说清 —— 默认执行器仍是持久 PowerShell，
+  `ops_bash` 只用于一次性 POSIX 命令。文案住在 `tools/ops-enable.cjs` 的 `SHELL_OVERRIDE_TEXT`，
+  验收工具直接 require 同一份常量（两处各写一份就会漂）。实测（`ops-mount-check.mjs` D 段）：
+  `ops_bash` 已发布、那句 OVERRIDE 确实进段。
+* `dsh-ops-background` 同时带 `allowSystemShellFallback: true` 与 **`bashPath`** —— 它的发布门要求
+  bash 可解析（dsh-ops `lib/tools.js:312`），而本机 `@dsh-ops/bash-win32-x64` 没装（实测
+  `resolveShells` 返回 `available: false`），不加就一个 job 工具都不出。但**只加兜底是坑**：
+  ops 的 PATH 兜底只排除 `%SystemRoot%\System32\bash.exe`（`lib/shells.js:481-487`），
+  **不排除** `%LOCALAPPDATA%\...\WindowsApps\bash.exe` —— 那同样是 WSL 启动器，FastCtx 实测直接拒绝
+  （"not a working bash … WindowsApps shim"）。所以 `detectBash()` 显式探测 Git for Windows 的 bash
+  并写进 `bashPath`，探测不到才退回兜底。C 段还**真调一次** `ops_run_background`（发布 ≠ 可用）。
+
+**一个差点毁掉交付的陷阱（P1，2026-10-15 读 dsh-ops 源码时发现，已修）**：ops 的配置迁移
+`updatedConfig()`（dsh-ops `lib/config-updates.js:9-14`）会把「**没有** `configUpdateVersion` 且
+`allowSystemShellFallback: true`」的行**改成 false 并写回 profile**（`mountConfigUpdates` 里的
+`entry.parent.tree.write()`）。而 background 那四个 job 工具的发布门正好要这个 true
+（dsh-ops `lib/tools.js:311-316` + 本机 `@dsh-ops/bash-win32-x64` 未装）—— 不声明标记的话，
+首次启动就会被静默关掉，连我们写的注释理由都会当场失效。修法：三行（shell/file/background）
+各自带 `configUpdateVersion: 1`（`lib/config.js:157-160` 接受并校验该键，语义就是「本行迁移已完成」）；
+**ptc 行不能带**（`resolvePtcConfig` 只认 `binaryPath`/`required`，多给键抛 Unknown PTC config key，
+本机实测）。两条闸门盯住：`drift-check` 10f 查 profile 三行的标记与 background 的 true；
+`integration` §7.11 用**装机的真 updatedConfig** 跑双向断言（带标记 = 逐字节原样；不带 = 必须被翻成
+false —— 后者是负对照，上游哪天修掉这个陷阱它会变红提醒我们重核，M14 变异验证过）。
+**代价**：指引段每次改动都会变，所以这里**不写死数字** —— 要量就把 `OPS_LINK_TEXT` 现拼一遍看行数/字符数/UTF-8 字节（那是临时探针的活，本仓库不固化成工具）。它与队员无关、进共享前缀，按预设分组只冷读一次。
+`ops_batch`/`ops_result` 两个 schema 走 both 档的**双份**账（wire schema + SDK 声明，见 §3.7 代价段）。
+
+**验证**：`integration-test` §7.11 用真台架产出 native/ptc/both 三份**真实装配**（原版门的判据来源），
+并走真安装路径证明 `batch:false` 的角色不被本包覆盖成批量档（对照：开着批量档就被覆盖成 both）；
+检测层的 `missingPtcTools` 有三条负对照（拿得到时不催、PTC 关掉时不催、非纯 PTC 档看不到时不催 ——
+最后一条就是防 Lead/both 被误报的那道）。含另两条负对照：
+四行全 disabled 时 `mounted` 必须为空且不许注册指引段。变异验证 M1..M17 + M13b + M19（变异驱动
+`.probe-tmp/mut-ops*.cjs`，跑完各自从干净副本还原）：改坏 `mounted` 判据、去掉 ops 在场检查、让指引段按
+队员分叉、名单混入 `ops_run`、摘掉 `installMember` 的链接调用、复活自带 ops-file 行、把 ptc 行改回
+disabled、摘掉迁移标记、把 fallback 改成 false、给 ptc 行误加标记、只摘 ops-enable 里 background 行的标记
+（M13b）、把真 updatedConfig 改成恒等函数（模拟上游修掉陷阱 —— M12/M14 专门验证「闸门在故障消失时
+也会红」，即不许静默假绿）、去掉「PTC 挂着才催」条件（M15）、清单漏 ops-mount-check（M16）、把
+ops-enable --check 退化成只看两个键（M17，就是那次假绿灯的成因）、把 profileDirs 的退回链丢掉 .dsh
+段（M19 = 复现 2026-10-16 的真机 P1，selftest 那条新闸门当场红，实测输出见提交 f217184）。
+
+本机离线端到端验收（不需要重启 DSH）：`node tools/ops-mount-check.mjs` —— 四个**互相独立**的
+真 Context（共用一个 root 会互相抢注，第一版就是这么把负对照搞失效的）。A 挂**原版未改**的 file+PTC 组件
+（纯 PTC 档队员的**可见层**拿到 `ops_batch/ops_result`、批量档队员没有），并**真调一次** `ops_batch
+（action=plan，无副作用预检）` —— 可见 ≠ 可用，这一调同时穿过 execute 里的二次 ptcOnly 校验
+（装机 `lib/ptc/index.js:53`）。为此 makeRoot 的 subprocess 从「一律抛错」的替身改成按宿主契约
+（装机 `lib/ptc/worker.js:61-66`）真起进程，但**白名单只放行 dsh-ops 自己的原生 worker**，其余 argv
+照旧抛错 —— 探针不因此获得随便起进程的能力。实测 `id=j-3d5a8663… / failed=0 / logicalBytes=2163`，
+事后核对目标文件**没有被创建**、worker 写的审计存根里 `state:"pending"`（确属无副作用）。
+plan 的判据读**结构化字段**（status/failed/unknown/error.code），不拿 "error" 子串硬匹配 —— 成功的
+plan 里 `error:null` 也会被子串命中（第一版就是这么假红的）。
+B 同一份组件只差呈现档做负对照（ptc 拿到 / both 拿不到 ⇒ 因果在本包能配的那一项上），
+C 真起 FastCtx 服务器验证四个 job 工具确实发布，并**真调一次** `ops_run_background`（发布 ≠ 可用），
+D shell 组件：`ops_bash` 已发布，且 ops 原文「Prefer bash…」与本包的 OVERRIDE 同时进段。
+（这条工具入库：别人装完也能跑；长期保护仍在 §7.11 与 drift-check 10f/10g。）
 ## 4. `lib/tools.js`（`builder-host` 写）—— 九个团队工具 + 两个开关工具
 
 九个工具的**蓝本是官方 0.1.7 源码**（照抄，不要自创）：
@@ -444,7 +857,8 @@ parameters: {
   context: { type:'string', enum:['fresh','fork'], description:'默认 fresh。' },
   model: { type:'string', description:'可选，覆盖该角色的模型；必须与 provider 成对。' },
   provider: { type:'string', description:'可选，覆盖该角色的 provider；必须与 model 成对。' },
-  reasoning_effort: { type:'string', description:'可选，覆盖该角色的思考强度；必须是该模型广告的档位。' }
+  reasoning_effort: { type:'string', description:'可选，覆盖该角色的思考强度；必须是该模型广告的档位。' },
+  task_id: { type:'string', description:'可选：这条共享任务归这个队员。创建成功后插件用 team_task_update action=reassign 绑定（pending→in_progress + owner=该队员）。绑定失败绝不撤销已创建的队员，原因进 diagnostics。' }
 }
 ```
 
@@ -464,9 +878,19 @@ parameters: {
    `provider` 由 `context` 决定（`fresh` → `spawn`，`fork` → `fork`）。
    identity prefix 照抄官方（`You are teammate "<name>".` 那段），并把角色名加进去。
 4. 返回值就是官方 `{member}` 形状，再附加 `role` 与该队员最终路由（便于 Lead 确认真的生效）。
+5. 给了 `task_id` 时：先 `getTask` 读当前 revision，再 `updateTask({action:'reassign', owner: <新队员名>})`。
+   **为什么用 reassign 而不是 claim**：`claim` 把 owner 记成调用者（`task-board.js:117` `ownerId = caller.id`），
+   而调用者是 Lead —— 条目会挂在 Lead 名下，队员反而不是 owner。`reassign` 是 Lead 专属（`:158-159`）且
+   一次就把 `status: in_progress` + owner 都落对（`:170`）。绑定失败（不存在 / 被阻塞 / 已归别人 / CAS 过期）
+   只写 diagnostics，不撤销已经创建出来的队员。
 
 其余八个工具（`send_message` / `list_agents` / `wait_agent` / `interrupt_agent` /
 `team_task_create` / `team_task_list` / `team_task_get` / `team_task_update`）**逐字照抄官方**，
+**只有两处本插件附加**（2026-10-14 任务板闭环）：`list_agents` 在调用者是 Lead 时把「任务板未闭环 N 条」
+追加进 **lead 行已有的** `diagnostics`（`annotateBoardClosure`，不新增字段 = 不动 Lead 的工具目录 =
+不动缓存前缀，与 `TRUNCATED_DIAGNOSTIC` 同法）；`wait_agent` 给返回值附加可选 `diagnostics`
+（**必须同时进 `WAIT_VALUE_SCHEMA`**：官方按 output.schema 校验返回值，漏声明就是模型侧一次
+`ToolOutputError`，`dsh-tools/lib/index.js:3541-3544`）。两处都只在 Lead 调用且任务板确有未闭环条目时才出现。
 包括 schema、description、错误处理与 `jsonOutput` 渲染方式。`TeamTaskId` 从
 `@deepseek-ai/dsh-experimental-agent-team` import（官方就是这么做的）。
 
@@ -606,9 +1030,9 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
   `view === 'summary'` 分支是防御性的：官方只在 `plugins.bundle.config` 槽位上以 `{ view: 'page' }` 渲染本组件。
   bundle 详情页的**基本信息（图标/标题/版本/包名/描述）由页面白送**（plugin-manager README + `:1908-1947`），
   你只做：角色列表 + 模型/强度选择 + 保存/放弃 + 状态提示。
-- 数据与写入**全部走我们自己的 host 路由**（先例：mcp-manager 的 `apiCall()`，`lib/client.js:90-101`）：
+- 数据与写入**全部走我们自己的 host 路由**（先例：**第三方插件** `@xxxyz/dsh-mcp-manager` v2.2.7 的 `apiCall()`，本机路径 `~/.dsh/profiles/web/node_modules/@xxxyz/dsh-mcp-manager/lib/client.js:91-101` —— 它不是官方包、也不在 `app.asar` 里，但**本机确实装着、行号可逐字复核**；官方侧对应的只有 `@deepseek-ai/dsh-mcp-client` 与 `dsh-mcp-resources`。**别人机器上不一定有这个包**，所以这条只作写法先例，不当作可移植的依据）：
   - `POST /zws-dispatch-agent-team/api`，header 必须带 `content-type: application/json`
-    与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照 mcp-manager `:94`）。
+    与 `x-dsh-plugin: zws-dispatch-agent-team`（CSRF 门，照上面那个第三方插件的 `:92-95`）。
   - ops（注意：现行实现比这里多 `revision` / `diagnostics`，见 §0.1 第 18 条）：
     `{op:'get'}` → `{ok:true, config, roles:[...], path, revision, diagnostics}`；
     `{op:'list-models'}` → `{ok:true, groups, failures}`；
@@ -619,7 +1043,7 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     `{op:'team-conversation', args:{sessionId, targetId, limit}}` → `{ok:true, rows:[{kind,text,time}]}`
     （浮动窗口的对话尾部；targetId 不属于该团队 → `{ok:false}`）。
 - UI 要求（「原版 UI 味道」：灰阶、细边框、12–13px、克制，**不要花哨、不要浓 AI 味**）：
-  - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（mcp-manager 的 CSS 可抄）。
+  - 用 `var(--dsw-alias-border-l2, rgba(128,128,128,.45))` 一类主题变量（第三方 `@xxxyz/dsh-mcp-manager` 的 CSS 可抄）。
   - 每个角色一行：角色名（中文）+ 角色 id（等宽小字）+ 使命一句话；「模型」下拉；「思考强度」下拉。
   - 下拉用原生 `<select>` 即可（官方等价物 `Menu` 需要 ui-primitives，本包**不注入**它以降低失败面）。
     模型选项 value 用 `provider + '\u0000' + model` 不透明键，label 用 `provider / model`；
@@ -631,6 +1055,80 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
     **宿主的 diagnostics 必须显示出来**（配置文件坏掉时宿主会退回空配置并记一条诊断，
     页面若忽略它，用户看到的就是「全部跟随 Lead」的假象，随手一保存就把残留内容整份覆盖）。
   - 底部一段说明：默认（不配置）= 与 Lead 完全相同的模型与思考强度。
+- 画布上的**共享任务归属**走节点卡片的悬停 `title`（`el.title = wsTaskTip(node.taskTip, node.name)`：
+  `wsNodeCard` 建卡时挂、`wsUpdateCard` 就地刷新）。用户 2026-10-08 明确要求点击卡片后的浮窗只保留
+  「指标 + 对话窗口」两块，所以这里**不新增区块** —— tooltip 零布局成本。图例那行（`wsLegendCol`）
+  同步说明「悬停卡片看任务归属」。服务端只发结构化清单，句子在这儿拼（理由见上一条与下一节）。
+- **服务端发事实，浏览器拼句子**（2026-10-14/15 定下的纪律，跨半边的文案一律照此）：
+  宿主半**不知道界面语言** —— `dsh-client-locale` 的 `getSnapshot().active` 只在浏览器里有值。
+  所以凡是会上屏的文字，宿主半只发**结构化字段**，句子由 `wsText` 按当前语言拼：
+  `taskTip` → `{total, rows, omitted}`；折叠工具组 → `{count, rows}`；回合结局 →
+  `{reason, message, code}`；历史快照 → `historyRecovered: boolean`；**画布底栏的宿主提示
+  `notes`** → `{code, params}`（七个降级事实，`code` 与浏览器半 `WS_NOTE_CODES` 双向对齐，
+  selftest 有闸门；旧宿主发纯字符串时直通显示，本半不认识的未来 code 就显示 code 本身）；
+  工具标签 → `{titles, titlesEn}` + 内容指纹 `toolLabelsHash`（**不逐轮重发**：客户端带回
+  上次的 hash，一致时服务端省略表本体 —— 整张双语表实测 7,286 字节 / graph 本体 30,656 字节）。
+  反面教材就是原先那句 `notes.some(n => n.includes('团队可能已结束'))`：把界面文案当协议用，
+  换语言或改一个标点，功能就静默失效（快照标记消失，而底栏仍写「真实会话日志」）。
+  现在这条判据是 `historyRecovered`，notes 本身也不再是句子 —— 那段 `includes` 只是历史记录，
+  **不许再往回写**（selftest 有一条闸门扫 `state.notes.join(` 直接上屏的写法）。
+- **浮窗必须跟着当前语言**（`wsText` / `fallbackText` → `localeText` → 官方 `locale.bind(NS)`）：
+  此前 `wsText` 是 `zh[key]`，**恒读中文**，119 处调用全中；补齐 `en` 也不会变英文。
+  查找顺序 = 官方 locale 链 → 本文件 `zh` → key（缺键退中文而不是退 `wsSend` 这种裸键名，
+  那是刻意选择：宁可一句中文，不给一串 camelCase）。语言切换时 `locale.subscribe` 回调
+  `wsRelanguage()`：覆盖层是命令式 DOM，官方那次 React 重渲染**不会**顺手刷它。
+  顶栏标签就地换字；抽屉关掉再重开（它的标签散在十几个闭包变量里，逐个补等于再写第二套
+  渲染逻辑 —— 那正是本仓库反复栽的「抄两份迟早漂移」；代价是滚动位置与展开态回初始，
+  换语言极低频，如实记在这儿）。
+- 两本内联字典的**键集合必须严格相等**（selftest 有闸门），且**字典之外不许有中文字面量**
+  （另一条闸门扫字符串字面量、剥掉注释）。只补 `en` 而不扫后者，英文界面照样漏几句硬中文。
+- 逐行时间与复制（P1-3）照官方**有/无与左右顺序**，不是照我觉得好用：
+  `wsFormatClock` 移植 `formatMessageClock`（chat-client.js:1057-1068：当天 `HH:mm`，
+  同年 `clock.md` + 时间，跨年 `clock.ymd` + 时间；日期格式值取自官方 locale，不写死「月/日」）。
+  谁有一行：用户行 `clock=start`（时钟在左）、助手行 `clock=end`（复制在左）、团队/通知行只有时间。
+  工具行**不给**（官方 `tool-client.js` 里 `formatMessageClock` 出现 0 次）。
+  复制的是**全文**：被截断的行先走 `team-detail` 取全文再写剪贴板，取不到就报失败 ——
+  静默复制断尾的 2000 码元比没有复制键更糟。剪贴板两条路都在（`navigator.clipboard.writeText`
+  失败/缺失退隐藏 textarea + `execCommand`），照 `dsh-client-ui-primitives` 的 `writeClipboard`。
+- 两本内联字典（`const zh` / `const en`，`ctx.locale.register(NS, { zh, en })`）**不许有零引用文案**：
+  selftest 按「键名是否以字符串字面量出现在字典之外」判引用 —— 本文件唯一的取键方式是 `zh[key]` 与 `t('key')`，
+  全文没有 `'ws' + 变量` 这类动态拼键（逐行扫过），所以字面量判据是充分的。2026-10-14 据此清掉 6 条残骸：
+  `wsDrawerRelations` / `wsDrawerNoRel` / `wsDrawerTasks` / `wsDrawerNoTask`（2026-10-08 删区块时忘了删文案）、
+  `cacheModeDefault`（zh+en，模式下拉只有 auto/on/off）、`wsCacheRead`（卡片用的是硬编码的 `cache` 微标签）、
+  `wsStateProvisioning`（`wsStateOf` 把 provisioning 归进 running）、`wsQSentAsMsg`（被 `wsQNotSettled` 取代）。
+- **队员 agent 预设这一列（2026-10-15）**：宿主只发事实 —— `agentPresets: {presets:[{id,name,available,reason,detail?}], notes:[]}`
+  （'`reason`' 只有 `not-registered` / `broken` / 空 三种），句子由页面拼；显示名照官方
+  `presetDisplayText` 的次序：注册表发布的 `name` → 官方 locale 的内置名（绑 `settings.agentPreset`
+  命名空间读 `presetStandardName` 等键，**不复制第二份中文**）→ 本文件字典 → id。
+  不可用的 id **留着并禁用 + 括号写原因**，不藏（藏起来只会让人以为功能坏了）；宿主没带这张表时整列
+  禁用并给出唯一原因。草稿行是 `{key, effort, preset}` 三字段对象，被 8 处重新构造 ——
+  **任何一处漏带一个字段就是静默丢配置**，所以 `tools/selftest.cjs` 直接禁掉两字段形状。
+ - **配置页的下拉一律是 `.dat-bulk-ctl` / `.dat-ctl` 的**直接子节点**（2026-10-15 用户报「总控页面空白太多」）**：
+   少一个闭括号时 React 把第三列塞进第二列里面，**一句不报**，坏的只有版面（flex 容器少一格 → 左边与中间
+   各空出一整块）。判据在 `tools/client-smoke-test.cjs` §10，用的是 `node.props.children`（同级），
+   **不是** `findAll`（后代）—— 后代搜索对套娃免疫，§9 那批定位全用 findAll，所以这个 bug 一路溜到用户面前。
+ - **工具调用的展开层不许再写死尺寸**：`.dbox` 高度是 `min(52vh,480px)`（随视口），每块展开层顶上有一颗
+   「放大查看」（`wsOpenDetailZoom`）。面板**挂在 `.dat-ws` 根节点**而不是抽屉里 —— 抽屉带 `transform`，
+   固定定位的后代在它内部会改成相对抽屉定位，宽度照样被夹死；顶边必须让出 `--dat-chrome-top`，
+   否则 Windows 的 −□× 点不动（与 `.ws-drawer` 同一条理由）。三条硬规矩：按钮点击要 `stopPropagation`
+   （否则同一次点击顺带把那一行折叠掉，面板一闪就没）、Esc **先**关面板再关抽屉、关抽屉顺手关面板。
+   闸门：`tools/selftest.cjs` 那条「放大查看」，五处各做过变异（改坏 → 各自报出各自的原因）。
+ - **批量调用开关是第四维，且**不**摞进下拉那一列**（用户 2026-10-15 的版面要求）：它是
+   `.dat-row` 的**直接子节点**、位于 `.dat-role` 与 `.dat-ctl` 之间（正好填掉原来那块空白）。
+   默认打勾（`batch` 缺省 = 开，只有显式 `false` 才关，所以「关」才落键、配置不会越长越脏）；
+   统一那一格的判据是「**全部角色都开才打勾**」，不一致时旁边写一句原因（可以不准，不许静默）。
+   闸门：`tools/client-smoke-test.cjs` §11 七条（读回来=显示、同级、开关往返、脏标记回得去）。
+ - **统一选择那一排的四格必须等高骨架**（2026-10-15 用户第二次报版面：「选择框不在一行，有些不美观」）：
+   `.dat-bulk-ctl` 是 **`align-items:flex-start`**（顶对齐），每格恒定三个孩子 —— `span.dat-label` /
+   控件 / `span.dat-hintslot`。**提示槽永远存在**，没话要说时也是空串而不是 `null`：一旦某格
+   只在"有提示"时才有第三个孩子，那格就比别人高一行，底对齐的旧 CSS 会把它的下拉整个顶上去
+   （截图里「agent 预设」高出半截就是这么来的）。勾选格的 `.dat-checkline` 固定 `height:24px`
+   并带同款描边，与 `select` 同高。判据两半：结构在 `client-smoke` §12（含"全一致时也必须有空槽"
+   那份配置 —— 第一版只测了"有话时三个孩子"，变异「没话时省掉槽」完全不红，是空转闸门），
+   CSS 在 `selftest` 那条（把 `flex-start` 改回 `flex-end`，67 条冒烟全绿，只有这条会红）。
+ - **草稿行只有一个构造口 `makeRow(key, effort, preset, batch)`**：加第四维时把原先散在 14 处的
+   对象字面量全部收进来。selftest 那条闸门因此从「禁两字段形状」升级成「禁任何绕过 makeRow 的
+   行字面量」—— 判据是十几条**字面文本**而不是正则（正则的转义在多层 here-string 里被吃掉过）。
 - **绝对不要**：写 `context.mutate` 之外的通道、注入本包没声明的服务、import 本包没声明的模块。
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
@@ -699,6 +1197,52 @@ URL 级事实：**必须**用 `key: '@zws/dsh-dispatch-agent-team'`；`view: 'su
 `view: 'page'` 返回完整表单。`form` 可能不存在（我们的行不声明 Config schema）——**不要依赖它**。
 
 ## 8. 通用纪律（所有人）
+
+- **代码注释与文档里的行号指针会被编辑挪走**（2026-10-15 全仓实扫，数字都用闸门那套规则数，可复跑）：
+  本仓库自引用 = 勘误表 9 处（日期化历史，闸门不核）+ 正文 17 处（官方速记 2 + 句中点不出
+  符号而机器判不了 5 + **可判 10**）。**开工前的 HEAD：可判 9 条里 5 条已指错**
+  （lib/runtime.js 对 index.js:282/:336/:539 与 integration-test 的同两条 —— 更早的欠账）。
+  本轮`git diff` 可复跑：含行号的引用句共改动 **8 行 / 9 条指针**
+  —— 上面那 5 条旧账，加上被我自己这几轮**当场弄坏**的 4 条：往 client.js 插进 800 行字典与
+  注释后，上一轮刚写对的「lib/client.js:2123-2126」飘到 React.createElement；roster.js 加几十行
+  后，一直对的 `TEAMMATE_TOOL_DENY :472-482` 也飘了。**这就是复发机制：写的时候对 ≠ 以后一直对**，
+  指针是被别人的编辑挪走的，所以要有闸门，而不是改完就算。
+  现在可判的 10 条 **0 失效**（`node tools/selftest.cjs` 里那条闸门可复跑）。闸门只管 `lib/X.js:NN` 这种**行号**指针；我最初犯的「见 §6」
+  是**章节**指针，不在它覆盖内（那次靠自查抓到，改成核实过的 :2176 与 §1 的 ROLES 行）。规矩：
+  写指针时**句子里必须点得出目标符号名**（`clipLine`、`LINE_MAX`、`TEAMMATE_TOOL_DENY`
+  这类），改完自己那条句子后要能核；大段插行之后主动复查自己写过的指针。
+  `tools/selftest.cjs` 有一条闸门核这件事：它只判「句里点得出符号」的指针（±8 行窗口
+  里必须出现该符号），勘误表整行（日期化历史）与官方包路径（全路径尾巴 / 跨行折断 /
+  句中点了 mcp-manager、dsh-xxx 的速记）都跳过，宁少判不误判。
+
+- **报告器契约要写清「怎么算失败」，否则闸门会静默空转**（2026-10-15 实修）：
+  `tools/selftest.cjs` 的 `check()` 过去只看「有没有抛错」，**返回值里的原因字符串被当成 PASS**；
+  而 `tools/drift-check.cjs` 的 `check()` 是「返回非空字符串 = FAIL」。两套并存的结果是：照
+  drift-check 的写法给 selftest 加闸门，**从诞生起就是绿的**，改坏被检代码也不报。现在 selftest
+  与 drift-check 同契约（返回非空字符串一律 FAIL），既有 107 条无一受影响（它们都用 `assert` 抛错）。
+  教训：**新加一条闸门时必须做一次变异测试** —— 把它保护的那段代码改坏，看它咬不咬；不咬的闸门比没有更坏，
+  因为它给出的是「已经覆盖了」的假证据。本轮两条预设闸门正是靠变异测试现形的。
+- **测试之间不许泄漏共享状态**：`integration-test` §7.9 的「预设没装」负例把 fake 注册表里的一项
+  `stands.delete(...)` 了没还原，后面路由层读注册表的那条闸门就假失败（第一版就是这样）。
+  负例要**当场还原**，并且把「为什么必须还原」写在删除处。
+- **引用官方文件必须拼全包名**（同一天踩到）：注释里写裸 `lib/index.js:708` 指官方注册表，
+  而**本仓库也有** `lib/index.js` —— 行号闸门按本仓库解释，于是把我引到「符号对得上但指的是
+  另一处同名调用」的错上（`apply()` 的 `loadConfig` 预热在 :490，我引的 :250 是路由里另一处）。
+  规矩：官方的一律写 `dsh-xxx/lib/index.js:NNN`；本仓库的才允许裸路径。
+ - **变异测试必须每轮从干净副本还原**（2026-10-15 自己犯的）：我写的变异脚本每次 `apply` 都把「当前文件」
+   备份成 clean，于是第二轮之后备份里已经带着上一轮的破坏 —— 四条变异跑完只报出**第一条**的原因，
+   后三条根本没测到。正确形状：先存一份真正的干净副本，每轮 `restore → mutate(单点) → 跑 → restore`，
+   并且核对**失败消息的文字**是不是这一轮该报的那条（只看到 FAIL 不算，它可能是别的变异留下的）。
+   同一份脚本还要在「needle 没命中」时响亮失败（`NEEDLE MISS`），否则就是空跑一轮绿。
+ - **别拿「报错文案」当「提示词判据」的钥匙**（2026-10-15 实犯）：`integration-test` §7.10 第一版
+   用 `callable directly` 判「PTC_ONLY 那句在不在」—— 那是**运行时报错**里的词（dsh-tools:2545），
+   提示词里那句官方原文是 `is the only tool you can call directly`（:2517）。结果正向断言假通过，
+   只有我特意加的**负对照**（"ptc 档里必须能看到这句"）报了「本条断言是空转的」才现形。
+   教训两条：① 判据字符串必须从**它要判的那个载体**里抄，不能从相邻现象抄；② 每条这类断言都配一个
+   反向基线，「应该出现的没出现」要能自己喊出来 —— 没有负对照，判据漂了就是一台永绿的机器。
+ - **加第 N 个维度之前，先把散落的构造点收成一个构造口**：草稿行从 14 处字面量收成 `makeRow` 一处，
+   第四维才敢加。否则每加一维都要人肉找齐 14 处、再写 14 条字面量闸门，而漏一处的表现是
+   「界面正常、保存回执正常、下次载入才发现配置没了」—— 最难查的那一类。
 
 - 只写自己名下的文件；**不要**动别人名下的文件，也不要动本文件与已冻结文件。
 - 每个 JS 文件写完后跑 `node --check <file>`（`lib/client.js` 会被 `node --check` 当作 CJS，

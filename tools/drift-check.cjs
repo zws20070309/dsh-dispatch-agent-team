@@ -77,7 +77,25 @@ function openAsar(file) {
     fd,
     dataOffset,
     json,
+    /**
+     * 归档里有**两个根**：`dsh/node_modules/…`（桌面端自己那份闭包）与 `node_modules/…`
+     * （随包携带的那份）。同一个包可能只出现在其中一个根下 —— 实测 0.2.1-rc.2：
+     * `dsh-api-gateway/lib/client.js` 只在 `node_modules/@deepseek-ai/` 下，
+     * 而 `dsh-tools`/`dsh-scope` 在 `dsh/node_modules/@deepseek-ai/` 下。
+     * 过去每个读数点都写死前缀，官方挪一次目录就假红一批检查（2026-10-21 一次红了 3 条）。
+     * 这里做前缀回退：给的路径读不到时，换另一个根再试一次。判据本身不动。
+     * @param {string} entryPath - 归档内相对路径。
+     * @returns {string|undefined}
+     */
     read(entryPath) {
+      const direct = this.readAt(entryPath);
+      if (direct !== void 0) return direct;
+      const alt = entryPath.startsWith('dsh/node_modules/')
+        ? entryPath.slice('dsh/'.length)
+        : ('dsh/' + entryPath);
+      return this.readAt(alt);
+    },
+    readAt(entryPath) {
       let node = this.json;
       for (const segment of entryPath.split('/').filter(Boolean)) {
         node = node?.files?.[segment];
@@ -277,6 +295,28 @@ check('dsh-llm 仍提供 listProviders / listModels / resolveModelInfo', () => {
   return missing.length === 0 ? true : `dsh-llm 缺：${missing.join(', ')} —— lib/runtime.js 的 listModelCatalog/preflightRoute 需要重写`;
 });
 
+// 5b) 实测命中率的两个官方事实（2026-10-17 补）
+//     为什么要钉：tools/cache-prefix-audit.cjs 的「实测命中率」完全建立在这两条上 ——
+//     ① provider 字段被翻成 cacheReadTokens；② 会话日志里 assistant/message 真的带 usage。
+//     我上一轮正是因为**没读这两处**，对用户说了「会话日志里没有 usage，只能做理论分析」这句假话。
+const deepseekLlm = asar.read('dsh/node_modules/@deepseek-ai/dsh-llm-deepseek/lib/index.js') || '';
+check('官方仍把 provider 的 cache_read_input_tokens 映射成 cacheReadTokens（实测命中率的前提）', () => {
+  if (deepseekLlm === '') return '读不到 dsh-llm-deepseek/lib/index.js';
+  if (!deepseekLlm.includes('cache_read_input_tokens: "cacheReadTokens"')) {
+    return '映射变了：tools/cache-prefix-audit.cjs 与 lib/cache.js 读的 cacheReadTokens 可能已经不是缓存命中数';
+  }
+  return true;
+});
+
+const tokenMeterTypes = asar.read('dsh/node_modules/@deepseek-ai/dsh-token-meter/lib/types/usage-projection.js') || '';
+check('官方 usage 投影仍把 cacheReadTokens 分出来（所以它一路带进 assistant/message）', () => {
+  if (tokenMeterTypes === '') return '读不到 dsh-token-meter/lib/types/usage-projection.js';
+  if (!tokenMeterTypes.includes('cacheReadTokens')) {
+    return 'usage 投影不再有 cacheReadTokens：实测命中率要换字段读，本包的两处读点（lib/graph.js、lib/cache.js）都要重读';
+  }
+  return true;
+});
+
 // 6) 命令名正则（中文命令不可行的前提）是否变化
 const commandsIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-commands/lib/index.js') || '';
 check('dsh-commands 的命令名正则未变（仍是 ASCII-only）', () => {
@@ -356,6 +396,13 @@ check('工作区入口依赖的官方面板标记与 sessionId prop 仍在（改
 // （实测踩过两次：team/message/delivered 是扁平形状、不带 message 包装，按 data.message 读
 // 让投递回执一直是死代码）。官方改名时这条闸门必须先红，而不是等用户发现「线不见了」。
 const officialTeamCore = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
+// 整个团队包：0.2.1-rc.2 起 index.js 只是外壳，邮件与投影落在 lib/types/*.js 里。
+// 判据要跟着**事件**走而不是跟着文件走 —— 只看 index.js 会在官方挪文件时假红（2026-10-21 实测）。
+const officialTeamAll = [officialTeamCore,
+  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/mailbox.js') || '',
+  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/projection.js') || '',
+  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/roster.js') || '',
+].join('\n');
 check('工作区读取的官方团队事件字段名仍在（改名会让画布的边/统计静默变 0）', () => {
   if (officialTeamCore === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
   const missing = [];
@@ -365,8 +412,19 @@ check('工作区读取的官方团队事件字段名仍在（改名会让画布�
   }
   if (!officialTeamCore.includes('targetId')) missing.push('team/message 的 targetId');
   // team/message/delivered：**扁平**（version/teamId/messageId/targetId），不是 message 包装。
-  if (!/appendAndFlush\([^)]*"team\/message\/delivered"/u.test(officialTeamCore)) {
+  //
+  // 2026-10-21：0.2.1-rc.2 把落盘点从 index.js 挪进了 lib/types/mailbox.js（Mailbox.markDelivered），
+  // 于是原来只在 officialTeamCore 里搜 appendAndFlush 的判据**假红**了一次。
+  // 判据要跟着事件走，而不是跟着文件走：在团队包的所有文件里找那次 append，
+  // 找到之后再逐字段核对形状（下面两条）。
+  if (!/appendAndFlush\([^)]*['"]team\/message\/delivered['"]/u.test(officialTeamAll)) {
     missing.push('team/message/delivered 的落盘点');
+  }
+  // 形状判据：落盘点必须写这四个键（缺 teamId 就会被投影拒、缺 targetId 就回连不到发件人）。
+  const deliveredAt = officialTeamAll.indexOf("'team/message/delivered'");
+  const deliveredTail = deliveredAt < 0 ? '' : officialTeamAll.slice(deliveredAt, deliveredAt + 900);
+  for (const key of ['version', 'teamId', 'messageId', 'targetId']) {
+    if (!new RegExp(key + '\\b').test(deliveredTail)) missing.push('team/message/delivered 的 ' + key);
   }
   if (!officialTeamCore.includes('messageId')) missing.push('team/message/delivered 的 messageId');
   // team/member：data.member.{id,name}（节点名来源）
@@ -515,39 +573,173 @@ check('硬前置：官方 agent-team-profile 仍被 profile 选中', () => {
   return true;
 });
 
-// 10f) dsh-ops 组件合并（2026-10-11）：本包的 ops-file 行与 dsh-ops 自带的 dsh-ops-file 行
-// 挂同一个实现包；两行同时活会把同一套 ops_* 工具注册两次 → "already registered"，
-// file 组件挂掉。bundle 层顺序不可靠（dsh-ops 在本包之后时它的行还会覆盖同 id 行），
-// 唯一顺序无关的落点是 profile 层 —— 这里验证三件事：
-//   ① profile patch 把 dsh-ops-file 钉成 disabled（关掉重复行，不是关掉功能）；
-//   ② 本包 cordis.patch.yml 的 ops-file 行仍然存在（功能来源）；
-//   ③ dsh-ops 已安装时（profile node_modules 可解析），双行状态由状态文件的
-//      opsIntegration 记录（那半是运行时事实，这里只做静态可判的两条）。
-check('dsh-ops 合并：profile 层钉住 dsh-ops-file disabled + 本包 ops-file 行在位', () => {
-  const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
-  if (!fs.existsSync(profilePatchPath)) {
-    return `读不到 ${profilePatchPath}：dsh-ops-file 的重复注册防护没有落点`;
-  }
-  const profileText = fs.readFileSync(profilePatchPath, 'utf8');
-  // `- id: dsh-ops-file` 后到下一行级条目之前的块里必须有 disabled: true。
-  const at = profileText.search(/^-\s*id:\s*dsh-ops-file\s*$/m);
-  if (at < 0) {
-    return 'profile 的 cordis.patch.yml 没有 `- id: dsh-ops-file / disabled: true`：'
-      + '本包 ops-file 行与 dsh-ops 自带行会重复注册 ops_* 工具（already registered）。'
-      + '修法：在 profile patch 的 dsh-ops 块加两行（见本仓库 cordis.patch.yml 2026-10-11 段的说明）。';
-  }
-  const tail = profileText.slice(at).split(/\n-\s*(?:id|insert):/)[0];
-  if (!/^\s*disabled:\s*true\s*$/m.test(tail)) {
-    return 'profile 层的 dsh-ops-file 行没有 disabled: true —— 重复注册风险未解除';
-  }
+// 10f) dsh-ops 原生链接（2026-10-15 改版：不再内嵌，两插件各自启用）。
+// 本包侧的静态事实（cordis.patch.yml 不得再有自带 ops 行）+ profile 侧的挂载事实
+// （四行 disabled:false）+ 装机 dsh-ops 侧的实现事实（工具前缀/注册点/PTC 门已放宽）。
+// bundle 层顺序不可靠（谁在前取决于用户启用顺序），profile 层是唯一顺序无关的落点。
+check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:false', () => {
   const oursPatch = fs.readFileSync(path.join(PLUGIN_DIR, 'cordis.patch.yml'), 'utf8');
-  // ops-file 行在 `- insert:` 块内（4 空格缩进），正则必须允许行首空白。
-  if (!/^\s*-\s*id:\s*ops-file\s*$/m.test(oursPatch)) {
-    return '本包 cordis.patch.yml 的 ops-file 行消失了：第四组件（Rust 文件检索）失效';
+  if (/^\s*-\s*id:\s*ops-file\s*$/m.test(oursPatch)) {
+    return '本包 cordis.patch.yml 又出现了自带的 ops-file 行：2026-10-15 已按用户要求删除内嵌，' +
+          + 'ops_* 的唯一来源是独立 dsh-ops 插件（留着这行会与它的 dsh-ops-file 行重复注册 ops_*）。';
   }
+  const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
+  if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
+  // 判据复用 tools/ops-enable.cjs 的 plan()（同一份真值，不在这里重写一遍正则 ——
+  // 两处各写一份就会各自漂，那是本仓库反复栽过的坑）。plan 报"要翻转/要补行"= 不健康。
+  const { plan, splitRows } = require('./ops-enable.cjs');
+  const planResult = plan(fs.readFileSync(profilePatchPath, 'utf8'));
+  if (planResult.flipped.length > 0) {
+    return 'profile 层这些行仍是 disabled: true：' + planResult.flipped.join(', ')
+      + ' —— 组件不会挂载（交付要求四组件全开）。修法：node tools/ops-enable.cjs 然后重启 DSH。';
+  }
+  if (planResult.appended.length > 0) {
+    return 'profile 层缺这些行：' + planResult.appended.join(', ')
+      + ' —— 会退回 dsh-ops 自带默认（background/ptc 是关的）。修法：node tools/ops-enable.cjs 然后重启 DSH。';
+  }
+  // 逐键不齐也算不健康：plan() 会把已有行的 config 与 ROWS 对齐（publishBashTool /
+  // extraGuidance / bashPath / 迁移标记）。漏掉这一条就会出现「ROWS 改了、真 profile 没跟上、
+  // 而 drift 仍报绿」—— 本仓库 2026-10-16 真的这样假绿灯过一次（ops-enable --check 说齐备，
+  // 实际 shell 行还停在 publishBashTool: false）。
+  if (planResult.patched.length > 0) {
+    return 'profile 层这些行的 config 与本包期望不一致（plan 会补齐）：' + planResult.patched.join(', ')
+      + '。修法：node tools/ops-enable.cjs 然后重启 DSH。';
+  }
+  // 迁移标记（P1，2026-10-15 实测）：dsh-ops 的 updatedConfig()（lib/config-updates.js:9-14）会把
+  // 「没有 configUpdateVersion 且 allowSystemShellFallback: true」的行改成 false 并**写回 profile**
+  // （mountConfigUpdates 里的 entry.parent.tree.write()）。而 background 那四个 job 工具的发布门
+  // 正好要这个 true（lib/tools.js:311-316）—— 不声明标记 = 首次启动就被静默关掉。
+  // 行块切分复用 ops-enable 的 splitRows()（同一份真值，且这里刻意不新写正则：往测试里塞
+  // 带反斜杠的正则会被多层转义吃掉，本仓库已为此返工两次）。
+  const profileLines = fs.readFileSync(profilePatchPath, 'utf8').split(String.fromCharCode(10));
+  const blockOf = (id) => {
+    const hit = splitRows(profileLines).find((row) => row.id === id);
+    return hit === undefined ? null : profileLines.slice(hit.start, hit.end + 1).join(String.fromCharCode(10));
+  };
+  // 2026-10-21：迁移版本号从装机 dsh-ops 读，不再写死 1（0.3.2 已是 2）。
+  // 原来的 `block.indexOf('configUpdateVersion: 1')` 会在上游升到 2 之后**误报**，
+  // 而按它的提示去「修」正好会把已经迁好的配置降级 —— 判据本身在制造事故。
+  // background 也不该带标记：0.3.2 的 config-updates.js:22 明写它「needs no migration」。
+  const { MARKER: expectedMarker } = require('./ops-enable.cjs');
+  if (typeof expectedMarker !== 'string' || expectedMarker === '') {
+    return '读不到装机 dsh-ops 的 CONFIG_UPDATE_VERSION：无法判断 profile 的迁移标记是否齐备'
+      + '（ops-enable.cjs 也读不到时会拒绝改配置）。先确认 dsh-ops 装好了。';
+  }
+  for (const id of ['dsh-ops-shell', 'dsh-ops-file']) {
+    const block = blockOf(id);
+    if (block === null) return 'profile 里没有 ' + id + ' 行（上面的 plan 判据没抓到？）';
+    if (block.indexOf(expectedMarker.trim()) < 0) {
+      return 'profile 的 ' + id + ' 行缺迁移标记（期望 `' + expectedMarker.trim() + '`）—— '
+        + 'dsh-ops 的配置迁移会改写这一行。修法：node tools/ops-enable.cjs 后重启 DSH。';
+    }
+  }
+  {
+    const bg = blockOf('dsh-ops-background');
+    if (bg !== null && bg.indexOf('configUpdateVersion') >= 0) {
+      return 'profile 的 dsh-ops-background 行带了 configUpdateVersion —— dsh-ops 0.3.2 已移除该组件'
+        + '（config-updates.js:22「no-op stub that reads no config, so it needs no migration」），'
+        + '那个数字在上游没有任何语义，只会让 --check 报假缺失。修法：node tools/ops-enable.cjs。';
+    }
+  }
+  // bashPath（条件闸门）：没有 Git bash 的机器不该误报，但写了就必须存在 ——
+  // 一个指向不存在文件的 bashPath 比没有更糟（ops 会直接 available:false，四个 job 工具消失）。
+  {
+    const { detectBash } = require('./ops-enable.cjs');
+    const found = detectBash();
+    const bgBlock = blockOf('dsh-ops-background');
+    const declared = /bashPath:\s*(\S.*)$/m.exec(bgBlock);
+    if (found !== null && declared === null) {
+      return '本机探测到可用 bash（' + found + '）但 profile 的 dsh-ops-background 行没有 bashPath：'
+        + 'PATH 兜底会选中 WindowsApps 的 WSL 启动器（dsh-ops 只排除 System32 那个，lib/shells.js:481-487），'
+        + 'FastCtx 实测拒绝执行。修法：node tools/ops-enable.cjs 后重启 DSH。';
+    }
+    if (declared !== null) {
+      const raw = declared[1].trim().replace(/^["']|["']$/g, '');
+      if (!fs.existsSync(raw)) {
+        return 'profile 的 dsh-ops-background 行写了 bashPath 但那个文件不存在：' + raw
+          + ' —— ops 会解析成 available:false，四个 job 工具全部消失。删掉这一行或改成真实路径，然后重启。';
+      }
+    }
+  }
+
+  if (blockOf('dsh-ops-background').indexOf('allowSystemShellFallback: true') < 0) {
+    return 'profile 的 dsh-ops-background 行没有 allowSystemShellFallback: true —— 它的发布门要 bash 可解析'
+      + '（dsh-ops lib/tools.js:311-316），本机没装 @dsh-ops/bash-win32-x64，缺这一条那四个 job 工具一个都不出。';
+  }
+  const ptcBlock = blockOf('dsh-ops-ptc');
+  if (ptcBlock !== null && ptcBlock.indexOf('configUpdateVersion') >= 0) {
+    return 'profile 的 dsh-ops-ptc 行带了 configUpdateVersion —— resolvePtcConfig 只认 binaryPath/required，'
+      + '多给键会抛 Unknown PTC config key、整行挂载失败（本机实测：ptcRejectsMarker）。';
+  }
+  // 本包不得再依赖 vendor：目录与 exports 子路径都必须不存在。
+  if (fs.existsSync(path.join(PLUGIN_DIR, 'vendor'))) return 'vendor/ 目录又出现了：内嵌 ops 已按用户要求删除';
+  const pkg = JSON.parse(fs.readFileSync(path.join(PLUGIN_DIR, 'package.json'), 'utf8'));
+  if (pkg.exports?.['./ops-file'] !== undefined) return 'package.json 又出现了 ./ops-file 导出（vendor 入口）';
   return true;
 });
 
+// 10g) 装机 dsh-ops 的实现事实：工具前缀与注册点没改名 + PTC 门已放宽到 ptc+both。
+// 这一条把「别人下载本插件后能不能用 ops」的前提钉住：ops 一旦升级，判据可能变化。
+check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖面）', () => {
+  const { createRequire } = require('node:module');
+  let pkgJson;
+  try {
+    pkgJson = createRequire(path.join(PROFILE_DIR, 'package.json')).resolve('dsh-ops/package.json');
+  } catch {
+    return true; // 没装 dsh-ops：本包不依赖它，适配层自动静默，无需报失败。
+  }
+  const root = path.dirname(pkgJson);
+  const version = JSON.parse(fs.readFileSync(pkgJson, 'utf8')).version ?? '?';
+  const policy = fs.readFileSync(path.join(root, 'lib', 'policy.js'), 'utf8');
+  if (!/export const TOOL_PREFIX = 'ops_'/.test(policy)) return `dsh-ops ${version} 的 TOOL_PREFIX 变了：lib/ops-adapter.js 的 OPS_TOOL_NAMES 需要逐名重核`;
+  // 2026-10-21：判据从「背一整行字面量」改成「把装机那份的名单解析出来、逐名比对」。
+  // 起因是真机抓到的一处**报表缺陷**：ops 0.3.2 的 FILE_TOOLS 已经是 11 个，
+  // 而 lib/ops-adapter.js 的 OPS_TOOL_NAMES 还停着 0.3.0 的四个 —— 七个真在跑的工具
+  // 从来没进过能力盘点。逐字面量比对只能发现「官方改了」，发现不了「我们少列了」。
+  const filesMatch = /FILE_TOOLS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(policy);
+  if (filesMatch === null) return 'dsh-ops ' + version + ' 的 FILE_TOOLS 形状变了：lib/ops-adapter.js 的名单要重核';
+  const fileTools = filesMatch[1].split(',').map((part) => part.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  const adapter = require('../lib/ops-adapter.js');
+  const expected = fileTools.map((raw) => 'ops_' + raw);
+  const missing = expected.filter((name) => !adapter.OPS_TOOL_NAMES.includes(name));
+  if (missing.length > 0) {
+    return 'dsh-ops ' + version + ' 会发布、但本包 OPS_TOOL_NAMES 里没有的工具：' + missing.join('、')
+      + ' —— 能力盘点会少报（用户在插件页/诊断里看到的比实际少）';
+  }
+  // background 组件在 0.3.2 被**整体移除**了（README:96；lib/components/background/index.js 只剩一个
+  // 只 warn 一次的空壳，不再发布任何工具）。所以这里不再要求 BACKGROUND_TOOLS 存在，而是分两种情况：
+  //   * 新版没有它 → 必须被 OPS_REMOVED_COMPONENTS 收录（否则能力盘点会把它当成「应当在位」而报假缺失）；
+  //   * 老版本还有它 → 逐个名字都必须在 OPS_TOOL_NAMES 里（兼容老版本的名单不能丢）。
+  const backgroundMatch = /BACKGROUND_TOOLS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(policy);
+  if (backgroundMatch === null) {
+    if (!adapter.OPS_REMOVED_COMPONENTS.includes('background')) {
+      return 'dsh-ops ' + version + ' 已经没有 BACKGROUND_TOOLS（background 组件被移除），但 lib/ops-adapter.js 的'
+        + ' OPS_REMOVED_COMPONENTS 里没有 background —— 能力盘点会把它的四个工具当成「应当在位」，报出假缺失';
+    }
+    const stub = path.join(root, 'lib', 'components', 'background', 'index.js');
+    if (!fs.existsSync(stub)) return 'dsh-ops ' + version + ' 既没有 BACKGROUND_TOOLS 也没有 background 空壳行 —— 行还在 profile 里，加载会炸';
+    if (!fs.readFileSync(stub, 'utf8').includes('was removed')) return 'background 空壳行的说明变了：README/§3.8 里「该组件已移除」的引用要重核';
+  } else {
+    const backgroundTools = backgroundMatch[1].split(',').map((part) => part.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+    const missingBg = backgroundTools.map((raw) => 'ops_' + raw).filter((name) => !adapter.OPS_TOOL_NAMES.includes(name));
+    if (missingBg.length > 0) return 'background 组件的工具没进 OPS_TOOL_NAMES：' + missingBg.join('、');
+  }
+  // 本包**不改 dsh-ops 的源码**（用户 2026-10-15 明令）。这里只核对两件事：
+  // ① 装机那份的注册门仍是原版形状（只认纯 ptc）—— 若哪天它变了，本包的
+  //    「预设 ptc + 关批量档 = 拿到 ops_batch/ops_result」这条杠杆的说明就要重核；
+  // ② 宿主侧的装配段名没漂（本包判断呈现档只用这两个公开段名）。
+  const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
+  if (!ptcIndex.includes("assembly.tools.length === 1 && assembly.tools[0].name === 'run_code'")) {
+    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（只认纯 ptc 那条判据没找到）：' 
+      + '本包 INTERFACES §3.8 与 lib/ops-adapter.js 里「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
+  }
+  const toolsSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
+  if (toolsSrc === '') return '读不到 app.asar 里的 dsh-tools：无法验证呈现档的装配段名';
+  if (!/name:\s*"tools:sdk"/.test(toolsSrc) || !/name:\s*"tools:ptc-only"/.test(toolsSrc)) {
+    return '宿主 dsh-tools 的装配段名变了（tools:sdk / tools:ptc-only）：本包按呈现档给的指引与检测判据需要重核';
+  }
+  return true;
+});
 // 10e) 依赖解析接线：本包以 link: 安装时 Node 解析到真实路径，需要一个指向
 // <dshHome>/profiles/node_modules 的 junction，否则 @deepseek-ai/dsh-tools 在
 // **模块加载期**解析失败，host 行无法激活（首次安装实测就是这么失败的）。
@@ -1206,7 +1398,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 12g) skill：队员必须保留它，且官方「工具可见性 ↔ 技能目录」的绑定必须仍然成立。
     //
     // 为什么要有这一组（2026-10-07）：`skill` 由 preset 行带来（presets/dispatch-mode.patch.yml:142-146），
-    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:472-482），所以队员天然能用 —— 这件事此前**零闸门**。
+    // 不在 TEAMMATE_TOOL_DENY 里（lib/roster.js:705），所以队员天然能用 —— 这件事此前**零闸门**。
     // 失效方式与 2026-10-07 修掉的「/team 静默拒收附件」同类：插件照常加载、/team 照常可用，
     // 只是全队再也不会用技能（目录不注入 = 模型不知道有哪些技能，工具还在也等于没用）。
     // 官方实现是**两处**共同决定的，所以这里分两条钉：判据（工具身份比较）+ 事件作用域（按 agent 过滤）。
@@ -1242,14 +1434,26 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     });
 
     check('agent/pre-step 仍按 agent 作用域过滤（队员各自拿一份目录的前提）', () => {
-      const invariant = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/invariant.js') || '';
-      if (invariant === '') return '读不到 dsh-scope/lib/invariant.js';
-      // 没有这条过滤器，agent/pre-step 会变成全局广播：一个队员装配时**所有** agent 都会收到
-      // 目录（甚至包括已经关闭团队的会话）。integration-test 里两条「队员/Lead 各自收到目录」
-      // 的断言依赖它就是按 agent 过滤的。
-      if (!/"agent\/pre-step":\s*\(args\)\s*=>\s*args\[0\]\["agent"\]/u.test(invariant)) {
-        return 'agent/pre-step 的作用域过滤器不再是 `args[0]["agent"]` —— 目录注入会广播给所有 agent，'
-          + 'integration-test §2.5 的断言前提不成立';
+      // ⚠️ 2026-10-21：0.2.1-rc.2 把过滤器从 dsh-scope/lib/invariant.js 搬走了 —— 现在
+      // dsh-scope 只剩 lib/index.js，判据改由 **carrier**（scopeTarget(agent, agent)）承担：
+      // dsh-agent 的 agentEvents 把 agent 与它的 scope carrier 绑成一个对象，
+      // 每次 waterfall 都把 carrier 当第一个参数传下去，于是注册在某个 agent ctx 上的
+      // 监听器只会收到**这个 agent** 的事件。前提没变（仍是按 agent 隔离），依据变了。
+      //
+      // 没有这层隔离，agent/pre-step 就是全局广播：一个队员装配时所有 agent 都会收到目录
+      // （甚至包括已关团的会话）。integration-test §2.5 两条断言依赖它。
+      const agentSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent/lib/index.js') || '';
+      if (agentSrc === '') return '读不到 dsh-agent/lib/index.js';
+      if (!/function agentCarrier\(agent\)\s*\{\s*return scopeTarget\(agent, agent\);?\s*\}/u.test(agentSrc)) {
+        return 'agentCarrier 不再是 scopeTarget(agent, agent) —— agent 事件的按 agent 隔离依据要重读';
+      }
+      if (!/waterfall\(name, payload, \.\.\.rest\)\s*\{\s*const waterfall = ctx\.waterfall;\s*return waterfall\(carrier, name,/u.test(agentSrc)) {
+        return 'agentEvents.waterfall 不再把 carrier 当第一个参数传给 ctx.waterfall —— '
+          + '预处理器会退化成全局广播，integration-test §2.5 的断言前提不成立';
+      }
+      // 另一条独立证据：agent 作用域上真的注册了 agent/pre-step 监听（不是全局注册）。
+      if (!/agentCtx\.on\(\s*"agent\/pre-step"/u.test(agentSrc)) {
+        return 'dsh-agent 不再在 agentCtx 上注册 agent/pre-step —— 作用域绑定的形状变了，要重读';
       }
       return true;
     });
@@ -1383,11 +1587,38 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
   // 这三条检查就是那个前提的报警器。
   const agentTeamIndex = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
 
-  check('官方建队员仍走 startContinuable（同时在线帽 maxActiveSubagents 的存在前提）', () => {
+  check('官方建队员仍走 continuable 派发，且仍会撞上同时在线帽（maxActiveSubagents 的存在前提）', () => {
+    // ⚠️ 2026-10-21：入口方法从 startContinuable 改名成了 startActivation（0.2.1-rc.2）。
+    // 但**前提没变**，只是路径长了：startActivation → manager.startLocal →
+    // this.materialize(...) → pool.reserve(this.maxActiveSubagents()) → 满了抛
+    // ACTIVATION_LIMIT_REACHED（dsh-subagent/lib/types/activation.js 的 ActivationPool.reserve）。
+    // 所以判据从「认一个方法名」改成「认**整条链**」—— 任何一环断了这条闸先红：
+    //   * 入口不再是 continuable 派发（改 one-shot 就再也撞不到这道帽）；
+    //   * 预留不再取 maxActiveSubagents（容量表达变了）；
+    //   * 满了不再抛 ACTIVATION_LIMIT_REACHED（lib/tools.js 的翻译失去触发点）。
     if (agentTeamIndex === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
-    if (!agentTeamIndex.includes('this.ctx.subagents.startContinuable({')) {
-      return '官方不再用 startContinuable 建队员 —— MAINTAINER-NOTES.md §4.2.1「同时在线帽管到本插件」这条结论失效，'
-        + 'lib/tools.js 的 ACTIVATION_LIMIT_REACHED 翻译可能再也命中不了，请重新核对官方派发方式';
+    const dispatchAt = agentTeamIndex.indexOf('this.ctx.subagents.startActivation({');
+    if (dispatchAt < 0 && !agentTeamIndex.includes('this.ctx.subagents.startContinuable({')) {
+      return '官方建队员既不走 startActivation 也不走 startContinuable —— MAINTAINER-NOTES.md §4.2.1'
+        + '「同时在线帽管到本插件」这条结论失效，lib/tools.js 的 ACTIVATION_LIMIT_REACHED 翻译可能再也命中不了';
+    }
+    // 派发时必须带 delivery: "parent"（continuable 语境）—— one-shot 派发不带它。
+    if (dispatchAt >= 0) {
+      const call = agentTeamIndex.slice(dispatchAt, dispatchAt + 400);
+      if (!/delivery:\s*"parent"/u.test(call)) {
+        return 'startActivation 的调用不再是 delivery:"parent"（continuable 派发）—— 这是否仍是常驻队员要重核，'
+          + '同时在线帽与「返工回同一个队员」两条结论都压在它上面';
+      }
+    }
+    const subagentIndex2 = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '';
+    const activationSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/types/activation.js') || '';
+    if (subagentIndex2 === '' || activationSrc === '') return '读不到 dsh-subagent 的派发实现';
+    if (!/pool\.reserve\(this\.maxActiveSubagents\(\)\)/u.test(subagentIndex2)) {
+      return 'materialize 不再用 maxActiveSubagents() 预留名额 —— 同时在线帽的容量表达变了';
+    }
+    if (!/this\.slots\.size >= capacity/u.test(activationSrc) || !/ACTIVATION_LIMIT_REACHED/u.test(activationSrc)) {
+      return 'ActivationPool.reserve 不再按 capacity 拒绝并抛 ACTIVATION_LIMIT_REACHED —— '
+        + 'lib/tools.js 的「先收人再派活」提示失去触发点';
     }
     return true;
   });
@@ -1520,6 +1751,174 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     }
     // 官方长度上限：>64 才拒（memberName 里是 value.length > 64）。
     if (!/value\.length > 64/u.test(official)) return '官方的 64 长度上限不见了这个形状，lib/roster.js 的对应判断要重核';
+    return true;
+  });
+
+  check('工具行标签表与官方 locale 逐字一致（zh 与 en 两侧都比对）', () => {
+    // lib/graph.js 的 OFFICIAL_TOOL_TITLES / _EN 是浮窗里每一行工具调用的标签。
+    // 用户 2026-10-09 的原话就是「一定要正确，和我用官方的对话框没太大区别」，
+    // 所以这两张表**必须是官方 locale 的真值**，不是我觉得顺手的措辞 ——
+    // 而「是官方真值」这件事不能靠注释里写一句「脚本抽的」就成立（注释会过时，
+    // 代码不会）。这里逐键逐值比对，官方改了我们就红。
+    const conv = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js') || '';
+    if (conv === '') return '读不到 dsh-client-ui-conversation/lib/client.js';
+    // 官方 locale 块里每个 key 出现两次：先 zh 后 en。判据不靠顺序猜：
+    // 两份都必须**恰好**出现一次（第三份=官方加了新语言，要人工决定跟哪份）。
+    const pairs = new Map();
+    const re = /"tool\.title\.([A-Za-z]+)":\s*"([^"]*)"/g;
+    let m;
+    while ((m = re.exec(conv)) !== null) {
+      if (!pairs.has(m[1])) pairs.set(m[1], []);
+      pairs.get(m[1]).push(m[2]);
+    }
+    if (pairs.size === 0) return '官方 locale 里找不到任何 tool.title.*（键的写法变了？抽表脚本与这条都要重核）';
+    const officialZh = new Map();
+    const officialEn = new Map();
+    for (const [key, values] of pairs) {
+      if (values.length !== 2) {
+        return `官方 tool.title.${key} 出现 ${values.length} 次（预期 zh/en 各一次），两侧语言无法确定`;
+      }
+      const [a, b] = values;
+      const aCjk = /[\u4e00-\u9fff]/.test(a);
+      const bCjk = /[\u4e00-\u9fff]/.test(b);
+      // 一份必须含中文、一份必须不含 —— 否则就是官方换了语言数，不能靠位置猜。
+      if (aCjk === bCjk) return `tool.title.${key} 的两份值语言属性相同（${a} / ${b}），无法判定哪份是 zh`;
+      officialZh.set(key, aCjk ? a : b);
+      officialEn.set(key, aCjk ? b : a);
+    }
+    const graphText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'graph.js'));
+    if (graphText === '') return '读不到 lib/graph.js';
+    const parse = (name) => {
+      const at = graphText.indexOf('const ' + name + ' = {');
+      if (at < 0) return null;
+      const end = graphText.indexOf('\n};', at);
+      if (end < 0) return null;
+      const out = new Map();
+      const inner = graphText.slice(at, end);
+      for (const kv of inner.matchAll(/([A-Za-z]+):\s*'([^']*)'/g)) out.set(kv[1], kv[2]);
+      return out;
+    };
+    for (const [tableName, official] of [['OFFICIAL_TOOL_TITLES', officialZh], ['OFFICIAL_TOOL_TITLES_EN', officialEn]]) {
+      const mine = parse(tableName);
+      if (mine === null) return `lib/graph.js 里找不到 ${tableName}（改名或换写法了？同步这条闸门与抽表脚本）`;
+      // 别名表 TOOL_TITLE_ALIAS 指向的是**同两张表的键**，键集合比对只看这两张表本身。
+      const ghost = [...mine.keys()].filter((k) => !official.has(k));
+      const missing = [...official.keys()].filter((k) => !mine.has(k));
+      if (ghost.length > 0) return `${tableName} 里有官方没有的键：${ghost.join(', ')}（自造标签=与官方对话框不一样）`;
+      if (missing.length > 0) return `官方新增了 ${missing.join(', ')}，${tableName} 没跟上了`;
+      const driftKeys = [...mine.keys()].filter((k) => mine.get(k) !== official.get(k));
+      const drift = driftKeys.map((k) => k + ': 本插件「' + mine.get(k) + '」/ 官方「' + official.get(k) + '」');
+      if (drift.length > 0) return `${tableName} 与官方文案不一致：${drift.join(' | ')}`;
+    }
+    // 两侧键集合必须相同：少一个键，另一种语言就查不到、回退成工具原名。
+    const zhTable = parse('OFFICIAL_TOOL_TITLES');
+    const enTable = parse('OFFICIAL_TOOL_TITLES_EN');
+    // （箭头函数体不加花括号时，换行后的 .concat 会挂到 has(k) 的返回值上 —— 布尔没有 concat。
+    //  同一个笔误我在这条闸门里犯了两次，写成分行表达式就得加括号。）
+    const onlyZh = [...zhTable.keys()].filter((k) => !enTable.has(k));
+    const onlyEn = [...enTable.keys()].filter((k) => !zhTable.has(k));
+    const asym = onlyZh.concat(onlyEn);
+    if (asym.length > 0) return '两张表键集合不相等：' + asym.join(', ');
+    return true;
+  });
+
+  // ── 本轮（弹窗等价 + i18n）新依赖的官方实现 ─────────────────────────────
+  // 这些都是**我们照着抄/照着判**的形状。官方一改，我们的失败方式是静默的
+  // （标签查不到、展开层空白、停止键没了、语言不切），所以每条都要钉。
+  check('官方工具行：resultText / formatToolBody / toolRowModel / expandable 四个形状仍在', () => {
+    const tool = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-tool/lib/client.js') || '';
+    if (tool === '') return '读不到 dsh-client-ui-tool/lib/client.js';
+    // lib/graph.js 的 resultText/formatToolBody 是这两个函数的**移植**（同输入同输出）。
+    for (const needle of ['function resultText(', 'function formatToolBody(', 'function toolRowModel(']) {
+      if (!tool.includes(needle)) return '官方少了 ' + needle + ' —— graph.js 的同名移植失去了依据，必须重读官方实现';
+    }
+    // 「有没有得展开」官方是这么判的（我们据此决定给不给箭头）：
+    if (!tool.includes('const expandable = state !== "preparing"')) {
+      return '官方 expandable 的判据变了（原：state !== "preparing" 且有输入/输出/卡片）—— 弹窗的箭头给法要重核';
+    }
+    return true;
+  });
+
+  check('官方没有「成串工具调用折叠成一组」这回事（我们那个组是自己加的）', () => {
+    // 2026-10-14 我曾断言「官方也是把成串工具调用收进一个可展开组」—— 实读后**错了**：
+    // 官方逐条渲染（ToolCallTree 在 dsh-client-ui-tool 里存在， ActivityGroup /
+    // ToolCallGroup / collapseTool 三个包里都是 0 次）。既然折叠组是本插件自己的
+    // 产品判断，那组里的每一条必须**可达**（点开能看见），否则就是藏信息。
+    // selftest 的另一条钉的是「组里有 rows、句子在客户端拼」，这条钉的是外部依据：
+    // 哪天官方真加了折叠，我们要改的是**对齐官方**而不是继续自造。
+    const tool = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-tool/lib/client.js') || '';
+    const conv = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js') || '';
+    if (tool === '' || conv === '') return '读不到官方 tool/conversation bundle';
+    for (const needle of ['ActivityGroup', 'ToolCallGroup', 'collapseTool']) {
+      if (tool.includes(needle) || conv.includes(needle)) {
+        return '官方新增了 ' + needle + '（工具折叠机制）—— 本插件的 toolgroup 应当改为对齐官方而不是自成一派';
+      }
+    }
+    if (!tool.includes('ToolCallTree')) return '官方 ToolCallTree 不见了（工具行渲染大改）—— 弹窗的工具行口径要整体重读';
+    return true;
+  });
+
+  check('官方 MarkdownText 流式期间也渲 markdown（弹窗那句「官方流式是纯文本」的依据已订正）', () => {
+    const prim = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/index.js') || '';
+    // 0.2.1-rc.2 起这个包可能整个不在 asar 里（实现并进了 chat 的 bundle）——
+    // 那时用 chat bundle 当证据源，而不是把整条检查判红。
+    // ⚠️ 2026-10-21：0.2.1-rc.2 把 MarkdownText 的实现**挪进了 dsh-client-ui-chat 的 bundle**
+    // （dsh-client-ui-primitives 这个包已经不在 asar 里，剩下的是 chat 里对它的 import 引用）。
+    // 判据因此改成「认行为」而不是「认包路径」：
+    //   * MarkdownText 仍被官方正文/思考以 streaming 打开（chat bundle 里 streaming: running）；
+    //   * 它的渲染入口仍在（jsx 调用点在）。
+    // 若哪天官方改成纯文本流式，这条会先红，弹窗「流式也走 markdown」的依据就要重判。
+    const chat = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js') || '';
+    if (chat === '') return '读不到 dsh-client-ui-chat/lib/client.js';
+    // 官方正文/思考确实把它打开：streaming: running（chat bundle 里实测存在）。
+    if (!chat.includes('streaming: running')) {
+      return '官方不再传 streaming: running —— 弹窗「流式期间也走 markdown」的依据要重核';
+    }
+    // 渲染入口仍在（jsx 调用点）：MarkdownText 这个名字仍从这个 bundle 里被使用。
+    if (!/MarkdownText/u.test(chat)) return 'MarkdownText 不再出现在 chat bundle 里 —— 渲染入口换了，要重读';
+    return true;
+  });
+
+  check('停止生成走的那条路：cancel() 仍按 address 分流 interruptByParent / session.cancel', () => {
+    // 弹窗那颗停止键调的是**官方 session.cancel()**（不是插件自己的通道）。
+    const cli = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js') || '';
+    if (cli === '') return '读不到 dsh-api-session-controller/lib/client.js';
+    if (!cli.includes('async cancel()')) return 'session.cancel() 不在了 —— 弹窗的停止键必须换通道';
+    if (!cli.includes('interruptByParent')) return 'cancel() 不再走 subagents.interruptByParent 分流（子会话寻址口径变了）';
+    // 「在跑」的真值也在这份文件里：this.running 由 :1971-1972 写。
+    if (!cli.includes('this.running = running')) return 'running 字段的写法变了 —— 按钮显隐判据（session.running）要重读';
+    return true;
+  });
+
+  check('计划审批的匹配键：plan-review / Approve / Keep planning 三个常量逐字未变', () => {
+    // 弹窗按计划判「批准」时发的批次必须与官方读取端**逐字**一致，
+    // 否则官方 :289 那一串比较不通过，计划会永远停在「等批准」。
+    const plan = asar.read('dsh/node_modules/@deepseek-ai/dsh-plan-mode/lib/index.js') || '';
+    if (plan === '') return '读不到 dsh-plan-mode/lib/index.js';
+    for (const needle of [
+      'const REVIEW_ID = "plan-review"', 'const APPROVE_LABEL = "Approve"',
+      'const KEEP_PLANNING_LABEL = "Keep planning"', 'entry.id === REVIEW_ID',
+      'item.selected[0] !== APPROVE_LABEL', 'item.custom !== void 0',
+    ]) {
+      if (!plan.includes(needle)) return '官方计划审批的判据少了「' + needle + '」—— 弹窗发的答案批次要按新判据重写';
+    }
+    // 这三个字符串是**协议**，不是文案：插件的 PLAN_REVIEW 常量必须保持官方英文原样。
+    const graph = readFileOr(path.join(PLUGIN_DIR, 'lib', 'graph.js'));
+    for (const needle of ["id: 'plan-review'", "'Approve'", "'Keep planning'"]) {
+      if (!graph.includes(needle)) return 'lib/graph.js 的计划常量不再逐字等于官方（' + needle + '）';
+    }
+    return true;
+  });
+
+  check('官方 locale 面：bind / getSnapshot / subscribe 三个方法仍给插件用', () => {
+    // i18n 的全部改动压在这三个方法上（localeText 查 bind，active 读 getSnapshot，
+    // 重刷靠 subscribe）。少任何一个，浮窗就退回「恒读 zh」或「切语言不重画」。
+    const loc = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-locale/lib/client.js') || '';
+    if (loc === '') return '读不到 dsh-client-locale/lib/client.js';
+    for (const needle of ['getSnapshot() {', 'subscribe(fn) {', 'bind(ns) {']) {
+      if (!loc.includes(needle)) return '官方 locale 少了 ' + needle + ' —— localeText/wsRelanguage 的依据要重读';
+    }
+    if (!loc.includes('active: this.resolveActive()')) return '快照里的 active 取法变了（弹窗按它判中英）';
     return true;
   });
 
@@ -1659,6 +2058,254 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     if (!/waterfall\.resolve\(answer\)/.test(uq)) {
       return '官方 answer() 不再只是 waterfall.resolve(answer) —— 若它现在会回报失败，'
         + '弹窗的 bridgeQuestionOutcome 验结算可以简化，但语义要重新核对';
+    }
+    return true;
+  });
+
+  // ── 队员 agent 预设重绑所依赖的官方实现（2026-10-15 新增）──────────────────
+  // 「让 12 个队员各选一份预设」不是我们自己的机制：它完全建立在官方注册表的
+  // mount/select/bind/rebind + 作用域链读时求值之上。官方任何一处改版，本功能会
+  // **静默退化**成「队员还是调度模式」，所以逐条钉住。
+  check('官方 agentPresets 仍给 list / composedPreset / mount / select 四个方法', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    for (const needle of ['async list() {', 'composedPreset(ctx) {', 'async mount(ctx, id) {', 'async select(agent, agentPreset) {']) {
+      if (!reg.includes(needle)) return '官方注册表少了 ' + needle + ' —— 配置页的预设表/重绑的依据要重读';
+    }
+    return true;
+  });
+
+  check('重绑的落点：bind() 仍用 binding.parent.rebind(新代际.key) 换父', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    if (!reg.includes('binding.parent.rebind(generation.key)')) {
+      return 'bind() 不再走 rebind 换父 —— 换预设的机制变了，lib/runtime.js 的 rebindMemberPreset 要重读（可能已不需要，也可能根本做不到）';
+    }
+    if (!reg.includes('this.join(ctx, key, generation)')) return 'join() 的调用形状变了';
+    return true;
+  });
+
+  check('dsh-scope：rebind 仍是一等能力，且父链是**读时**遍历（换父立刻生效）', () => {
+    const scope = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
+    if (scope === '') return '读不到 dsh-scope/lib/index.js';
+    if (!scope.includes('return { rebind(next) {')) return 'bindScopeParent 不再返回 rebind 句柄 —— 换父这条路没了';
+    if (!scope.includes('for (const key of scopeChainOf(scope).reverse())')) {
+      return 'chainLayers 不再每次读时走 scopeChainOf —— 换父后工具/提示词可能不重算，队员预设会「改了没反应」';
+    }
+    const tools = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
+    if (tools === '') return '读不到 dsh-tools/lib/index.js';
+    if (!tools.includes('const layers = this.layers.chainLayers(scope);')) {
+      return 'tools.view() 不再用 chainLayers(scope) —— 继承面算法变了，本插件对「换 preset = 换工具」的判断要重读';
+    }
+    // own 层豁免也是前提：我们注册的团队工具/队员卡必须不受重绑影响。
+    if (!/and never what its OWN layer registers/.test(tools)) return 'restrict/view 的 own 层豁免注释变了 —— 重读「重绑不伤 own 层」这条断言的依据';
+    return true;
+  });
+
+  check('子代理仍**硬编码**继承父的实时 preset（所以必须我们重绑，官方没给参数）', () => {
+    const child = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/types/child-agent.js') || '';
+    if (child === '') return '读不到 dsh-subagent/lib/types/child-agent.js';
+    if (!child.includes("childCtx.get('agentPresets')?.composeFrom(childCtx, parent.ctx)")) {
+      return 'applyChildComposition 的继承写法变了 —— 若官方哪天给了 per-child preset 参数，'
+        + 'lib/runtime.js 的重绑就该换成官方入口（我们这套是绕不过去时才需要的）';
+    }
+    // 2026-10-21：0.2.1-rc.2 把 default 参数引了进来（selectedPreset ?? …），原来的整串不再逐字出现。
+    // 判据改成「三条事实同时成立」，而不是背一整行源码：
+    //   ① 子会话的 agentPreset 仍取自父的 composedPreset（省略独立选择时）；
+    //   ② 显式给了 selectedPreset 就优先用它（官方给的那条口子，我们将来可以改走它）；
+    //   ③ 没有 agentPreset 时仍是 composeFrom 父作用域（同步继承）。
+    if (!/selectedPreset \?\? parent\.ctx\.get\(['"]agentPresets['"]\)\?\.composedPreset\(parent\.ctx\)/u.test(child)) {
+      return 'childSessionMeta 不再把父的 preset 写进子的 header —— 恢复分支（以日志为准对齐）的依据要重读';
+    }
+    if (!/agentPreset === undefined \? \{\} : \{ agentPreset \}/u.test(child)) {
+      return 'childSessionMeta 不再把 agentPreset 落进 header.meta —— sessionProjections 的初值会读不到';
+    }
+    if (!/composeFrom\(childCtx, parent\.ctx\)/u.test(child)) {
+      return 'applyChildComposition 不再 composeFrom 父作用域 —— 「子硬编码继承父实时 preset」这条前提变了，'
+        + 'lib/runtime.js 的 rebindMemberPreset 可能需要整体改写';
+    }
+    return true;
+  });
+
+  check('会话重建读 agentPreset **投影**（header + selected 事件），所以我们落的事件有效', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    if (!reg.includes('key: "agentPreset"')) return 'agentPreset 投影的键变了（lib/runtime.js 读 sessionProjections 的那个键要跟着改）';
+    if (!reg.includes('init: (header) => header.agentPreset ?? null')) return '投影初值不再取自 header —— 恢复分支的判断要重读';
+    if (!reg.includes('event.type === "agent-preset/selected"')) return '投影不再由 selected 事件推进 —— 我们落盘那条就白写了';
+    return true;
+  });
+
+  check('官方 select() 仍用 turnBoundary 锁住已开播的会话（我们不绕这条）', () => {
+    const reg = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/lib/index.js') || '';
+    if (reg === '') return '读不到 dsh-agent-preset-registry/lib/index.js';
+    if (!reg.includes('boundary.openTurnStartSeq !== null || boundary.lastTurn > 0')) {
+      return 'select() 的锁定判据变了 —— 插件里「已开播就记下次派活生效」那条分支要按新判据重写';
+    }
+    if (!reg.includes('"agent-preset/locked"')) return '锁定错误码改名：lib/runtime.js 的 /locked|already started/ 匹配要更新';
+    return true;
+  });
+
+  check('内置组合的显示名仍由官方 locale 出（我们抄的是键名表，不是文案）', () => {
+    const cli = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-agent-preset/lib/client.js') || '';
+    if (cli === '') return '读不到 dsh-client-ui-agent-preset/lib/client.js';
+    if (!cli.includes('const BUILT_IN_PRESET_KEYS = {')) return '官方那张 id→键名 表改名/重构 —— presetLabel 的退路要重读';
+    for (const needle of ['presetStandardName', 'presetPtcName', 'presetMinimalName', 'presetCordisName']) {
+      if (!cli.includes(needle)) return '官方 locale 键 ' + needle + ' 不在了（本文件 BUILT_IN_PRESET_NAME_KEYS 与字典里的 presetName* 要跟着改）';
+    }
+    // 我们那份映射必须与官方那张逐字一致，否则内置组合在页面上会退回显示裸 id。
+    const client = readFileOr(path.join(PLUGIN_DIR, 'lib', 'client.js'));
+    for (const pair of [["standard: 'presetStandardName'", "ptc: 'presetPtcName'"], ["minimal: 'presetMinimalName'", "cordis: 'presetCordisName'"]]) {
+      for (const needle of pair) {
+        if (!client.includes(needle)) return 'lib/client.js 的 BUILT_IN_PRESET_NAME_KEYS 少了 ' + needle + '（与官方那张表不再逐字一致）';
+      }
+    }
+    return true;
+  });
+
+    // ── 批量调用档（both）所依赖的官方形状（2026-10-15 用户选路径 1）──────────────
+    // 本插件不开新预设、不改官方文件，只在队员自己的作用域喊一句 presentAs('both')。
+    // 这句话的全部效力都压在下面这几行官方代码上 —— 它们任一变动，功能就静默变成
+    // 「开关拨了但什么都没发生」，所以逐条钉住。
+    const batchTools = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
+    const batchScope = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
+    const batchPres = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-tool-presentation/lib/index.js') || '';
+    const batchMcp = asar.read('dsh/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js') || '';
+
+    check('官方呈现档只有 native|ptc（both 已被官方移除；本插件改为能力探测，官方加回时这条必须先红）', () => {
+      if (batchTools === '') return '读不到 dsh-tools';
+      // ⚠️ 2026-10-21 判据翻转（原判据是「both 必须存在」）。
+      //
+      // DSH 0.2.1-rc.2 把呈现档收窄成 native|ptc：asar 实读 dsh-tools:2763 是
+      // `mode: z.union(["native", "ptc"]).default("native")`，台架实测 `Config({mode:"both"})`
+      // 抛 `$.mode expected "native" | "ptc" but got "both"`。所以现在要断言的是**它不在** ——
+      // lib/runtime.js 的 presentationModeSupported 正是靠这个联合类型判定要不要声明 both。
+      // 官方哪天把 both 加回来，这条必须先红：那时探测会返回 true，both 支自动恢复生效，
+      // 但要有人重新实测一次（不能靠「探测通过」当验证）。
+      if (batchTools.includes('"native", "ptc", "both"')) {
+        return '官方把 both 加回来了 —— 本插件的 presentationModeSupported 会返回 true、both 档恢复生效；'
+          + '请把那两条断言改回「支持」并真机实测一次再合';
+      }
+      if (!/mode: z\.union\(\["native", "ptc"\]\)/u.test(batchTools)) {
+        return '呈现档联合类型既不是 native|ptc 也不是 native|ptc|both —— 请重读 dsh-tools 的 Config，探测判据要跟着改';
+      }
+      // ptc 分支的语义仍要钉住（它现在是唯一能拿到 run_code 的档）。
+      if (!batchTools.includes('.filter((schema) => schema.name === RUN_CODE_NAME)')) {
+        return 'ptc 分支不再是「只留 run_code」：纯 PTC 档的呈现基线要重写';
+      }
+      return true;
+    });
+
+    check('presentAs 仍是 per-scope 声明口，modeFor 仍是「最近的一层赢」', () => {
+      if (!batchTools.includes('presentAs(mode) {')) return 'ctx.tools.presentAs 不见了或改名了：applyMemberBatch 会走「取不到就记诊断」那条降级路';
+      if (!batchTools.includes('for (let index = layers.length - 1; index >= 0; index -= 1)')) {
+        return 'modeFor 不再是「从最近一层往前找第一个声明」：自己那层压不住预设那层，路径 1 的前提没了';
+      }
+      if (!batchScope.includes('farthest ancestor first and the exact scope last')) {
+        return 'dsh-scope 的 chainLayers 顺序注释变了（顺序一旦翻转，上面那条判据就是假的，功能会反过来被预设压住）';
+      }
+      return true;
+    });
+
+    check('装配期仍要求 ptcRuntime —— 本插件那条守卫的理由还成立', () => {
+      if (!batchTools.includes('requires a PTC runtime')) {
+        return 'dsh-tools 不再因缺 PTC 运行时抛错：applyMemberBatch 里的守卫可以删（删之前请同步 §7.10 那条负对照）';
+      }
+      if (!batchTools.includes('mode !== "native"')) return 'run_code 的注入条件变了（不再是「非 native 就注入」）：both 档拿不到 run_code 时 §7.10 会先红';
+      if (!batchTools.includes('is the only tool you can call directly')) {
+        return '官方 PTC_ONLY 文案变了：§7.10 拿它当钥匙，both/ptc 两条断言会假绿或假红，按新文案改判据';
+      }
+      return true;
+    });
+
+    check('呈现档声明包仍把 native|ptc 转成 presentAs（官方换档机制没变；both 已于 2026-10-21 被官方移除）', () => {
+      if (batchPres === '') return '读不到 dsh-agent-tool-presentation';
+      // 2026-10-21：官方把 both 从声明包的联合类型里删了（与 dsh-tools 的 Config 同步收窄）。
+      // 这里只钉仍在的两档；如果官方把 both 加回来，上一条「官方呈现档只有 native|ptc」会先红。
+      for (const value of ['"native"', '"ptc"']) {
+        if (!batchPres.includes(value)) return '声明包的 Config 联合类型里少了 ' + value;
+      }
+      if (!batchPres.includes('tools.presentAs(config.mode)')) return '声明包不再调 presentAs：官方换档机制变了，本插件直接 presentAs 的前提要重新核';
+      return true;
+    });
+
+    check('MCP 工具仍注册进调用方作用域（用户后加的 MCP 要能被队员看到，这一档才有意义）', () => {
+      if (batchMcp === '') return '读不到 dsh-mcp-client：MCP 工具进不来，用户那条「以后加的 MCP 也要能看到」失效';
+      if (!batchMcp.includes('ctx.tools.register(definition)')) return 'MCP 工具不再走 ctx.tools.register：它落在哪一层要重新核（both 档可能看不见它）';
+      if (!batchMcp.includes('const publicName = publicToolName(opts.serverName, tool.name)')) {
+        return 'MCP 工具的公开名规则变了：文档里写的 mcp__<server>__<tool> 与 §7.10 之外的判据都要跟着改';
+      }
+      return true;
+    });
+
+  // ── persona 钉住（2026-10-16 缓存前缀断裂修复）所依赖的官方事实 ────────────────
+  check('官方 persona 槽位：段名与排序值仍是我们钉住用的那一对', () => {
+    const sp = asar.read('dsh/node_modules/@deepseek-ai/dsh-system-prompt/lib/index.js') || '';
+    if (sp === '') return '读不到 dsh-system-prompt/lib/index.js';
+    if (!sp.includes('DEPLOYMENT_PERSONA_PREFIX: 0')) return '官方 DEPLOYMENT_PERSONA_PREFIX 不再是 0：roster.js 的 MEMBER_PERSONA_ORDER 要跟着改';
+    if (!sp.includes('PERSONA_PREFIX_SECTION = "deployment:persona-prefix"')) return '官方 persona 槽位名变了：roster.js 的 MEMBER_PERSONA_SECTION 要跟着改';
+    return true;
+  });
+
+  check('官方自己就用「同名段覆盖 persona」（dsh-subagent 的 per-child persona）—— 我们的手法不是野路子', () => {
+    const sub = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '';
+    if (sub === '') return '读不到 dsh-subagent/lib/index.js';
+    if (!sub.includes('if (composition.persona !== void 0) childCtx.systemPrompt.section({')) {
+      return 'dsh-subagent 不再用 childCtx.systemPrompt.section 覆盖 per-child persona：本包 pinMemberPersona 的手法失去官方先例，要重读';
+    }
+    if (!sub.includes('name: "deployment:persona-prefix",')) return '它覆盖的段名变了（与我们钉的不再是同一个槽位）';
+    return true;
+  });
+
+  check('dsh-persona 仍是 scope-only：挂在全局会撞（本包 try/catch 的语义依据）', () => {
+    const pe = asar.read('dsh/node_modules/@deepseek-ai/dsh-persona/lib/index.js') || '';
+    if (pe === '') return '读不到 dsh-persona/lib/index.js';
+    if (!pe.includes('collides with the registry')) return 'dsh-persona 不再声明「与注册表同名会撞」：撞车时的降级形状要重读';
+    if (!pe.includes('name: PERSONA_PREFIX_SECTION')) return 'dsh-persona 注册段名的方式变了';
+    return true;
+  });
+
+  check('dsh-scope：最近的一层赢（merge 用 set），同层同名仍然抛错（钉住靠这两条成立）', () => {
+    const sc = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
+    if (sc === '') return '读不到 dsh-scope/lib/index.js';
+    if (!sc.includes('merged.set(name, value)')) return 'merge 不再是「按链由远及近 set」：own 层遮蔽继承面这件事不成立了';
+    if (!sc.includes('farthest ancestor first, so the nearest scope')) return 'chainLayers 的顺序注释变了（远→近）：最近一层赢的依据要重读';
+    if (!sc.includes('if (data.has(name)) throw this.duplicateError(name)')) return 'NamedEntries.insert 不再对同层同名抛错：pinMemberPersona 的 catch 分支形状要重读';
+    return true;
+  });
+
+  check('官方两份 persona 的文字确实不同，且 ptc 那份带模型名 —— 本包钉住与「不钉 Lead」两条决定都挂在这上面', () => {
+    const minimal = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/minimal.patch.yml') || '';
+    const ptc = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/ptc.patch.yml') || '';
+    const standard = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml') || '';
+    if (minimal === '' || ptc === '' || standard === '') return '读不到内置预设的 patch（预设文件位置变了）';
+    if (!minimal.includes('prefix: You are a helpful software engineer assistant.')) return 'minimal 那份 persona 变了：本包「不复用任何一份」的理由要重读';
+    if (!ptc.includes('prefix: You are a coding agent powered by the {{model}} model.')) return 'ptc 那份 persona 变了（模型名不在里面的话，换模型翻面这条依据要重读）';
+    if (!standard.includes('prefix: You are a coding agent powered by the {{model}} model.')) return 'standard 那份 persona 与 ptc 不再同文：队员之间「前缀只分两组」的依据要重读';
+    const profile = readFileOr(path.join(PROFILE_DIR, 'cordis.patch.yml'));
+    if (!profile.includes('prefix: You are a helpful software engineer assistant.')) {
+      return 'profile 里 minimal-grayscale 的 persona 变了：第一次请求渲染「灰度短版」这条真机依据（143/143）要重读';
+    }
+    return true;
+  });
+
+  check('白名单三个 id 在本机真的注册着（standard/ptc 来自官方 bundle，极简灰度来自 profile patch）', () => {
+    const roster = readFileOr(path.join(PLUGIN_DIR, 'lib', 'roster.js'));
+    const ids = ['ptc', 'standard', 'minimal-grayscale'];
+    for (const id of ids) {
+      if (!roster.includes("'" + id + "'")) return 'TEAMMATE_PRESET_IDS 里不再有 ' + id + ' —— 本闸门的判据要按新名单重写';
+    }
+    for (const [id, file] of [['standard', 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/standard.patch.yml'], ['ptc', 'dsh/node_modules/@deepseek-ai/dsh-web-app/presets/ptc.patch.yml']]) {
+      const text = asar.read(file) || '';
+      if (text === '') return '读不到 ' + file + '（内置组合的声明位置变了？）';
+      // 不用 \b（在字符串字面量里它会被解析成退格符，正则永远匹配不上）：直接要求 id 后面
+      // 不能再是标识符字符或短横线，等价于「整段 id 精确匹配」。
+      if (!new RegExp('id: ' + id + '[^\wA-Za-z0-9_-]').test(text + ' ')) return
+    }
+    const profile = readFileOr(path.join(PROFILE_DIR, 'cordis.patch.yml'));
+    if (!profile.includes('preset-minimal-grayscale')) {
+      return 'profile patch 里没有 preset-minimal-grayscale：白名单第三项在这台机器上不存在。'
+        + '配置页会把它标成「本机没装」（这是正确降级），但用户点名要的三个模式少了一个 —— 要么改名单，要么把那份预设装回来';
     }
     return true;
   });
