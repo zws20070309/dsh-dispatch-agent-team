@@ -864,15 +864,23 @@ function functionBodyOf(source, needle) {
     }
     assert.equal(roster.recommendedRoleConfig('no-such-role'), undefined, '不存在的角色必须回 undefined');
     assert.equal(roster.recommendedRoleConfig('__proto__'), undefined, '原型键不许被当成有推荐（hasOwnProperty 守卫）');
-    assert.ok(roster.RECOMMENDATION_RULE.includes('纯 PTC') && roster.RECOMMENDATION_RULE.includes('模型'),
+    // 2026-10-21：规则文本随语义改写（不再出现「纯 PTC」这个词，改用「ptc 呈现档」）。
+    // 判据的**意图**不变：必须说清「动了哪两格」与「哪一格不动」。
+    assert.ok(roster.RECOMMENDATION_RULE.includes('批量调用') && roster.RECOMMENDATION_RULE.includes('ptc')
+      && roster.RECOMMENDATION_RULE.includes('模型'),
       '规则文本要同时说清「填什么」与「不填什么」，否则用户不知道按钮动了哪几格');
-    // 分组本身也是判据：只读/汇报型 = 关批量，写域型 = 开批量（这条划分是这张表的全部理由）。
-    const pure = ids.filter((roleId) => rec[roleId].batch === false);
-    const both = ids.filter((roleId) => rec[roleId].batch === true);
-    assert.deepEqual(pure.slice().sort(), ['frontier-auditor', 'plan-critic', 'red-team', 'researcher', 'scout', 'verify', 'visual-critic'],
-      '纯 PTC 那一档的角色集合变了：' + JSON.stringify(pure));
-    assert.deepEqual(both.slice().sort(), ['builder', 'integrator', 'refiner', 'scribe', 'tester'],
-      '保留批量调用那一档的角色集合变了：' + JSON.stringify(both));
+    // 分组本身也是判据（这条划分是这张表的全部理由）。
+    // ⚠️ 2026-10-21 档名对调：宿主删掉 both 后，本包把开关改成「开=ptc / 关=native」，
+    // 所以现在 **只读/汇报型 = batch 开（ptc，省 53KB/轮）**，
+    // **写域型 = batch 关（native，原生 edit/write 直调）**。
+    // 旧表的划分在新语义下会让写域型拿到它最不需要的那一档（只有 run_code，改文件要拼字符串），
+    // 与 roster.js 里第 3 条论证直接冲突。
+    const ptcRoles = ids.filter((roleId) => rec[roleId].batch === true);
+    const nativeRoles = ids.filter((roleId) => rec[roleId].batch === false);
+    assert.deepEqual(nativeRoles.slice().sort(), ['builder', 'integrator', 'refiner', 'scribe', 'tester'],
+      '写域型（batch 关 -> native，原生 edit/write 直调）的角色集合变了：' + JSON.stringify(nativeRoles));
+    assert.deepEqual(ptcRoles.slice().sort(), ['frontier-auditor', 'plan-critic', 'red-team', 'researcher', 'scout', 'verify', 'visual-critic'],
+      '只读/汇报型（batch 开 -> ptc，只有 run_code）的角色集合变了：' + JSON.stringify(ptcRoles));
   });
 
   await check('persona 钉住的取值形状：槽位名/排序值钉死，句子单行、无变量、无模型名、不按角色分叉', async () => {
