@@ -1427,7 +1427,8 @@ async function main() {
   {
     check('守卫先跑对：没有 ptcRuntime 时安装路径不开这一档，并留下一条点名的诊断', () => {
       const lines = runtime.notes().join('\n');
-      if (!lines.includes('批量调用（both）未开启')) return '安装路径没记「批量调用未开启」这条诊断（守卫没跑？）';
+      // 2026-10-21：文案随语义调整（不再说 both），判据跟着改成「已开但未生效」。
+      if (!lines.includes('批量调用已开但未生效')) return '安装路径没记「批量调用已开但未生效」这条诊断（守卫没跑？）';
       if (!lines.includes('ptcRuntime')) return '诊断没点名 ptcRuntime，用户照着改不了：' + lines.slice(-320);
       return true;
     });
