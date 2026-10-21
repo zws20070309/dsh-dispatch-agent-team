@@ -3161,6 +3161,21 @@ function functionBodyOf(source, needle) {
     const missing = MUST_HAVE_LABEL.filter((name) => graph.toolRowLabel(name) === generic);
     assert.deepEqual(missing, [],
       '这些工具会渲染成泛泛的「' + generic + '」（别名表没登记）：' + JSON.stringify(missing));
+    // ② 别名只能是「指向官方已有键」，而且渲染出来必须**逐字等于**那个官方键的值。
+    // 这条防的是「为了补全而自造词」（用户 2026-10-09 明令：要和官方对话框一致）。
+    const pairs = [
+      ['ops_bash', 'bash'], ['ops_grep', 'grep'], ['ops_glob', 'glob'],
+      ['ops_inspect_local_file', 'read'], ['ops_replace', 'edit'], ['ops_edit_file', 'edit'],
+      ['ops_write_file', 'write'], ['ops_stat', 'read'], ['ops_diff', 'read'],
+      ['ops_copy', 'write'], ['ops_move', 'write'], ['ops_remove', 'write'],
+      ['ops_job_output', 'readJob'], ['ops_job_list', 'listJobs'], ['ops_job_kill', 'killJob'],
+      ['ops_batch', 'bash'], ['ops_result', 'readJob'], ['ops_run_background', 'bash'],
+      ['team_task_get', 'getTeamTask'], ['present', 'sendMessage'], ['skill', 'read'],
+      ['diagram_read', 'read'], ['diagram_apply', 'edit'],
+    ];
+    const drifted = pairs.filter(([tool, officialKey]) => graph.toolRowLabel(tool) !== table.titles[officialKey]);
+    assert.deepEqual(drifted, [],
+      '这些工具的标签与官方同名键不一致（自造词或映射变了）：' + JSON.stringify(drifted));
   });
 
   await check('toolRowLabel：逐字用官方 tool.title.* 真值（不许再自造「已读取文件」这类文案）', () => {
