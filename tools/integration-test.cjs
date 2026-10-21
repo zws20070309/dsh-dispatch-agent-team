@@ -1557,24 +1557,30 @@ async function main() {
     joinOrRebind(mateH.ctx, 'dispatch-mode');
     root.emit('agent/created', { agent: mateH });
     // **故意不 await tick()**：要判的就是「agent/created 同步返回之后」那一刻的装配形状。
-    check('纯 PTC 档队员：agent/created 同步返回后第一次装配就只有 run_code（不等异步重绑）', () => {
+    // 2026-10-21 语义：batch:false 现在**明确钉 native**（不再是「沿用预设 ptc」）。
+    // 所以这条断言的期望从「恰好 [run_code]」改成「同步那一刻就已经没有 run_code」——
+     // 判的仍然是同一件事：**同步声明赶上了第一次装配**，不等异步重绑。
+    check('关批量档队员：agent/created 同步返回后第一次装配就已经是 native 形状（没有 run_code，不等异步重绑）', () => {
       const names = wireOf(mateHKey).knownNames;
-      if (names.length !== 1 || names[0] !== 'run_code') {
-        return `同步声明没生效，第一次装配不是纯 PTC 形状（${names.length} 个）：` + names.slice(0, 12).join(", ");
+      if (names.includes('run_code')) {
+        return `同步声明没生效，第一次装配里还有 run_code（${names.length} 个）：` + names.slice(0, 12).join(', ');
       }
+      if (names.length === 0) return '第一次装配是空的';
       return true;
     });
     await tick();
     await tick();
     await tick();
-    check('异步重绑落地后仍是纯 PTC 档（同步声明与重绑两种机制不打架，档不会被换回 native）', () => {
+    check('异步重绑落地后仍是 native 档（同步声明与重绑两种机制不打架，档不会被换回 ptc）', () => {
       const names = wireOf(mateHKey).knownNames;
-      if (names.length !== 1 || names[0] !== 'run_code') return '重绑之后档被换掉了：' + names.join(', ');
+      if (names.includes('run_code')) return '重绑之后档被换掉了（又出现 run_code）：' + names.join(', ');
       return true;
     });
     const hNotes = runtime.notes().join('\n');
     check('这一档的声明在安装记录里留了痕（用户/Lead 能看见队员本次是什么档）', () => {
-      if (!hNotes.includes('纯 PTC 档已在本层同步声明')) return '安装记录里没有那条声明回执：' + hNotes.slice(-300);
+      // 2026-10-21：回执分档位写（native 与 ptc 各一句），所以判「本层同步声明」这个共同片段。
+      if (!hNotes.includes('已在本层同步声明')) return '安装记录里没有那条声明回执：' + hNotes.slice(-300);
+      if (!hNotes.includes('原生档已在本层同步声明')) return '回执没说是哪一档（batch:false 应是 native）：' + hNotes.slice(-300);
       return true;
     });
 
@@ -1820,10 +1826,15 @@ async function main() {
     // 所以正确断言是：**恰好等于 ['run_code']**，一个不多一个不少；
     // 团队工具仍在**它自己的层**里（SDK 面可见、在 run_code 程序内可调 —— 真机 researcher-ops
     // 就是这样成功调用 report_result 的），只是不进送给模型的 schema。
-    check('关批量档 + 预设 ptc：本包不覆盖成 both，wire 恰好只剩 run_code（团队工具留在 SDK 面）', () => {
-      if (ptcOnlyWire.length !== 1 || ptcOnlyWire[0] !== 'run_code') {
-        return '纯 PTC 档的 wire 不是恰好 [run_code]（' + ptcOnlyWire.length + ' 个）：' + ptcOnlyWire.slice(0, 12).join(', ');
+    // 2026-10-21 语义再改：**关批量 = 明确钉 native**，不再是「沿用预设」。
+    // 原因（真机交付态）：12 个角色全部 preset 'ptc'，沿用预设会让开关两端都是 ptc ——
+    // 拨动开关没有任何可观测差异，与 both 时代那个静默缺陷同类。
+    // 现在的判据：关 -> wire 里**没有** run_code 且**有**原生工具；开 -> 有 run_code。
+    check('关批量档：本包明确钉 native，wire 里有原生工具、没有 run_code', () => {
+      if (ptcOnlyWire.includes('run_code')) {
+        return '关掉批量后 wire 里仍有 run_code（说明没有钉到 native 档）：' + ptcOnlyWire.slice(0, 12).join(', ');
       }
+      if (ptcOnlyWire.length === 0) return '关掉批量后 wire 是空的';
       const visible = [...root.get('tools').view(matePtcKey).visible.keys()];
       if (!visible.includes(roster.REPORT_TOOL_NAME)) {
         return '团队工具连 SDK 面都没了（那 run_code 程序里也调不到 report_result）：' + visible.slice(0, 12).join(
@@ -1832,13 +1843,32 @@ async function main() {
       return true;
     });
 
-    check('同一预设但批量档开着：本包覆盖成 both（run_code + 原生工具并存）—— 两档的差别确实由这个开关决定', () => {
+    check('同一预设但批量档开着：wire 里有 run_code —— 两档的差别确实由这个开关决定', () => {
       if (!ptcBatchWire.includes('run_code')) return '批量档没声明上（wire 里没有 run_code）：' + JSON.stringify(ptcBatchWire);
-      if (!ptcBatchWire.includes(roster.REPORT_TOOL_NAME)) return 'both 档丢了团队工具：' + JSON.stringify(ptcBatchWire);
+      // 这一条是整段的**核心**：同一个预设、只拨开关，两档的 wire 必须不同。
       if (ptcOnlyWire.join(',') === ptcBatchWire.join(',')) return '开与关的 wire 完全相同 = 开关没作用到这一档上';
       return true;
     });
 
+    // ── 2026-10-21：新宿主形状（both 已被官方删除）的覆盖 ──────────────────────────
+    // 本文件这一节加载的是 profile junction 的 @deepseek-ai/dsh-tools（0.2.0-rc.2，**还认 both**），
+    // 而真机宿主是 0.2.1-rc.2（**不认 both**）。只测前者等于只测了过去。
+    // 但 presentAs 本身不校验取值、也没有「移除一档」的口子，无法在真库上模拟「拒绝 both」。
+    // 所以这里改用**纯函数级**断言：presentationModeSupported 的判据就是「把候选值喂给
+    // tools 行的 Config schema」，而那个 schema 的形状已经从宿主真身核对过
+    // （.probe/deep/asar/dsh-tools.js:2763 是 z.union(["native","ptc"])）。
+    // 这里直接断言「runtime.js 里那句探测确实是这么写的」，并在 drift-check 里
+    // 持续核对宿主那份 schema 的真身（双向夹住，缺一不可）。
+    check('新宿主形状的判据接线仍在：presentationModeSupported 把候选值喂给 tools 行的 Config', () => {
+      const src = realFs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+      const at = src.indexOf('function presentationModeSupported');
+      if (at < 0) return 'runtime.js 里没有 presentationModeSupported';
+      const body = src.slice(at, at + 900);
+      if (!/schema\(\{ mode \}\)/.test(body)) return '探测没有把候选值喂给 Config schema（判据失效）';
+      if (!/constructor\?\.Config/.test(body)) return '没有从构造函数取 Config（实例上没有这个字段）';
+      if (!/return undefined;/.test(body)) return '取不到 schema 时必须返回 undefined（不知道），不能当成不支持';
+      return true;
+    });
     // 检测层必须如实报告"PTC 组件挂着但本作用域拿不到批量工具"，并给出**本插件**的修法。
     const gateProfile = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-itest-gateprofile-'));
     tempDirs.push(gateProfile);
