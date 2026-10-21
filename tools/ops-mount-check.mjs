@@ -7,7 +7,8 @@
 //
 // 四段（各用**独立** Context —— 组件都监听 agent/created，共用一个 root 会互相抢注，
 // 第一版就是这么把负对照搞失效的）：
-//   A = 交付态：file 四件套人人可见；纯 PTC 档队员（预设 ptc + 关批量档）拿到 ops_batch/ops_result
+//   A = 交付态：file 四件套人人可见；纯 PTC 档队员拿到 ops_batch/ops_result
+//       （2026-10-21 语义：本包「批量调用 开」= ptc 档 → 拿得到；关 = native → 拿不到）
 //   B = 负对照：同一份原版组件，只差呈现档 —— ptc 档拿到 / both 档拿不到
 //             ⇒ 因果在**本包能配的那一项**上，不需要也不允许去改 ops
 //   C = background 组件真起 FastCtx 服务器，四个 job 工具确实发布，并真调一次 ops_run_background
@@ -236,7 +237,9 @@ await tick(8);
 const ptcComp = await import(opsFile('lib/components/ptc/index.js'));
 ptcComp.apply(rootA, { required: false });
 await tick(8);
-// 两名队员：一名纯 PTC 档（预设 ptc + 关批量档 = 本包的合法杠杆），一名批量档（默认）。
+// 两名队员：一名纯 PTC 档（本包「批量调用 开」的装配结果），一名批量档（原生 + run_code 的环境）。
+// 注意这两名是**测试台架直接 presentAs 出来的**，不经过 applyMemberBatch —— 它们验的是 ops 的门，
+// 不是本包的开关映射（后者由 integration-test 的装配断言负责）。
 const matePtc = await makeMember(rootA, 'mate-ptc', 'ptc');
 const mateBoth = await makeMember(rootA, 'mate-both', 'both');
 const aPtc = await report(rootA, matePtc, '纯 PTC 档队员');
@@ -304,7 +307,9 @@ let okB = null;
   okB = gotPtc.length === 2 && gotBoth.length === 0;
   say('B) 负对照（同一份原版组件，只差呈现档）：ptc 档拿到 ' + JSON.stringify(gotPtc) + '，both 档拿到 ' + JSON.stringify(gotBoth));
   say('  判定 B = ' + (okB
-    ? '✓ ptc 档拿到 / both 档拿不到 —— 因果确实在呈现档，本包的修法（预设 ptc + 关批量档）成立'
+    ? '✓ ptc 档拿到 / both 档拿不到 —— 因果确实在呈现档。'
+      + '（2026-10-21 语义：本包「批量调用 **开**」= ptc 档 → 拿得到这两个工具；关 = native → 拿不到。'
+      + '旧文案写的是「预设 ptc + 关批量档」，那是 both 还在时的老杠杆，已不适用）'
     : '✗ 与预期不符：说明 ops 的门或本包的杠杆需要重新核对'));
   say('');
 }
