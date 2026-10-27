@@ -4,6 +4,8 @@
 /node_modules/
 
 # 运行时产物（配置与状态文件落在 DSH 主目录，不放仓库；这里再兜一层防止误提交）
+# dsh-ops worker 的文件锁（文件名是安装路径/内容哈希，属于本机运行时噪声，也是机器指纹）
+.dsh-ops-update-*.lock
 dispatch-agent-team.json
 dispatch-agent-team-sessions.json
 dispatch-agent-team-status.json
