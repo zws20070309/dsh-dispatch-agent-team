@@ -92,6 +92,38 @@ const CONFIG_UPDATE_VERSION = detectConfigVersion();
 const MARKER = CONFIG_UPDATE_VERSION === null ? null : ('    configUpdateVersion: ' + CONFIG_UPDATE_VERSION);
 
 /**
+ * dsh-ops 自己的 bundle patch 还 insert 不 insert 这四个遗留组件行。
+ *
+ * ── 为什么必须问这一句（2026-10-29 真机，本脚本当场给出了**假绿灯**）──────────────
+ * 本脚本的判据一直是「profile 里这四行在不在、config 齐不齐」。dsh-ops **0.5.0** 起
+ * 它的 cordis.patch.yml 不再 insert 这四行（改成 insert `dsh-ops-mode-*` 行族 + discovery，
+ * 源码注释原话 "Legacy component modules … are no longer inserted here"）。
+ * 于是 profile 里那四行成了**没有对应 insert 的孤立覆盖**：patch 找不到目标只会 warn
+ * `patch: entry %C not found` 然后跳过 —— 它们一个字节都不生效。
+ *
+ * 实测（本机 2026-10-29）：`--check` 报「已启用且配置齐备」，而 loader 里真正在跑的
+ * 是 5 个 mode 行；那四行既不在 loader 里，也不影响任何东西。用户看到「齐备」，
+ * 却不知道这个工具管的已经是**上一代的开关**。
+ *
+ * 所以 README / --check 的输出必须如实说明：不是「坏了」，是「这四行在新版上不再是
+ * 开关的载体」。修法不是去改 dsh-ops（用户明令不改别人源码），而是把事实说准。
+ *
+ * @returns {boolean|null} true = 上游仍 insert 四行；false = 已改版；null = 读不到（没装）。
+ */
+function legacyRowsStillInserted() {
+  const pkg = resolveOpsPackageJson();
+  if (pkg === null) return null;
+  try {
+    const text = fs.readFileSync(path.join(path.dirname(pkg), 'cordis.patch.yml'), 'utf8');
+    const inserted = [...text.matchAll(/^\s*-\s*id:\s*(\S+)/gmu)].map((match) => match[1]);
+    if (inserted.length === 0) return null;
+    return IDS.some((id) => inserted.includes(id));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * shell 段的追加指引（走 dsh-ops 自己的公开扩展点 extraGuidance，lib/config.js 接受、
  * lib/policy.js:64 把它拼到该段末尾 —— 不改它一行源码）。
  *
@@ -476,6 +508,15 @@ function main() {
     console.log('  （不带参数）  需要时补齐/翻转这四行并写盘；重启 DSH 生效');
     console.log('  --check      只报告，不写盘（退出码 1 = 需要处理）');
     console.log('  --revert     删掉这四行（回到 dsh-ops 自带默认）');
+    // 版本前提必须写在帮助里：0.5.0 之后这四行已不是开关载体，
+    // 用户照着「补齐/翻转」去维护会得到一份看着齐备、实际不生效的 profile。
+    if (legacyRowsStillInserted() === false) {
+      console.log('');
+      console.log('⚠ 本机 dsh-ops 已改版：它的 bundle patch 不再 insert 这四个遗留行，');
+      console.log('  改装 dsh-ops-mode-{minimal,standard,ptc,cordis} + dsh-ops-discovery。');
+      console.log('  本脚本的写盘动作对那一版**没有意义**（那四行只是没有目标的孤儿覆盖）；');
+      console.log('  开关以插件页的 mode 行为准，状态见 ~/.dsh/dispatch-agent-team-status.json 的 opsIntegration。');
+    }
     return 0;
   }
   const check = argv.includes('--check');
@@ -501,7 +542,19 @@ function main() {
   }
   const result = plan(text, { bashPath: detectBash() });
   const need = result.flipped.length + result.appended.length + result.patched.length;
+  // 上游是否还 insert 这四行（见 legacyRowsStillInserted 的注释）。
+  // false = 这四行在 profile 里只是**没有目标的孤儿覆盖**，一个字节都不生效；
+  // 此时「齐备」这句话本身就是误导，必须换成事实说明。
+  const legacy = legacyRowsStillInserted();
   if (need === 0) {
+    if (legacy === false) {
+      console.log('profile 里这四行确实都在、config 也齐（' + file + '），但它们**已经不再是开关的载体**：');
+      console.log('装机 dsh-ops 的 bundle patch 不再 insert dsh-ops-shell/file/background/ptc，');
+      console.log('改成了 dsh-ops-mode-{minimal,standard,ptc,cordis} + dsh-ops-discovery 行族。');
+      console.log('patch 找不到目标只会 warn 并跳过 —— 这四行现在不生效，也不需要再维护。');
+      console.log('实际的开关状态请看插件页的 dsh-ops 行，或状态文件的 opsIntegration 字段。');
+      return 0;
+    }
     console.log('已启用且配置齐备：四行都在 profile 层，没有 disabled:true，且每行的 config 与 ROWS 逐键一致（' + file + '）。');
     return 0;
   }
@@ -522,4 +575,4 @@ function main() {
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT, yamlScalar, normalizePathValue, CONFIG_UPDATE_VERSION };
+module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT, yamlScalar, normalizePathValue, CONFIG_UPDATE_VERSION, legacyRowsStillInserted };

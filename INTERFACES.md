@@ -28,7 +28,7 @@
 | 13 | §4:182 `teamToolDefinitions({runtime, agentTeams, config})` | 多一个可选 `include`（工具名单子集），队员侧用它过滤 |
 | 14 | §4:184 `TEAM_TOOL_NAMES` 定义在 tools.js | 真值已搬到**零 dsh 依赖**的 `lib/roster.js`（这样 selftest / drift-check 能直接读），`lib/tools.js` 只做转发 |
 | 15 | §5:191 `inject = ['systemPrompt','commands','tools','agents','agentTeams']` | **代码是 `['systemPrompt']`**（`lib/preset.js`）。多声明会让「那条可在插件页被关掉」变成整个 preset 半不 apply |
-| 16 | §4:172 + §5.2:211-217 + §5.3:248「命令与开关工具注册在 preset scope」 | **错，而且危险**：它们现在注册在**宿主平面**（`lib/preset.js` 的 `registerControls()`，由 `lib/index.js` 调用），`apply()` 只注册一个提示词段。在 preset 子树里发布能力/注册命令会把整份 preset 判成 broken（README §8.2 的事故） |
+| 16 | §4:172 + §5.2:211-217 + §5.3:248「命令与开关工具注册在 preset scope」 | **本条已于 2026-10-29 作废，以第 20 条为准**（原文这里写的是「它们现在注册在宿主平面、由 lib/index.js 调用 registerControls」，那是 2026-09-28 那次**越界**的写法，当天就被否证）。现行代码：`lib/preset.js` 的 `apply()` 用 `ctx.inject(['commands','tools'], cb)` 调 `registerControls(scoped)`，`lib/index.js` **不 import** preset.js 也不碰命令/工具注册（源码注释与 `tools/drift-check.cjs` 的控制面作用域闸门都钉着这条）。仍然成立的那半句：在 preset 子树里**发布服务**（ctx.provide / ctx.set）会让整份 preset 判成 broken——但「注册命令/工具」不属于发布服务。详见第 20 条与第 27 条 |
 | 17 | §6:258 `exports.inject = ['slots']` | 现在是 `['slots','locale']`；§6:275 签名里的 `subject` 不存在（官方只给 `plugins.detail.*` 传 subject）；§6:291 的 `N/7` 现在是 `N/12`（动态 `roles.length`） |
 | 18 | §6:279-290 ops 响应形状 | `get` 现在额外返回 `revision` / `diagnostics`；`set` 支持 **revision CAS**（不一致时 `{ok:false, conflict:true, revision}`）；`reset` 也返回 `revision`。只按本文档实现客户端会丢掉乐观并发保护 |
 | 19 | §5:191 / §5.2 / §5.3「控制面取服务的方式」 | **2026-09-28 的真实故障**：cordis 的 ctx 属性访问要求服务在**本 fiber 的 inject 列表**里，而宿主平面的 `commands` / `tools` 是**兄弟 fiber**（`dsh-base/cordis.patch.yml:286` / `:461`）提供的 → `ctx.commands` 抛 `cannot get property "commands" without inject`，异常被 try/catch 吞成一条 warn，于是插件正常加载、配置页正常，但 **`/team` 与两个开关工具全部消失**。现行写法：`lib/preset.js` 用 `ctx.inject(['commands','tools'], cb)` + `serviceOf(ctx, name)`（优先 `ctx.get`）。对照物：mcp-manager 把所有服务都写进了 inject（`lib/index.js:17`）。详见 README §8.3 |
@@ -486,7 +486,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
    `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:705`）。
-   注意 `lib/tools.js:671-675` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
+   注意 `lib/tools.js:692-696` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
    **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），

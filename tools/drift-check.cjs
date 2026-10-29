@@ -587,7 +587,13 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
   // 判据复用 tools/ops-enable.cjs 的 plan()（同一份真值，不在这里重写一遍正则 ——
   // 两处各写一份就会各自漂，那是本仓库反复栽过的坑）。plan 报"要翻转/要补行"= 不健康。
-  const { plan, splitRows } = require('./ops-enable.cjs');
+  const { plan, splitRows, legacyRowsStillInserted } = require('./ops-enable.cjs');
+  // 2026-10-29：先问清「这四行还是不是开关的载体」。
+  // dsh-ops 0.5.0 起它自己的 bundle patch 不再 insert dsh-ops-shell/file/background/ptc，
+  // 改成 mode 行族 —— profile 里那四行于是只是**没有目标的孤儿覆盖**，patch 找不到目标
+  // 只 warn 并跳过。此时下面那些「四行齐不齐」的判据全是空转（会假绿灯），
+  // 真正该看的是 loader 里挂了哪些 mode 行（由 lib/ops-adapter.js 的 OPS_MODE_ROWS 采集）。
+  const legacyRows = legacyRowsStillInserted();
   const planResult = plan(fs.readFileSync(profilePatchPath, 'utf8'));
   if (planResult.flipped.length > 0) {
     return 'profile 层这些行仍是 disabled: true：' + planResult.flipped.join(', ')
@@ -624,6 +630,24 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   if (typeof expectedMarker !== 'string' || expectedMarker === '') {
     return '读不到装机 dsh-ops 的 CONFIG_UPDATE_VERSION：无法判断 profile 的迁移标记是否齐备'
       + '（ops-enable.cjs 也读不到时会拒绝改配置）。先确认 dsh-ops 装好了。';
+  }
+  // 上述「四行的 config 齐不齐 / 迁移标记 / bashPath」判据只在**四行仍是开关载体**时有意义。
+  // 0.5.0 起上游不再 insert 它们（见 legacyRowsStillInserted 的注释）：此时让这些判据继续
+  // 全绿就是假绿灯 —— 用户会以为「照 --check 提示维护这四行」等于 ops 配好了。
+  if (legacyRows === false) {
+    const adapter = require('../lib/ops-adapter.js');
+    if (!Array.isArray(adapter.OPS_MODE_ROWS) || adapter.OPS_MODE_ROWS.length === 0) {
+      return '装机 dsh-ops 已不再 insert 遗留四行，而 lib/ops-adapter.js 没有 OPS_MODE_ROWS —— '
+        + '能力盘点会把「五个 mode 行全在挂载」报成「一个组件都没挂」（假故障 + 队员丢 ops 指引）。';
+    }
+    const patchText = fs.readFileSync(path.join(PROFILE_DIR, 'node_modules', 'dsh-ops', 'cordis.patch.yml'), 'utf8');
+    const expectedModeIds = [...patchText.matchAll(/^\s*-\s*id:\s*(dsh-ops-mode-\S+|dsh-ops-discovery)\s*$/gmu)].map((m) => m[1]);
+    const missingMode = expectedModeIds.filter((id) => !adapter.OPS_MODE_ROWS.some((row) => row.id === id));
+    if (missingMode.length > 0) {
+      return 'dsh-ops 的 bundle patch 会 insert 这些 mode 行，而 OPS_MODE_ROWS 里没有：' + missingMode.join('、')
+        + ' —— 能力盘点会漏报该组件。';
+    }
+    return true;
   }
   for (const id of ['dsh-ops-shell', 'dsh-ops-file']) {
     const block = blockOf(id);
@@ -678,6 +702,42 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   return true;
 });
 
+/**
+ * 从**装机的 dsh-ops** 里读一个原始名清单（如 FILE_TOOLS / PTC_TOOLS）。
+ *
+ * 为什么要按模块而不是正则：0.5.0 把目录搬去了 lib/capabilities/registry.js，
+ * lib/policy.js 只剩 re-export。正则抓不到时报出来的是「我们找错了文件」，不是「官方改了」——
+ * 2026-10-29 这条就是这样红了一整天。按模块解析后，名单搬家不再产生假红。
+ *
+ * 顺序：先 require（Node 22+ 可直接 require ESM；本机实测通过），
+ * 失败再退回「在 policy.js 与 registry.js 里做文本解析」，最后才判 FAIL。
+ * @param root - dsh-ops 包根。
+ * @param policyText - lib/policy.js 内容（老版本的真值就在这里）。
+ * @param name - 导出的常量名。
+ * @returns {string[]|null} 原始名清单；两路都拿不到时 null。
+ */
+function resolveOpsNameList(root, policyText, name) {
+  const candidates = [path.join(root, 'lib', 'policy.js'), path.join(root, 'lib', 'capabilities', 'registry.js')];
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    try {
+      const loaded = require(file);
+      const value = loaded?.[name];
+      if (Array.isArray(value)) return value.map((item) => String(item));
+    } catch { /* 退回文本解析 */ }
+  }
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    // 老版本写法：`export const FILE_TOOLS = Object.freeze(['a','b'])`。
+    // 0.5.0 写法是 map 出来的（`FILE_CAPABILITIES.map(…)`），文本解析拿不到 —— 那一路靠上面的 require。
+    const match = new RegExp(name + ' = Object\\.freeze\\(\\[([^\\]]*)\\]\\)', 'u').exec(text);
+    if (match === null) continue;
+    return match[1].split(',').map((part) => part.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  }
+  return null;
+}
+
 // 10g) 装机 dsh-ops 的实现事实：工具前缀与注册点没改名 + PTC 门已放宽到 ptc+both。
 // 这一条把「别人下载本插件后能不能用 ops」的前提钉住：ops 一旦升级，判据可能变化。
 check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖面）', () => {
@@ -696,9 +756,12 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   // 起因是真机抓到的一处**报表缺陷**：ops 0.3.2 的 FILE_TOOLS 已经是 11 个，
   // 而 lib/ops-adapter.js 的 OPS_TOOL_NAMES 还停着 0.3.0 的四个 —— 七个真在跑的工具
   // 从来没进过能力盘点。逐字面量比对只能发现「官方改了」，发现不了「我们少列了」。
-  const filesMatch = /FILE_TOOLS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(policy);
-  if (filesMatch === null) return 'dsh-ops ' + version + ' 的 FILE_TOOLS 形状变了：lib/ops-adapter.js 的名单要重核';
-  const fileTools = filesMatch[1].split(',').map((part) => part.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  // 2026-10-29：dsh-ops **0.5.0** 把目录搬进了 lib/capabilities/registry.js，
+  // lib/policy.js 只剩一行 re-export（`export { FILE_TOOLS, … } from './capabilities/registry.js'`），
+  // 旧正则在这里抓不到任何东西 —— 它不是在报「官方改了」，是在报「我们找错了文件」。
+  // 判据改成：**按模块真值解析**（可 require 就 require，拿不到再退回文本解析），
+  // 这样「名单搬去别处」不再产生假红，而「名单内容真的变了」照样抓得住。
+  const fileTools = resolveOpsNameList(root, policy, 'FILE_TOOLS');
   const adapter = require('../lib/ops-adapter.js');
   const expected = fileTools.map((raw) => 'ops_' + raw);
   const missing = expected.filter((name) => !adapter.OPS_TOOL_NAMES.includes(name));
@@ -729,9 +792,21 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   //    「预设 ptc + 关批量档 = 拿到 ops_batch/ops_result」这条杠杆的说明就要重核；
   // ② 宿主侧的装配段名没漂（本包判断呈现档只用这两个公开段名）。
   const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
-  if (!ptcIndex.includes("assembly.tools.length === 1 && assembly.tools[0].name === 'run_code'")) {
-    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（只认纯 ptc 那条判据没找到）：' 
-      + '本包 INTERFACES §3.8 与 lib/ops-adapter.js 里「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
+  // 2026-10-29：判据从「逐字包含一整行」改成**语义三要件**。
+  // 0.5.0 把同一句拆成了多行，并把 `assembly.tools[0].name` 写成 `assembly.tools[0]?.name`
+  // （可选链）—— 逐字比对因此红了一天，而门的语义一个字都没变。
+  // 三要件就是这条杠杆成立的全部前提：① 工具数组恰好 1 个；② 那一个叫 run_code；
+  // ③ 还要求 tools:ptc-only 段非空。缺任何一条，「预设 ptc + 关批量 = 拿到 ops_batch」就不成立。
+  const ptcCompact = ptcIndex.replace(/\s+/gu, ' ');
+  const ptcGate = /Array\.isArray\(assembly\.tools\)/u.test(ptcCompact)
+    && /assembly\.tools\.length === 1/u.test(ptcCompact)
+    && /assembly\.tools\[0\]\??\.name === ['"]run_code['"]/u.test(ptcCompact)
+    && /name === ['"]tools:ptc-only['"]/u.test(ptcCompact)
+    && /section\.text\.trim\(\) !== ['"]['"]/u.test(ptcCompact);
+  if (!ptcGate) {
+    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（「恰好一个 run_code + 非空 tools:ptc-only」'
+      + '这三要件没找齐）：本包 INTERFACES §3.8 与 lib/ops-adapter.js 里'
+      + '「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
   }
   const toolsSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
   if (toolsSrc === '') return '读不到 app.asar 里的 dsh-tools：无法验证呈现档的装配段名';

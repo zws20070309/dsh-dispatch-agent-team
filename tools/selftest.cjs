@@ -2707,6 +2707,18 @@ function functionBodyOf(source, needle) {
     for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
       assert.ok(adapterSrc.includes("id: '" + id + "', component:"), 'ops-adapter 的 OPS_ROWS 必须覆盖 ' + id);
     }
+    // 2026-10-29：dsh-ops **0.5.0** 的 bundle patch 不再 insert 上面那四行，改成 insert
+    // 「一条预设一档」的 mode 行族（装机 0.5.0 的 cordis.patch.yml 实读，注释原话：
+    // "Legacy component modules … are no longer inserted here"）。只认遗留四行时真机表现为
+    // mounted=[] → 假故障「没有可用的组件挂着」+ linkOpsForMember 提前返回（队员全丢 ops 指引）。
+    for (const id of ['dsh-ops-mode-minimal', 'dsh-ops-mode-standard', 'dsh-ops-mode-ptc',
+      'dsh-ops-mode-cordis', 'dsh-ops-discovery']) {
+      assert.ok(adapterSrc.includes("id: '" + id + "', component:"), 'ops-adapter 的 OPS_MODE_ROWS 必须覆盖 ' + id);
+    }
+    assert.ok(adapterSrc.includes('OPS_ALL_ROWS'),
+      'detectOpsComponents 必须按 OPS_ALL_ROWS（新旧两代行）匹配，只认遗留四行会在 0.5.0 上判成「一个组件都没挂」');
+    assert.ok(/OPS_ALL_ROWS\.find\(\(row\) => row\.id === id\)/u.test(adapterSrc),
+      'detectOpsComponents 必须按 id 在 OPS_ALL_ROWS 里精确匹配（新旧两代行同一张表）');
     for (const tool of ['ops_inspect_local_file', 'ops_grep', 'ops_glob', 'ops_replace', 'ops_bash',
       'ops_run_background', 'ops_job_output', 'ops_job_list', 'ops_job_kill', 'ops_batch', 'ops_result']) {
       assert.ok(adapterSrc.includes("'" + tool + "'"), 'ops-adapter 的 OPS_TOOL_NAMES 必须含 ' + tool);
@@ -2881,6 +2893,15 @@ function functionBodyOf(source, needle) {
     // 它逼着实现写死 1，于是 ops 升到 2 之后本脚本会把用户的**已迁移**配置降级写回 1。
     assert.ok(enableSrc.includes('CONFIG_UPDATE_VERSION') && enableSrc.includes('detectConfigVersion'),
       'ops-enable 必须从装机 dsh-ops 读 CONFIG_UPDATE_VERSION（不许写死迁移版本号）');
+    // 2026-10-29 假绿灯闸门：dsh-ops 0.5.0 起它的 bundle patch **不再 insert** 这四行
+    // （改成 dsh-ops-mode-* 行族 + discovery，源码注释 "Legacy component modules … are no
+    // longer inserted here"）。此时 profile 里那四行只是没有目标的孤儿覆盖，patch 找不到
+    // 目标只 warn 并跳过。而 --check 当时仍报「已启用且配置齐备」—— 用户照它维护等于维护空气。
+    // 判据：必须能问出「上游还 insert 不 insert」，且 --check 的输出必须按答案分叉。
+    assert.ok(enableSrc.includes('legacyRowsStillInserted'),
+      'ops-enable 必须能判断「上游还 insert 不 insert 这四行」（否则 0.5.0 上 --check 是假绿灯）');
+    assert.ok(/legacy === false/u.test(enableSrc),
+      'ops-enable 的 --check 输出必须按 legacyRowsStillInserted() 分叉：孤儿行不能报「已启用且配置齐备」');
     assert.ok(!/configUpdateVersion: 1'/u.test(enableSrc),
       'ops-enable 里又出现了写死的 configUpdateVersion: 1（上游升到 2 时会把用户配置降级）');
     // shell / file 两行要带标记；background **不许带**（0.3.2 的 config-updates.js:22 明写
@@ -3127,7 +3148,11 @@ function functionBodyOf(source, needle) {
     assert.ok(guard >= 0 && checkAt > guard, '未知参数守卫必须排在默认动作之前');
     assert.ok(/if \(bad\.length > 0\)[\s\S]{0,400}return 2;/u.test(src), '未知参数必须以退出码 2 拒绝');
     // --help 必须自己开一条只打印的分支，不能靠「没有 --check」落到写盘。
-    assert.ok(/argv\.includes\('--help'\)[\s\S]{0,600}return 0;/u.test(src), '--help 必须单独走「只打印、直接返回」');
+    // 2026-10-29：窗口从 600 放宽到 1600 —— 帮助里加了一段「本机 dsh-ops 已改版」的前提说明
+    // （0.5.0 起那四行不再是开关载体，不说清楚用户会照着一份不生效的配置去维护）。
+    // **意图没变**：仍然是「--help 只打印、直接 return 0」，且必须排在默认写盘动作之前；
+    // 真跑一次 `node tools/ops-enable.cjs --help` 的输出就是这条断言的运行期对照。
+    assert.ok(/argv\.includes\('--help'\)[\s\S]{0,1600}return 0;/u.test(src), '--help 必须单独走「只打印、直接返回」');
   });
 
   await check('both 不被宿主支持时，预设 ptc 的队员仍必须同步声明 ptc（不许退回到 2026-10-16 的 P0）', () => {
@@ -3722,13 +3747,58 @@ function functionBodyOf(source, needle) {
       '轮询降档也要认能力闸门：旧宿主下覆盖层被丢掉，实时性还得靠轮询');
   });
 
+  await check('errorText：任意抛出值都渲染成一行可读文本，且永不抛（三个模块的 messageOf 统一走它）', async () => {
+    // 真实缺陷（2026-10-29）：lib/index.js / runtime.js / self-heal.js 三处各自写了一份
+    // `String(error.message ?? error)`。它在两种形状上会骗人（均已用 node -e 复现）：
+    //   ① 抛的是**结构化对象**（官方 TeamError 带稳定 code、未必有可读 message）→ `[object Object]`；
+    //   ② `String(Object.create(null))` → 抛 TypeError: Cannot convert object to primitive value，
+    //      也就是「报错」本身把调用点打挂。
+    const tc = await load('text-clip.js');
+    const cases = [
+      [undefined, '未知错误'],
+      [null, '未知错误'],
+      ['', '未知错误'],
+      ['boom', 'boom'],
+      [new Error('bad thing'), 'bad thing'],
+    ];
+    for (const [input, want] of cases) {
+      assert.equal(tc.errorText(input), want, 'errorText(' + String(input) + ') 应为 ' + want);
+    }
+    // code 必须一起给（官方原话：route on code, never by parsing message）。
+    assert.equal(tc.errorText(Object.assign(new Error('blocked'), { code: 'TEAM_TASK_BLOCKED' })),
+      'blocked（TEAM_TASK_BLOCKED）', '带 code 的错误必须把 code 一起渲染出来');
+    const codeOnly = tc.errorText({ code: 'TEAM_TASK_INVALID_TRANSITION' });
+    assert.ok(codeOnly.includes('TEAM_TASK_INVALID_TRANSITION'), '只有 code 的对象也必须把它渲染出来：' + codeOnly);
+    // 这三种形状旧实现分别是 [object Object] / 抛出 / [object Object]。
+    for (const value of [{ foo: 1 }, Object.create(null), [1, 2, 3]]) {
+      const out = tc.errorText(value);
+      assert.equal(typeof out, 'string', 'errorText 必须返回字符串');
+      assert.ok(out.length > 0, 'errorText 不得返回空串');
+      assert.ok(!out.includes('[object Object]'), 'errorText 又退化成 [object Object]：' + out);
+    }
+    // 带访问器的对象：读 message 本身抛，也必须回落而不是炸。
+    const angry = { get message() { throw new Error('nope'); }, get code() { throw new Error('nope'); } };
+    assert.equal(typeof tc.errorText(angry), 'string', '读属性抛错时也必须回落成字符串');
+    // 三个模块必须**都**走它，不许再各写一份（否则下一轮又会各自漂）。
+    for (const file of ['index.js', 'runtime.js', 'self-heal.js']) {
+      const src = readFileSync(path.join(LIB, file), 'utf8');
+      // 用字符串拼装而不是写正则字面量：这条路径上 { } 会被当成量词边界，
+      // 而测试脚本本身又是 CJS，容易踩到转义（本仓库为此返工过两次）。
+      const importLine = src.split('\n').find((line) => line.includes("from './text-clip.js'"));
+      assert.ok(importLine !== undefined && importLine.includes('errorText'),
+        file + ' 必须 import errorText from ./text-clip.js（实际：' + String(importLine) + '）');
+      assert.ok(!/String(error.message ?? error)/.test(src),
+        file + ' 里又出现了 String(error.message ?? error)（结构化对象会渲染成 [object Object]）');
+    }
+  });
+
   await check('lib/client.js 没有未闭合的 JSDoc 块（node --check 抓不到这类吞代码的错）', () => {
     // 真实事故（2026-10-13 本次开发）：写注释时开了 `/**` 却用 `//` 续行、
     // 也没有 `*/` 收尾 ⇒ 从那一行起整段被当成注释，**紧跟其后的 const 声明被吃掉**。
     // 语法完全合法（node --check 与 45 个冒烟用例全绿），只有真浏览器运行时才炸：
     //   ReferenceError: BRIDGE_RETAIN_SOURCE is not defined
     // 本仓库的 client.js 是手写 bundle、没有构建期类型检查，所以这条只能靠源码扫描钉住。
-    const files = ['client.js', 'graph.js', 'runtime.js', 'tools.js', 'roster.js', 'playbook.js', 'index.js', 'preset.js'];
+    const files = ['client.js', 'graph.js', 'runtime.js', 'tools.js', 'roster.js', 'playbook.js', 'index.js', 'preset.js', 'text-clip.js', 'cache.js', 'ops-adapter.js', 'self-heal.js', 'resume.js'];
     const offenders = [];
     for (const file of files) {
       const lines = readFileSync(path.join(LIB, file), 'utf8').split('\n');
@@ -3744,8 +3814,21 @@ function functionBodyOf(source, needle) {
         }
         if (!closed) offenders.push(file + ':' + (i + 1) + '  ' + line.trim().slice(0, 70));
       }
+      // 相邻两个 JSDoc 块 = 上一个函数的注释被"挪走"了（2026-10-29 真踩）：
+      // 往一个已有 JSDoc 的函数前面插新函数时，新块被插在**旧块与旧函数之间**，
+      // 于是旧块变成孤儿、错误地挂到新函数上，而旧函数**静默失去文档**。
+      // node --check 完全看不出问题（语法合法），所以只能靠源码扫描钉住。
+      for (let i = 0; i < lines.length; i += 1) {
+        if (!/^\s*\*\//.test(lines[i])) continue;
+        // 跳过空行看下一处非空行是不是又开了个 /**。
+        for (let k = i + 1; k < lines.length; k += 1) {
+          if (lines[k].trim() === '') continue;
+          if (/^\s*\/\*\*/.test(lines[k])) offenders.push(file + ':' + (k + 1) + '  紧挨着上一个 JSDoc 块（旧块的文档成了孤儿，它自己的函数失去了注释）');
+          break;
+        }
+      }
     }
-    assert.deepEqual(offenders, [], '未闭合的 JSDoc 会吃掉后面的代码：\n      ' + offenders.join('\n      '));
+    assert.deepEqual(offenders, [], 'JSDoc 结构问题（未闭合会吃掉代码；相邻双块说明注释被挪走了）：\n      ' + offenders.join('\n      '));
   });
 
   await check('buildGraph：承接边方向按主导信息流，不随名单顺序漂移（用户 #7）', () => {
