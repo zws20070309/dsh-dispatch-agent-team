@@ -111,16 +111,11 @@ const MARKER = CONFIG_UPDATE_VERSION === null ? null : ('    configUpdateVersion
  * @returns {boolean|null} true = 上游仍 insert 四行；false = 已改版；null = 读不到（没装）。
  */
 function legacyRowsStillInserted() {
-  const pkg = resolveOpsPackageJson();
-  if (pkg === null) return null;
-  try {
-    const text = fs.readFileSync(path.join(path.dirname(pkg), 'cordis.patch.yml'), 'utf8');
-    const inserted = [...text.matchAll(/^\s*-\s*id:\s*(\S+)/gmu)].map((match) => match[1]);
-    if (inserted.length === 0) return null;
-    return IDS.some((id) => inserted.includes(id));
-  } catch {
-    return null;
-  }
+  // 判据只有一份（upstreamInsertedIds）：解析上游 patch 的代码写两遍就会各飘各的，
+  // 而这两个函数必须永远给出同一个答案（一个决定「要不要写」，一个决定「删哪些」）。
+  const inserted = upstreamInsertedIds();
+  if (inserted === null) return null;
+  return IDS.some((id) => inserted.has(id));
 }
 
 /**
@@ -601,45 +596,84 @@ function main() {
   const orphans = orphanInfo.orphans;
 
   /**
-   * 删掉给定 id 的整块行**以及它上方紧邻的注释块**；返回删掉的 id。
+   * 删掉给定 id 的整块行**以及它上方专属的注释块**；返回删掉的 id。
    *
-   * 为什么连注释一起删（2026-10-29）：只删配置行会留下几十行描述这些行的注释
-   * （本机实测：删 5 行配置后还孤零零剩 31 行讲「四行怎么配、为什么这么配」的说明）。
-   * 那比不删更糟 —— 下一个人读到注释会以为这些开关还在管事。
-   * 判据：从块首往上吃连续的注释/空行，**但只在紧邻到文件头或上一个配置行时**才吃，
-   * 且必须留一个空行分隔（不把上一段的注释也吞掉）。
+   * ── 为什么连注释一起删（2026-10-29）────────────────────────────────────────
+   * 只删配置行会留下几十行描述这些行的注释（本机实测：删 5 行配置后还孤零零剩 31 行
+   * 讲「这四行怎么配、为什么这么配」的说明）。那比不删更糟 —— 下一个人读到会以为
+   * 这些开关还在管事。
+   *
+   * ── 怎么区分「我们的注释」与「别人的注释」（2026-10-29 审查抓到的数据破坏）──────
+   * 第一版规则是「先跳过一个空行、再连续吃注释」。只要**别人的注释**紧贴着我们的死配置行
+   * （中间没有空行），它就会被一起删掉。已实测复现：`# 这是 llm-x 的第二段说明` 跟着
+   * `- id: dsh-ops-shell` 一起消失 —— 删用户不相关的配置说明不可接受。
+   *
+   * 现在的判据（两条同时成立才算「专属」）：
+   *   ① 与配置行之间**有空行分隔**：紧贴上一行的注释属于上一段，绝不动；
+   *   ② 注释块**最上面那行是分节标题**（以 `# ──` 开头）。本仓库里「整段描述某一组行」的
+   *      注释都是这个形状（profile 里那 31 行就是这么开头的），而随手补在上方的零散说明
+   *      不会带这条分隔线。于是「专属块」与「别人的尾注」被可靠分开。
+   * 两条不满足就**只删配置行**：留一句孤儿注释可以接受，删别人的注释不可以。
+   *
+   * ── 为什么要「迭代到不动点」────────────────────────────────────────────────
+   * 判据只能基于**当前文本的实际结构**：删掉第一行配置后，后面的行会顶上，它们的邻居关系
+   * 随之改变。一次性扫描会漏掉这种「删完之后才紧邻」的注释块（实测：夹具里 shell 行删掉后，
+   * 注释块与 ptc 行之间只剩一个空行，于是注释块被留了下来）。
+   * 做法：反复（最多 50 轮，每轮至少删掉一行，必然收敛）重扫，直到没有新的可删内容。
    * @param ids - 要删的行 id。
    * @returns {{removed:string[], text:string}}
    */
   const dropRows = (ids) => {
-    const lines = text.split(LF);
-    const drop = new Set();
+    let current = text;
     const removed = [];
-    for (const block of splitRows(lines).filter((row) => ids.includes(row.id))) {
-      for (let index = block.start; index <= block.end; index += 1) drop.add(index);
-      removed.push(block.id);
-    }
-    if (drop.size === 0) return { removed: [], text };
-    // 扩到上方紧邻的注释块（含注释块与配置行之间的**单个空行**：profile 里就是这么排的，
-    // 实测 473 是空行、471-472 才是注释，只吃"连续注释"会在空行处停住 → 注释全留下）。
-    // 规则：先跳过最多一个空行，再连续吃注释；遇到第一个非注释立刻停。
-    const expanded = new Set(drop);
-    for (const block of splitRows(lines).filter((row) => ids.includes(row.id))) {
-      let index = block.start - 1;
-      if (index >= 0 && lines[index].trim() === '') index -= 1;
-      for (; index >= 0; index -= 1) {
-        if (!lines[index].trim().startsWith('#')) break;
-        expanded.add(index);
+    for (let round = 0; round < 50; round += 1) {
+      const lines = current.split(LF);
+      const blocks = splitRows(lines).filter((row) => ids.includes(row.id));
+      if (blocks.length === 0) break;
+      const drop = new Set();
+      for (const block of blocks) {
+        if (!removed.includes(block.id)) removed.push(block.id);
+        // ⚠️ 块尾要自己算：splitRows 的 end 会一路吃到**下一个块的开头**（含下一块的注释），
+        // 直接按 start..end 删会把别人的注释一起抹掉。这里只取到本块自己的最后一个
+        // 非空、非注释行（配置行），后面的注释/空行留给判据 ① 去决定。
+        let realEnd = block.start;
+        for (let index = block.start; index <= block.end; index += 1) {
+          const line = lines[index];
+          if (line.trim() === '' || line.trim().startsWith('#')) break;
+          realEnd = index;
+        }
+        for (let index = block.start; index <= realEnd; index += 1) drop.add(index);
+        // ① 中间必须隔着一个空行：紧贴上一行的注释属于上一段，绝不动。
+        let index = block.start - 1;
+        if (index < 0 || lines[index].trim() !== '') continue;
+        index -= 1;
+        // ② 往上收集连续注释，但只有「最上面那行是分节标题」时它才是这段配置的专属说明。
+        const run = [];
+        for (; index >= 0; index -= 1) {
+          if (!lines[index].trim().startsWith('#')) break;
+          run.push(index);
+        }
+        if (run.length === 0) continue;
+        const heading = lines[run[run.length - 1]].trim();
+        if (!/^#\s*──/u.test(heading)) continue;
+        for (const at of run) drop.add(at);
+        // 连同注释块上方的那个空行一起删，免得留下一串空行。
+        const above = run[run.length - 1] - 1;
+        if (above >= 0 && lines[above].trim() === '') drop.add(above);
       }
+      if (drop.size === 0) break;
+      // 收尾：把因此产生的连续空行压成一个，避免留下双空行。
+      const kept = lines.filter((_, index) => !drop.has(index));
+      const compact = [];
+      for (const line of kept) {
+        if (line.trim() === '' && compact.length > 0 && compact[compact.length - 1].trim() === '') continue;
+        compact.push(line);
+      }
+      const next = compact.join(LF);
+      if (next === current) break;
+      current = next;
     }
-    // 收尾：把因此产生的连续空行压成一个，避免留下双空行。
-    const kept = lines.filter((_, index) => !expanded.has(index));
-    const compact = [];
-    for (const line of kept) {
-      if (line.trim() === '' && compact.length > 0 && compact[compact.length - 1].trim() === '') continue;
-      compact.push(line);
-    }
-    return { removed, text: compact.join(LF) };
+    return { removed, text: removed.length === 0 ? text : current };
   };
 
   if (revert) {

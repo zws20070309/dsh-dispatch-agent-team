@@ -712,11 +712,10 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
  * 顺序：先 require（Node 22+ 可直接 require ESM；本机实测通过），
  * 失败再退回「在 policy.js 与 registry.js 里做文本解析」，最后才判 FAIL。
  * @param root - dsh-ops 包根。
- * @param policyText - lib/policy.js 内容（老版本的真值就在这里）。
  * @param name - 导出的常量名。
  * @returns {string[]|null} 原始名清单；两路都拿不到时 null。
  */
-function resolveOpsNameList(root, policyText, name) {
+function resolveOpsNameList(root, name) {
   const candidates = [path.join(root, 'lib', 'policy.js'), path.join(root, 'lib', 'capabilities', 'registry.js')];
   for (const file of candidates) {
     if (!fs.existsSync(file)) continue;
@@ -761,7 +760,7 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   // 旧正则在这里抓不到任何东西 —— 它不是在报「官方改了」，是在报「我们找错了文件」。
   // 判据改成：**按模块真值解析**（可 require 就 require，拿不到再退回文本解析），
   // 这样「名单搬去别处」不再产生假红，而「名单内容真的变了」照样抓得住。
-  const fileTools = resolveOpsNameList(root, policy, 'FILE_TOOLS');
+  const fileTools = resolveOpsNameList(root, 'FILE_TOOLS');
   const adapter = require('../lib/ops-adapter.js');
   const expected = fileTools.map((raw) => 'ops_' + raw);
   const missing = expected.filter((name) => !adapter.OPS_TOOL_NAMES.includes(name));

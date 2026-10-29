@@ -206,12 +206,16 @@ node tools/install.cjs
 
 批量工具（`ops_batch`/`ops_result`）的门两代都最窄：**只放行纯 PTC 呈现档**
 （dsh-ops `lib/ptc/index.js`：该作用域的工具组合恰好只有一个 `run_code`，且 `tools:ptc-only` 段非空）。
-所以实测结论是：**Lead（原生档）与开着「批量调用」的队员都拿不到那两个工具**——
-后者在本机这一版宿主上被钉成 `ptc`（官方已删除 both 档，见下文），组合工具数 >1 时同样被那扇门挡在门外。
-这不是缺陷，是 ops 的设计；要它们见下面第一条。Lead 那侧本插件**刻意不动** —— 那是你的主会话。
+所以实测结论是：**Lead（原生档）拿不到那两个工具**，而队员能不能拿到取决于它是不是纯 PTC 档
+（= 预设 `ptc` + **打开**「批量调用」；2026-10-21 起开/关就是 ptc/native 两档，不再有 both）。
+这不是缺陷，是 ops 的设计；怎么配见下面第一条。Lead 那侧本插件**刻意不动** —— 那是你的主会话。
 
 想确认这套链接在你机器上真的通了（**不用重启 DSH**）：`node tools/ops-mount-check.mjs` —— 它挂真 dsh-ops 组件与真宿主注册表跑一遍，
-四段各自独立（各用独立 Context）：A 交付态、B 负对照（同一份原版组件只差呈现档）、C 后台任务真起 FastCtx 服务器并**真调一次** `ops_run_background`、D shell 组件（`ops_bash` 发布 + 口径文字确实进段）。
+四段各自独立（各用独立 Context）：A 交付态（按**装机那一代**装配：0.3.x 的四组件行 / 0.5.x 的 mode 行族）、
+B 负对照（同一份原版组件只差呈现档）、C 后台任务（0.3.2 起该组件已移除，自动跳过）、
+D shell 通道（`ops_bash` 已发布 + 本包的 extraGuidance 确实进渲染结果）。
+**本机 dsh-ops 没装原生 worker 时，A/B 会如实跳过而不是报错** —— 那种情况下 file 与 PTC 工具按 ops 的设计
+就不会发布，把「装机缺件」报成「插件坏了」是错的；判定是三值的（true / false / 跳过）。
 
 | dsh-ops 组件 | 队员拿到什么 |
 |---|---|
@@ -219,15 +223,17 @@ node tools/install.cjs
 | background | `ops_run_background` / `ops_job_output` / `ops_job_list` / `ops_job_kill` —— 长任务托管（需会话处于完全访问）。**0.3.2 起该组件已被 dsh-ops 整体移除**，行留着只会打一条警告，四个工具不再发布 |
 | shell | `ops_bash`（一次性 POSIX 命令）+ 把命令执行器换成随包 PowerShell 7（Windows 上通常比系统自带的好用） |
 | discovery（0.5.x 新增） | `ops_discover_tools` —— file 工具的按需激活入口，native 档才有 |
-| PTC 增强 | `ops_batch` / `ops_result`（+ 0.5.x 的 `ops_load_sdk`）—— 一次调用完成跨文件的复制/移动/删除（先 plan 再执行），大结果分页引用。**仅纯 PTC 档队员**（预设 `ptc` + 关闭「批量调用」）拿得到；Lead 与批量档队员按 ops 的设计拿不到 |
+| PTC 增强 | `ops_batch` / `ops_result`（+ 0.5.x 的 `ops_load_sdk`）—— 一次调用完成跨文件的复制/移动/删除（先 plan 再执行），大结果分页引用。**仅纯 PTC 档队员**（预设 `ptc` + **打开**「批量调用」）拿得到；Lead 与原生档队员按 ops 的设计拿不到 |
 
 三点如实说明：
 
 - **`ops_batch`/`ops_result` 要纯 PTC 档才有**：dsh-ops 的 PTC 组件按自己的设计只把这两个工具
   给纯 PTC 呈现档的作用域。本包**不改 dsh-ops 一行源码**，用已有的配置就能拿到：把该角色的
-  **预设设为 `ptc`** 并**关掉它的「批量调用」开关**（见上文配置页），那名队员就是纯 PTC 档，
-  ops 自己会把这两个工具给他（可在 `run_code` 程序里调用）。默认（批量档开着）拿不到它们，
-  但**其余 ops 工具照常可用**，不影响任何功能。
+  **预设设为 `ptc`** 并**打开它的「批量调用」开关**（见上文配置页），那名队员就是纯 PTC 档，
+  ops 自己会把这两个工具给他（可在 `run_code` 程序里调用）。
+  注意方向：2026-10-21 起这个开关的语义是「**开 = 钉 ptc 档 / 关 = 钉 native 档**」
+  （宿主已删掉 both 档）。所以「关掉批量」恰恰会把它变成原生档、拿不到这两个工具 ——
+  那是 both 还在时的老杠杆，已不适用。关掉批量时其余 ops 工具照常可用，不影响任何功能。
 - **没装 dsh-ops 的用户零影响**：不注册任何提示词、不多一个字节，插件页也不会出现 ops 组件。
 - **状态可查**：`~/.dsh/dispatch-agent-team-status.json` 的 `opsIntegration` 字段记录组件的挂载事实、
   当前可见的 ops_* 清单，以及（仅当某名**纯 PTC 档**队员看不到 `ops_batch`/`ops_result` 时）一句点名修法。
@@ -235,8 +241,11 @@ node tools/install.cjs
   注意 `node tools/ops-enable.cjs` 只管**旧四行**（老版本才有对应 insert）；0.5.x 上它会如实说明
   那四行已不再是开关载体，别照着它去插件页找不存在的开关。
 
-想四个组件都开（含 dsh-ops 默认关着的 background 与 PTC）：`node tools/ops-enable.cjs` 后重启 DSH；
-`--check` 只看不改，`--revert` 删掉这四行回到 dsh-ops 自带默认。
+想在**老版本 dsh-ops** 上把四个组件都开（含它默认关着的 background 与 PTC）：
+`node tools/ops-enable.cjs` 后重启 DSH；`--check` 只看不改，`--prune` 只清死配置，
+`--revert` 删掉本工具管过的全部行回到 dsh-ops 自带默认。
+**0.5.x 上这四行已不再是开关载体**（上游不再 insert 它们），此时该命令的职责是**清理**，不是启用：
+跑一次会把 profile 里那些孤儿覆盖连同它们的注释块一起删掉。
 ## 卸载
 
 ```bash

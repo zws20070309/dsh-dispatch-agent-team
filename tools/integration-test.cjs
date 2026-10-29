@@ -2092,6 +2092,9 @@ async function main() {
         '',
         '# ── dsh-ops 四组件全开（历史注释）──',
         '# 四行都由 dsh-ops 自己的 bundle patch insert。',
+        // 空行分隔是真实 profile 的形状（实测 backup 第 473 行），也是判据 ①：
+        // 没有这个空行，注释块就归属上一个配置行 —— 那时只删配置行、注释必须留下。
+        '',
         '- id: dsh-ops-shell',
         '  disabled: false',
         '  config:',
@@ -2149,6 +2152,49 @@ async function main() {
       }
       if (after.includes('四组件全开')) return '--prune 删了配置行却把**注释块**留在文件里（史山换个形式继续存在）';
       if (!after.includes('- id: llm-deepseek')) return '--prune 误删了无关的配置行';
+      // ⚠️ 反向闸门（2026-10-29 审查抓到的**数据破坏**）：别人的注释绝不能跟着删。
+      // 第一版规则是「先跳过一个空行、再连续吃注释」，只要别人的注释紧贴着我们的死配置行
+      // （中间没有空行），它就会被一起删掉。已复现：`# 这是 llm-x 的说明` 消失。
+      // 现在的判据是两条同时成立（空行分隔 + 块首是 `# ──` 分节标题），这里逐条钉住。
+      const foreignTmp = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-foreign-'));
+      tempDirs.push(foreignTmp);
+      const foreignProfile = path.join(foreignTmp, 'profiles', 'desktop');
+      realFs.mkdirSync(foreignProfile, { recursive: true });
+      const foreignPatch = path.join(foreignProfile, 'cordis.patch.yml');
+      const foreignLink = path.join(foreignProfile, 'node_modules', 'dsh-ops');
+      realFs.mkdirSync(path.dirname(foreignLink), { recursive: true });
+      let foreignLinkOk = true;
+      try { realFs.symlinkSync(opsReal, foreignLink, 'junction'); } catch { foreignLinkOk = false; }
+      if (foreignLinkOk) {
+        // 形态 A：别人的注释紧贴我们的死配置行（无空行）→ 注释必须留下
+        const caseA = [
+          '- id: llm-x', '  config:', '    a: 1',
+          '# 这是 llm-x 的说明（属于别人的行，绝不能被删）',
+          '- id: dsh-ops-shell', '  disabled: false', '',
+        ].join(LF4);
+        realFs.writeFileSync(foreignPatch, caseA, 'utf8');
+        require('node:child_process').spawnSync(
+          process.execPath, [path.join(__dirname, 'ops-enable.cjs'), '--prune'],
+          { env: { ...process.env, DSH_PROFILE_DIR: foreignProfile }, encoding: 'utf8' },
+        );
+        const afterA = realFs.readFileSync(foreignPatch, 'utf8');
+        if (!afterA.includes('这是 llm-x 的说明')) return '--prune 删掉了**别人的**注释（数据破坏）：' + JSON.stringify(afterA);
+        if (afterA.includes('- id: dsh-ops-shell')) return '形态 A：死配置行没删掉';
+        // 形态 B：块首不是分节标题（`# ──`），即使有空行分隔也不吃 → 注释留下
+        const caseB = [
+          '- id: llm-x', '  config:', '    a: 1', '',
+          '# 随手补的零散说明（不是分节标题，不属于我们的块）',
+          '- id: dsh-ops-shell', '  disabled: false', '',
+        ].join(LF4);
+        realFs.writeFileSync(foreignPatch, caseB, 'utf8');
+        require('node:child_process').spawnSync(
+          process.execPath, [path.join(__dirname, 'ops-enable.cjs'), '--prune'],
+          { env: { ...process.env, DSH_PROFILE_DIR: foreignProfile }, encoding: 'utf8' },
+        );
+        const afterB = realFs.readFileSync(foreignPatch, 'utf8');
+        if (!afterB.includes('随手补的零散说明')) return '形态 B：块首不是分节标题也被吃了（判据 ② 失效）';
+        if (afterB.includes('- id: dsh-ops-shell')) return '形态 B：死配置行没删掉';
+      }
       // 反向：老版本上这些行是**活的**，一个都不许判成孤儿。
       const legacyFound = enable.findOrphanRows(
         '- id: dsh-ops-shell' + LF4 + '  disabled: false' + LF4,

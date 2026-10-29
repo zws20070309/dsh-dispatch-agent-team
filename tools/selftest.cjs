@@ -3784,6 +3784,14 @@ function functionBodyOf(source, needle) {
       assert.ok(out.length > 0, 'errorText 不得返回空串');
       assert.ok(!out.includes('[object Object]'), 'errorText 又退化成 [object Object]：' + out);
     }
+    // 2026-10-29 审查补：**空 message 的 Error** 必须报类名，不许退成 "[object Error]"。
+    // 旧实现走 Object.prototype.toString，于是 'new Error("")' → "[object Error]" ——
+    // 那正是本次要消灭的「[object Object] 式」噪音换了个马甲。errorText 在 message 为空时
+    // 会落到 describeValue，所以这一支必须单独覆盖。
+    assert.equal(tc.errorText(new Error('')), 'Error', '空 message 的 Error 必须报类名');
+    assert.equal(tc.errorText(Object.assign(new Error(''), { name: 'TeamError', code: 'X' })),
+      '未知错误（X）', '空 message 但有 code 时仍要给出 code');
+    assert.ok(!tc.errorText(new Error('')).includes('[object '), 'errorText 不得输出 [object …] 形状');
     // 带访问器的对象：读 message 本身抛，也必须回落而不是炸。
     const angry = { get message() { throw new Error('nope'); }, get code() { throw new Error('nope'); } };
     assert.equal(typeof tc.errorText(angry), 'string', '读属性抛错时也必须回落成字符串');

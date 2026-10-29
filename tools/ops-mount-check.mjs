@@ -53,17 +53,6 @@ try { fs.mkdirSync(path.dirname(LOG), { recursive: true }); fs.writeFileSync(LOG
 const say = (line) => { console.log(line); try { fs.appendFileSync(LOG, line + String.fromCharCode(10), 'utf8'); } catch { /* 同上 */ } };
 
 const tick = async (n = 8) => { for (let i = 0; i < n; i += 1) await new Promise((r) => setImmediate(r)); };
-// 真 MCP 握手（spawn + initialize + listTools）比固定 tick 慢，这里做有界轮询而不是猜时长。
-const waitFor = async (predicate, timeoutMs = 90_000) => {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    let value = null;
-    try { value = predicate(); } catch { value = null; }
-    if (value) return value;
-    if (Date.now() >= deadline) return null;
-    await new Promise((r) => setTimeout(r, 250));
-  }
-};
 
 const { Context } = await import(libUrl('@deepseek-ai/cordis'));
 const { createScope } = await import(libUrl('@deepseek-ai/dsh-scope'));
@@ -71,9 +60,6 @@ const dshTools = await import(libUrl('@deepseek-ai/dsh-tools'));
 const dshSp = await import(libUrl('@deepseek-ai/dsh-system-prompt'));
 const ToolRuntime = dshTools.ToolRuntime ?? dshTools.default;
 const SystemPrompt = dshSp.SystemPrompt ?? dshSp.default;
-
-/** 允许被这个探针真实起的唯一可执行文件（dsh-ops 原生 worker，本工具只跑无副作用的 plan）。 */
-const OPS_WORKER_ALLOWLIST = [path.join(opsRoot, 'runtime', 'win32-x64', 'dsh-ops-worker.exe')];
 
 /**
  * 宿主 subprocess 契约的忠实实现（argv 已由调用方按白名单校验）。
@@ -116,6 +102,16 @@ function spawnWorkerBridge(argv, options) {
   return { done, collected: { stdout: out, stderr: err } };
 }
 
+const OPS_WORKER_FILE = (() => {
+  // 与 dsh-ops 自己的候选顺序一致：runtime/<platform>-<arch>/ ← native/target/release/
+  const name = process.platform === 'win32' ? 'dsh-ops-worker.exe' : 'dsh-ops-worker';
+  const candidates = [
+    path.join(opsRoot, 'runtime', process.platform + '-' + process.arch, name),
+    path.join(opsRoot, 'native', 'target', 'release', name),
+  ];
+  return candidates.find((candidate) => { try { return fs.existsSync(candidate); } catch { return false; } }) ?? null;
+})();
+
 /**
  * 一套最小但真实的宿主：SystemPrompt + ToolRuntime + ptcRuntime + 权限/子进程替身。
  *
@@ -141,8 +137,10 @@ async function makeRoot() {
   // 的替身 —— 那样 PTC 的实调只能停在桥前（实测报 SANDBOX_UNAVAILABLE: probe: no real spawn），
   // 验不到「这名队员真能调用 ops_batch」。现在放过一个进程：**只有**装机 dsh-ops 自己的原生 worker，
   // 且本工具只拿它跑无副作用的 action=plan；其余 argv 一律照旧抛错，探针不因此获得随便起进程的能力。
-  const WORKER = OPS_WORKER_ALLOWLIST[0];
+  const WORKER = OPS_WORKER_FILE;
   root.provide('subprocess', { spawn: (options) => {
+    // 装机没有原生 worker 时**一律拒绝**：没有可放行的二进制，放行任何进程都是错的。
+    if (WORKER === null) throw new Error('probe: 本机 dsh-ops 没有原生 worker，不允许起任何进程');
     const argv = Array.isArray(options && options.argv) ? options.argv : [];
     if (argv.length === 0 || path.resolve(argv[0]) !== path.resolve(WORKER)) {
       throw new Error('probe: 只允许起 dsh-ops 原生 worker，收到 ' + JSON.stringify(argv).slice(0, 160));
@@ -235,15 +233,6 @@ const OPS_INSERTED_ROWS = insertedOpsRows();
 /** 装机那代：'mode'（0.5.0+）还是 'legacy'（0.3.x 的四组件行）。 */
 const OPS_GENERATION = OPS_INSERTED_ROWS.some((row) => /^dsh-ops-mode-/u.test(row.id)) ? 'mode' : 'legacy';
 
-const OPS_WORKER_FILE = (() => {
-  // 与 dsh-ops 自己的候选顺序一致：runtime/<platform>-<arch>/ ← native/target/release/
-  const name = process.platform === 'win32' ? 'dsh-ops-worker.exe' : 'dsh-ops-worker';
-  const candidates = [
-    path.join(opsRoot, 'runtime', process.platform + '-' + process.arch, name),
-    path.join(opsRoot, 'native', 'target', 'release', name),
-  ];
-  return candidates.find((candidate) => { try { return fs.existsSync(candidate); } catch { return false; } }) ?? null;
-})();
 // 与 tools/ops-enable.cjs 写进 profile 的那句同源（直接 require 那份常量，不各写一份）。
 const OPS_ENABLE = createRequire(path.join(PLUGIN, 'tools', 'x.js'))('./ops-enable.cjs');
 const OPS_TEAM_SHELL_GUIDANCE = OPS_ENABLE.SHELL_OVERRIDE_TEXT;
