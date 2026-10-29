@@ -1715,12 +1715,30 @@ async function main() {
 
     check('检测表与装机 ops 的注册面对齐：四组件行名 + 18 个公开工具名 + 无 ops_run', () => {
       if (adapter.OPS_ROWS.length !== 4) return 'OPS_ROWS 不是四行：' + adapter.OPS_ROWS.map((row) => row.id).join(', ');
+      // 2026-10-29：dsh-ops 0.5.0 改成 insert mode 行族（遗留组件行不再被 insert），
+      // 只认遗留四行时真机 mounted=[]（假故障 + 队员丢 ops 指引）。
+      if (adapter.OPS_MODE_ROWS.length !== 5) return 'OPS_MODE_ROWS 不是五行：' + adapter.OPS_MODE_ROWS.map((row) => row.id).join(', ');
+      if (adapter.OPS_ALL_ROWS.length !== adapter.OPS_ROWS.length + adapter.OPS_MODE_ROWS.length) return 'OPS_ALL_ROWS 不等于两族之和';
+      {
+        // 同一 component 在新旧两代里必须同名（mounted.includes('ptc') 这条判据跨代成立）。
+        const byId = new Map(adapter.OPS_ALL_ROWS.map((row) => [row.id, row.component]));
+        if (byId.get('dsh-ops-ptc') !== byId.get('dsh-ops-mode-ptc')) return '新旧两代的 ptc 组件名不一致：mounted 判据会跨代失效';
+        if (new Set(adapter.OPS_ALL_ROWS.map((row) => row.id)).size !== adapter.OPS_ALL_ROWS.length) return 'OPS_ALL_ROWS 里有重复 id';
+      }
       // 2026-10-21：11 → 18。ops 0.3.2 的 file 组件发布 **11** 个工具
       // （lib/policy.js:7 的 FILE_TOOLS：inspect_local_file/grep/glob/replace/write_file/edit_file/diff/stat/copy/move/remove），
       // 而本包原来只列了 0.3.0 时代的前四个 —— 七个真在跑的工具从来没进过能力盘点。
       // 11(file) + 1(bash) + 4(background，0.3.2 已移除但保留兼容) + 2(ptc) = 18。
-      if (adapter.OPS_FILE_TOOL_NAMES.length !== 11) return 'OPS_FILE_TOOL_NAMES 数量变了（' + adapter.OPS_FILE_TOOL_NAMES.length + '）：与 ops 的 FILE_TOOLS 不再一致';
-      if (adapter.OPS_TOOL_NAMES.length !== 18) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      // 2026-10-29：11 → 15(file) / 18 → 24。装机 **0.5.0** 的
+      // lib/capabilities/registry.js 实读：fileOrder 末尾多了四个 reader
+      // （read_files/read_table/read_docx/read_pdf），另有 discovery 的 discover_tools
+      // 与 PTC 的 load_sdk 两个新公开名。同一个病：不列进来 = 真在跑的工具不进能力盘点。
+      // 15(file) + 1(bash) + 4(background 兼容) + 2(ptc) + 2(discovery/sdk) = 24。
+      if (adapter.OPS_FILE_TOOL_NAMES.length !== 15) return 'OPS_FILE_TOOL_NAMES 数量变了（' + adapter.OPS_FILE_TOOL_NAMES.length + '）：与 ops 的 FILE_TOOLS 不再一致';
+      if (adapter.OPS_TOOL_NAMES.length !== 24) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      for (const tool of adapter.OPS_DISCOVERY_TOOL_NAMES) {
+        if (adapter.OPS_TOOL_NAMES.indexOf(tool) < 0) return '新公开名没进总表：' + tool;
+      }
       if (!adapter.OPS_REMOVED_COMPONENTS.includes('background')) return 'OPS_REMOVED_COMPONENTS 必须含 background（0.3.2 已移除该组件）';
       if (adapter.OPS_TOOL_NAMES.indexOf('ops_run') >= 0) return '名单里出现了 ops_run：0.3.0 任何组合都不发布它（docs/manual-validation.md:17）';
       const probe = probeRows;
@@ -1734,11 +1752,15 @@ async function main() {
     // ops-enable.cjs 的 plan()：四组件启用的唯一真值（drift-check 复用它）。
     const enable = require('./ops-enable.cjs');
     const { plan: planEnable, SHELL_OVERRIDE_TEXT } = enable;
+    // 这些用例验的是**遗留四行那一代**的 plan 逻辑（翻转/补齐/逐键收敛/折行容差）。
+    // 0.5.0 起 plan() 会按代数分叉（不再补死配置），所以必须显式声明代数，
+    // 否则台架跑在 0.5.0 机器上时这些用例会因为「本来就不该有动作」而空转。
+    const LEGACY_GEN = { legacyStillInserted: true };
     const sampleProfile = '- id: agent-team\n  config:\n    maxMembers: 48\n\n'
       + '- id: dsh-ops-shell\n  disabled: true\n\n- id: llm-deepseek\n  name: x\n';
-    const pass1 = planEnable(sampleProfile);
-    const pass2 = planEnable(pass1.text);
-    const passEmpty = planEnable('- id: agent-team\n  config:\n    a: 1\n');
+    const pass1 = planEnable(sampleProfile, LEGACY_GEN);
+    const pass2 = planEnable(pass1.text, LEGACY_GEN);
+    const passEmpty = planEnable('- id: agent-team\n  config:\n    a: 1\n', LEGACY_GEN);
     // 用**装机的真 dsh-ops 代码**验证迁移标记（P1）：带标记 = updatedConfig 必须原样返回；
     // 不带标记 = 它必须把 allowSystemShellFallback 翻成 false（这就是陷阱本身，负对照）。
     let opsMigrate = null;
@@ -1754,8 +1776,12 @@ async function main() {
       }
     }
     if (opsMigrate === null) console.log('  SKIP  装机 dsh-ops 的配置迁移（' + opsMigrateNote + '）');
+    // ⚠️ 迁移标记必须用**装机那份的真值**（ops-enable 的 CONFIG_UPDATE_VERSION 就是从上游读的），
+    // 不能写死 1。2026-10-29 真机：dsh-ops 0.5.0 的 CONFIG_UPDATE_VERSION 已是 **2**，
+    // 而这里写死 1 → updatedConfig 认为「还没迁完」，于是一路迁移到 2 —— 夹具本身把
+    // 「原样返回」这条判据造红了。判据的意图（带标记就不许被改写）不变。
     const BG_ROW = { promptPolicy: true, enableShellTools: true, required: false, toolCallTimeoutMs: 300000,
-      allowSystemShellFallback: true, configUpdateVersion: 1 };
+      allowSystemShellFallback: true, configUpdateVersion: enable.CONFIG_UPDATE_VERSION };
     const BG_UNMARKED = { ...BG_ROW };
     delete BG_UNMARKED.configUpdateVersion;
 
@@ -1971,7 +1997,8 @@ async function main() {
     const foldedChunks = foldWords(SHELL_OVERRIDE_TEXT, 3);
     const foldedRow = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
       '    publishBashTool: true', '    shellPolicy: advise', '    allowSystemShellFallback: false',
-      '    configUpdateVersion: 1',
+      // 迁移标记用上游真值（见 BG_ROW 上的注释：写死 1 会让 plan() 认为行还没迁完）。
+      '    configUpdateVersion: ' + enable.CONFIG_UPDATE_VERSION,
       '    extraGuidance: "' + foldedChunks[0],
       '      ' + foldedChunks[1],
       '      ' + foldedChunks[2] + '"',
@@ -1979,10 +2006,10 @@ async function main() {
       // JSON.stringify —— 那会写出 "C:\\\\Program Files\\\\..."（反斜杠转义两遍），
       // 既是错的 YAML 写法，也让「按值比较」永远不相等（每次 --check 都重写那一行）。
       '    bashPath: ' + enable.yamlScalar(FAKE_BASH)].join(LF3);
-    const foldedOnce = planEnable(foldedRow, { bashPath: FAKE_BASH });
+    const foldedOnce = planEnable(foldedRow, { ...LEGACY_GEN, bashPath: FAKE_BASH });
     check('宿主把 extraGuidance 折行后：--check 不许误报，值真改了仍要报（2026-10-16 真机）', () => {
       if (foldedOnce.patched.length !== 0) return '折行被当成缺键（每次启动都要重写 profile = 与宿主互相改写）：' + JSON.stringify(foldedOnce.patched);
-      const wrong = planEnable(foldedRow.replace('OPS-TEAM OVERRIDE:', 'SOMETHING ELSE:'), { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      const wrong = planEnable(foldedRow.replace('OPS-TEAM OVERRIDE:', 'SOMETHING ELSE:'), { ...LEGACY_GEN, bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
       if (!wrong.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '值真的不同却没报（折行容差不许吞掉真问题）：' + JSON.stringify(wrong.patched);
       // 截词要作用在**折行的最后一段**上（extraGuidance 不是文件最后一行，早先用 $ 锚定
       // 根本没替换成功 → clipped 与输入完全相同 → 那条断言是空转，闸门当场拒绝，对的）。
@@ -1990,9 +2017,9 @@ async function main() {
       if (tail === foldedChunks[2]) return '夹具末段没有 " as bash."，截词控制无效：' + foldedChunks[2];
       const clippedSrc = foldedRow.replace(foldedChunks[2] + '"' , tail + '"');
       if (clippedSrc === foldedRow) return '截词没作用到夹具上（末段文本对不上）';
-      const clipped = planEnable(clippedSrc, { bashPath: FAKE_BASH });
+      const clipped = planEnable(clippedSrc, { ...LEGACY_GEN, bashPath: FAKE_BASH });
       if (!clipped.patched.some((x) => x.indexOf('extraGuidance') >= 0)) return '折行里被截词却没报：' + JSON.stringify(clipped.patched);
-      const again = planEnable(wrong.text, { bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
+      const again = planEnable(wrong.text, { ...LEGACY_GEN, bashPath: 'C:\\Program Files\\Git\\bin\\bash.exe' });
       if (again.patched.length !== 0) return '修完第二遍仍在改 = 不幂等：' + JSON.stringify(again.patched);
       return true;
     });
@@ -2000,14 +2027,15 @@ async function main() {
       const LF2 = String.fromCharCode(10);
       const stale = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
         '    publishBashTool: false', '    shellPolicy: advise', '    allowSystemShellFallback: false',
-        '    configUpdateVersion: 1', '', '- id: dsh-ops-background', '  disabled: false', '  config:',
-        '    enableShellTools: true', '    allowSystemShellFallback: true', '    configUpdateVersion: 1', ''].join(LF2);
-      const once = planEnable(stale, { bashPath: 'C:/Fake/git/bin/bash.exe' });
+        '    configUpdateVersion: ' + enable.CONFIG_UPDATE_VERSION, '',
+        '- id: dsh-ops-background', '  disabled: false', '  config:',
+        '    enableShellTools: true', '    allowSystemShellFallback: true', ''].join(LF2);
+      const once = planEnable(stale, { ...LEGACY_GEN, bashPath: 'C:/Fake/git/bin/bash.exe' });
       if (once.patched.length !== 2) return '两行都该收敛，实得 ' + JSON.stringify(once.patched);
       if (once.text.indexOf('publishBashTool: true') < 0) return 'publishBashTool 没被改成 true（ROWS 改了但 profile 不收敛 = 静默失真）';
       if (once.text.indexOf('extraGuidance') < 0) return '没补 extraGuidance（ops_bash 的冲突口径就没人说了）';
       if (once.text.indexOf('bashPath') < 0) return 'background 行没补 bashPath';
-      const twice = planEnable(once.text, { bashPath: 'C:/Fake/git/bin/bash.exe' });
+      const twice = planEnable(once.text, { ...LEGACY_GEN, bashPath: 'C:/Fake/git/bin/bash.exe' });
       if (twice.patched.length + twice.flipped.length + twice.appended.length !== 0) {
         return '第二遍仍有动作 = 不幂等（每次启动都重写 profile）：' + JSON.stringify([twice.patched, twice.flipped, twice.appended]);
       }
@@ -2026,12 +2054,155 @@ async function main() {
         if (realFs.existsSync(candidate)) { file = candidate; break; }
       }
       if (file === null) return true; // 没有 profile：本机不是交付环境，跳过不算失败
-      const result = planEnable(realFs.readFileSync(file, 'utf8'));
+      const realText = realFs.readFileSync(file, 'utf8');
+      // 2026-10-29：判据按**装机代数**分叉。0.5.0 起上游不再 insert 四组件行，
+      // 于是「四行都在 profile 里」本身就不再是健康态 —— 它是死配置。
+      // 新版该验的是相反的事：**一行都不许留**，且 plan() 不许把它们补回来。
+      const orphans = enable.findOrphanRows(realText);
+      const legacyAlive = orphans.legacyStillInserted;
+      const result = planEnable(realText);
+      if (legacyAlive === false) {
+        if (orphans.orphans.length > 0) {
+          return '本机 dsh-ops 已改版（不再 insert 四组件行），但 profile 里还留着死配置：'
+            + orphans.orphans.join(', ') + '：node tools/ops-enable.cjs --prune 后重启 DSH。文件：' + file;
+        }
+        if (result.flipped.length + result.appended.length + result.patched.length !== 0) {
+          return '0.5.0 上 plan() 还想往 profile 里写死配置（翻转 ' + result.flipped.join(',')
+            + ' / 补行 ' + result.appended.join(',') + ' / 改键 ' + result.patched.join(',')
+            + '）：清理动作会被它撤销。';
+        }
+        return true;
+      }
       if (result.flipped.length + result.appended.length !== 0) {
         return '本机 profile 的四组件启用态不干净（翻转 ' + result.flipped.join(',') + ' / 缺 ' + result.appended.join(',')
           + '）：node tools/ops-enable.cjs 后重启 DSH。文件：' + file;
       }
       if (result.kept.length !== 4) return '四行没全部识别为已启用：' + JSON.stringify(result.kept);
+      return true;
+    });
+
+    // 2026-10-29：死配置清理（用户明令「代码不要写成史山」）。
+    // 判据走**生产同一份函数**（findOrphanRows + plan 的代数分叉），不另写一套。
+    check('死配置清理：0.5.0 上托管行一律算孤儿，plan() 不许把它们补回来，且注释块要一起清掉', () => {
+      const LF4 = String.fromCharCode(10);
+      // 夹具：一段带注释块的四行 + 一行无关配置（模拟真 profile 的形状）。
+      const fixture = [
+        '- id: llm-deepseek',
+        '  name: x',
+        '',
+        '# ── dsh-ops 四组件全开（历史注释）──',
+        '# 四行都由 dsh-ops 自己的 bundle patch insert。',
+        // 空行分隔是真实 profile 的形状（实测 backup 第 473 行），也是判据 ①：
+        // 没有这个空行，注释块就归属上一个配置行 —— 那时只删配置行、注释必须留下。
+        '',
+        '- id: dsh-ops-shell',
+        '  disabled: false',
+        '  config:',
+        '    promptPolicy: true',
+        '',
+        '- id: dsh-ops-ptc',
+        '  disabled: false',
+        '  config:',
+        '    required: false',
+        '',
+        '- id: dsh-ops-hide-official',
+        '  disabled: false',
+      ].join(LF4);
+      const found = enable.findOrphanRows(fixture);
+      if (found.legacyStillInserted !== false) return '本机 dsh-ops 0.5.0 却判成「上游仍 insert 四行」';
+      const expected = ['dsh-ops-shell', 'dsh-ops-ptc', 'dsh-ops-hide-official'];
+      if (JSON.stringify(found.orphans) !== JSON.stringify(expected)) {
+        return '孤儿识别不全（hide-official 最容易漏）：' + JSON.stringify(found.orphans);
+      }
+      // plan() 在该代**不许**有任何写动作 —— 否则它会把清理掉的行重新种回去（史山的成因）。
+      const planned = planEnable(fixture);
+      if (planned.flipped.length + planned.appended.length + planned.patched.length !== 0) {
+        return '0.5.0 上 plan() 仍想写盘（会把死配置种回来）：' + JSON.stringify([planned.flipped, planned.appended, planned.patched]);
+      }
+      // 清理必须**连注释块一起删**：只删配置行会留下几十行讲「这四行怎么配」的说明，
+      // 下一个人读到会以为开关还在管事（本机实测：删 5 行配置后还剩 31 行孤儿注释）。
+      // 这里用 --prune 的同一份实现（真跑一次，落在临时 profile 上，不碰用户文件）。
+      const tmpDir = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-prune-'));
+      tempDirs.push(tmpDir);
+      const tmpProfile = path.join(tmpDir, 'profiles', 'desktop');
+      realFs.mkdirSync(tmpProfile, { recursive: true });
+      const tmpPatch = path.join(tmpProfile, 'cordis.patch.yml');
+      realFs.writeFileSync(tmpPatch, fixture + LF4, 'utf8');
+      // 装机 dsh-ops 必须可从**这个临时 profile** 解析到：脚本的代数判据（读上游 patch）
+      // 走 resolveOpsPackageJson → <profile>/node_modules/dsh-ops。没有它，脚本会判「不知道
+      // 上游 insert 什么」→ 一个字节都不删（这是保守正确的行为，但测不到清理）。
+      // 用 junction 指到本机真装的那份，保证判据与真机同源（不是伪造一个 version）。
+      const opsReal = path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-ops');
+      const opsLink = path.join(tmpProfile, 'node_modules', 'dsh-ops');
+      realFs.mkdirSync(path.dirname(opsLink), { recursive: true });
+      let linkedOk = true;
+      try { realFs.symlinkSync(opsReal, opsLink, 'junction'); } catch { linkedOk = false; }
+      if (!linkedOk) return '建不出 dsh-ops junction，跳过清理实测（判据本身已由纯函数断言覆盖）';
+      const prunedRun = require('node:child_process').spawnSync(
+        process.execPath,
+        [path.join(__dirname, 'ops-enable.cjs'), '--prune'],
+        { env: { ...process.env, DSH_PROFILE_DIR: tmpProfile }, encoding: 'utf8' },
+      );
+      if (prunedRun.status !== 0) {
+        return '--prune 退出码 ' + String(prunedRun.status) + '：' + String(prunedRun.stderr || prunedRun.stdout).slice(0, 200);
+      }
+      const after = realFs.readFileSync(tmpPatch, 'utf8');
+      for (const id of expected) {
+        if (after.includes('- id: ' + id)) return '--prune 没删掉 ' + id;
+      }
+      if (after.includes('四组件全开')) return '--prune 删了配置行却把**注释块**留在文件里（史山换个形式继续存在）';
+      if (!after.includes('- id: llm-deepseek')) return '--prune 误删了无关的配置行';
+      // ⚠️ 反向闸门（2026-10-29 审查抓到的**数据破坏**）：别人的注释绝不能跟着删。
+      // 第一版规则是「先跳过一个空行、再连续吃注释」，只要别人的注释紧贴着我们的死配置行
+      // （中间没有空行），它就会被一起删掉。已复现：`# 这是 llm-x 的说明` 消失。
+      // 现在的判据是两条同时成立（空行分隔 + 块首是 `# ──` 分节标题），这里逐条钉住。
+      const foreignTmp = realFs.mkdtempSync(path.join(realOs.tmpdir(), 'dispatch-foreign-'));
+      tempDirs.push(foreignTmp);
+      const foreignProfile = path.join(foreignTmp, 'profiles', 'desktop');
+      realFs.mkdirSync(foreignProfile, { recursive: true });
+      const foreignPatch = path.join(foreignProfile, 'cordis.patch.yml');
+      const foreignLink = path.join(foreignProfile, 'node_modules', 'dsh-ops');
+      realFs.mkdirSync(path.dirname(foreignLink), { recursive: true });
+      let foreignLinkOk = true;
+      try { realFs.symlinkSync(opsReal, foreignLink, 'junction'); } catch { foreignLinkOk = false; }
+      if (foreignLinkOk) {
+        // 形态 A：别人的注释紧贴我们的死配置行（无空行）→ 注释必须留下
+        const caseA = [
+          '- id: llm-x', '  config:', '    a: 1',
+          '# 这是 llm-x 的说明（属于别人的行，绝不能被删）',
+          '- id: dsh-ops-shell', '  disabled: false', '',
+        ].join(LF4);
+        realFs.writeFileSync(foreignPatch, caseA, 'utf8');
+        require('node:child_process').spawnSync(
+          process.execPath, [path.join(__dirname, 'ops-enable.cjs'), '--prune'],
+          { env: { ...process.env, DSH_PROFILE_DIR: foreignProfile }, encoding: 'utf8' },
+        );
+        const afterA = realFs.readFileSync(foreignPatch, 'utf8');
+        if (!afterA.includes('这是 llm-x 的说明')) return '--prune 删掉了**别人的**注释（数据破坏）：' + JSON.stringify(afterA);
+        if (afterA.includes('- id: dsh-ops-shell')) return '形态 A：死配置行没删掉';
+        // 形态 B：块首不是分节标题（`# ──`），即使有空行分隔也不吃 → 注释留下
+        const caseB = [
+          '- id: llm-x', '  config:', '    a: 1', '',
+          '# 随手补的零散说明（不是分节标题，不属于我们的块）',
+          '- id: dsh-ops-shell', '  disabled: false', '',
+        ].join(LF4);
+        realFs.writeFileSync(foreignPatch, caseB, 'utf8');
+        require('node:child_process').spawnSync(
+          process.execPath, [path.join(__dirname, 'ops-enable.cjs'), '--prune'],
+          { env: { ...process.env, DSH_PROFILE_DIR: foreignProfile }, encoding: 'utf8' },
+        );
+        const afterB = realFs.readFileSync(foreignPatch, 'utf8');
+        if (!afterB.includes('随手补的零散说明')) return '形态 B：块首不是分节标题也被吃了（判据 ② 失效）';
+        if (afterB.includes('- id: dsh-ops-shell')) return '形态 B：死配置行没删掉';
+      }
+      // 反向：老版本上这些行是**活的**，一个都不许判成孤儿。
+      const legacyFound = enable.findOrphanRows(
+        '- id: dsh-ops-shell' + LF4 + '  disabled: false' + LF4,
+        { inserted: new Set(['dsh-ops-shell', 'dsh-ops-file']) },
+      );
+      if (legacyFound.legacyStillInserted !== true || legacyFound.orphans.length !== 0) {
+        return '老版本（仍 insert 四行）却把它们判成了孤儿 —— 会删掉用户真在用的配置';
+      }
       return true;
     });
 
@@ -4137,6 +4308,57 @@ async function main() {
       // 角色必须推导正确（plan-critic-verify 不能被误判成 plan——最长前缀匹配的意义）。
       if (roster.deriveRole('plan-critic-verify') !== 'plan-critic') return 'plan-critic-verify 的角色推导错了';
       if (roster.deriveRole('scout-core') !== 'scout') return 'scout-core 的角色推导错了';
+      return true;
+    });
+
+    // ── task_id 绑定失败：诊断必须带**官方错误码**（2026-10-29）────────────────────
+    // 官方 TeamError 是 HarnessError 的子类，code 是稳定可路由的失败类
+    // （dsh-llm/lib/types/error.js 原话 "route on this, never by parsing message"）。
+    // 旧实现只取 error.message，把 code 丢掉 → 诊断只能给一句猜测清单。
+    // 这里走**真工具执行路径**（spawn 成功、reassign 抛官方错误），逐码核对输出。
+    const bindDiagnosticsByCode = {};
+    const bindCodes = ['TEAM_TASK_INVALID_TRANSITION', 'TEAM_TASK_BLOCKED', 'TEAM_TASK_NOT_FOUND', 'TEAM_LEAD_REQUIRED'];
+    for (const code of bindCodes) {
+      const bindTools = toolsModule.teamToolDefinitions({
+        runtime: spawnRuntime,
+        agentTeams: {
+          listMembers: () => [],
+          spawnTeammate: async (_caller, request) => ({
+            member: { id: `agent-${request.name}`, name: request.name, role: 'teammate', status: 'inactive', diagnostics: [] },
+          }),
+          getTask: async () => ({ id: 'task-1', revision: 3, status: 'pending' }),
+          updateTask: async () => {
+            // 精确复刻官方 TeamError 的形状：Error 子类 + 稳定 code。
+            const error = new Error('official failure text for ' + code);
+            error.name = 'TeamError';
+            error.code = code;
+            throw error;
+          },
+        },
+        include: roster.LEAD_TEAM_TOOL_NAMES,
+      });
+      const bindTool = bindTools.find((definition) => definition.name === 'spawn_teammate');
+      const result = await bindTool.execute(
+        { role: 'scout', name: 'scout-bind', description: 'x', prompt: 'y', task_id: 'task-1' },
+        { agent: caller },
+      );
+      bindDiagnosticsByCode[code] = Array.isArray(result?.diagnostics) ? result.diagnostics.join(' ') : '';
+    }
+    check('spawn_teammate 的 task_id 绑定失败：诊断带上官方错误码与对应的下一步（用户 2026-10-29）', () => {
+      for (const code of bindCodes) {
+        const text = bindDiagnosticsByCode[code];
+        if (text === '' ) return `${code}：绑定失败却没留任何诊断`;
+        if (!text.includes(code)) return `${code}：诊断里没有官方错误码（只有 message 时无法路由）——实际：${text}`;
+        // 每个码的下一步指引必须**各不相同**（否则等于没分诊）。
+        if (text.includes('[object Object]')) return `${code}：诊断里出现了 [object Object] —— ${text}`;
+      }
+      const distinct = new Set(bindCodes.map((code) => {
+        const text = bindDiagnosticsByCode[code];
+        return text.replace(/official failure text for \S+/u, '').replace(/\bTEAM_[A-Z_]+\b/gu, '');
+      }));
+      if (distinct.size === 1) return '四个错误码给出了同一条下一步指引（等于没分诊）';
+      // 反向：spawn 本身不许被报成失败（队员已经建出来了）。
+      if (bindDiagnosticsByCode.TEAM_TASK_BLOCKED.includes('未创建')) return '绑定失败把 spawn 报成了失败（会诱导 Lead 重派一个队员）';
       return true;
     });
   })();
