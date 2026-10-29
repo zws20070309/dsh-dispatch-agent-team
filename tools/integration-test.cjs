@@ -1715,12 +1715,30 @@ async function main() {
 
     check('检测表与装机 ops 的注册面对齐：四组件行名 + 18 个公开工具名 + 无 ops_run', () => {
       if (adapter.OPS_ROWS.length !== 4) return 'OPS_ROWS 不是四行：' + adapter.OPS_ROWS.map((row) => row.id).join(', ');
+      // 2026-10-29：dsh-ops 0.5.0 改成 insert mode 行族（遗留组件行不再被 insert），
+      // 只认遗留四行时真机 mounted=[]（假故障 + 队员丢 ops 指引）。
+      if (adapter.OPS_MODE_ROWS.length !== 5) return 'OPS_MODE_ROWS 不是五行：' + adapter.OPS_MODE_ROWS.map((row) => row.id).join(', ');
+      if (adapter.OPS_ALL_ROWS.length !== adapter.OPS_ROWS.length + adapter.OPS_MODE_ROWS.length) return 'OPS_ALL_ROWS 不等于两族之和';
+      {
+        // 同一 component 在新旧两代里必须同名（mounted.includes('ptc') 这条判据跨代成立）。
+        const byId = new Map(adapter.OPS_ALL_ROWS.map((row) => [row.id, row.component]));
+        if (byId.get('dsh-ops-ptc') !== byId.get('dsh-ops-mode-ptc')) return '新旧两代的 ptc 组件名不一致：mounted 判据会跨代失效';
+        if (new Set(adapter.OPS_ALL_ROWS.map((row) => row.id)).size !== adapter.OPS_ALL_ROWS.length) return 'OPS_ALL_ROWS 里有重复 id';
+      }
       // 2026-10-21：11 → 18。ops 0.3.2 的 file 组件发布 **11** 个工具
       // （lib/policy.js:7 的 FILE_TOOLS：inspect_local_file/grep/glob/replace/write_file/edit_file/diff/stat/copy/move/remove），
       // 而本包原来只列了 0.3.0 时代的前四个 —— 七个真在跑的工具从来没进过能力盘点。
       // 11(file) + 1(bash) + 4(background，0.3.2 已移除但保留兼容) + 2(ptc) = 18。
-      if (adapter.OPS_FILE_TOOL_NAMES.length !== 11) return 'OPS_FILE_TOOL_NAMES 数量变了（' + adapter.OPS_FILE_TOOL_NAMES.length + '）：与 ops 的 FILE_TOOLS 不再一致';
-      if (adapter.OPS_TOOL_NAMES.length !== 18) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      // 2026-10-29：11 → 15(file) / 18 → 22。装机 **0.5.0** 的
+      // lib/capabilities/registry.js 实读：fileOrder 末尾多了四个 reader
+      // （read_files/read_table/read_docx/read_pdf），另有 discovery 的 discover_tools
+      // 与 PTC 的 load_sdk 两个新公开名。同一个病：不列进来 = 真在跑的工具不进能力盘点。
+      // 15(file) + 1(bash) + 4(background 兼容) + 2(ptc) + 2(discovery/sdk) = 24。
+      if (adapter.OPS_FILE_TOOL_NAMES.length !== 15) return 'OPS_FILE_TOOL_NAMES 数量变了（' + adapter.OPS_FILE_TOOL_NAMES.length + '）：与 ops 的 FILE_TOOLS 不再一致';
+      if (adapter.OPS_TOOL_NAMES.length !== 24) return 'OPS_TOOL_NAMES 数量变了（' + adapter.OPS_TOOL_NAMES.length + '）：ops 改名或我们漏了组件';
+      for (const tool of adapter.OPS_DISCOVERY_TOOL_NAMES) {
+        if (adapter.OPS_TOOL_NAMES.indexOf(tool) < 0) return '新公开名没进总表：' + tool;
+      }
       if (!adapter.OPS_REMOVED_COMPONENTS.includes('background')) return 'OPS_REMOVED_COMPONENTS 必须含 background（0.3.2 已移除该组件）';
       if (adapter.OPS_TOOL_NAMES.indexOf('ops_run') >= 0) return '名单里出现了 ops_run：0.3.0 任何组合都不发布它（docs/manual-validation.md:17）';
       const probe = probeRows;
@@ -1754,8 +1772,12 @@ async function main() {
       }
     }
     if (opsMigrate === null) console.log('  SKIP  装机 dsh-ops 的配置迁移（' + opsMigrateNote + '）');
+    // ⚠️ 迁移标记必须用**装机那份的真值**（ops-enable 的 CONFIG_UPDATE_VERSION 就是从上游读的），
+    // 不能写死 1。2026-10-29 真机：dsh-ops 0.5.0 的 CONFIG_UPDATE_VERSION 已是 **2**，
+    // 而这里写死 1 → updatedConfig 认为「还没迁完」，于是一路迁移到 2 —— 夹具本身把
+    // 「原样返回」这条判据造红了。判据的意图（带标记就不许被改写）不变。
     const BG_ROW = { promptPolicy: true, enableShellTools: true, required: false, toolCallTimeoutMs: 300000,
-      allowSystemShellFallback: true, configUpdateVersion: 1 };
+      allowSystemShellFallback: true, configUpdateVersion: enable.CONFIG_UPDATE_VERSION };
     const BG_UNMARKED = { ...BG_ROW };
     delete BG_UNMARKED.configUpdateVersion;
 
@@ -1971,7 +1993,8 @@ async function main() {
     const foldedChunks = foldWords(SHELL_OVERRIDE_TEXT, 3);
     const foldedRow = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
       '    publishBashTool: true', '    shellPolicy: advise', '    allowSystemShellFallback: false',
-      '    configUpdateVersion: 1',
+      // 迁移标记用上游真值（见 BG_ROW 上的注释：写死 1 会让 plan() 认为行还没迁完）。
+      '    configUpdateVersion: ' + enable.CONFIG_UPDATE_VERSION,
       '    extraGuidance: "' + foldedChunks[0],
       '      ' + foldedChunks[1],
       '      ' + foldedChunks[2] + '"',
@@ -2000,8 +2023,9 @@ async function main() {
       const LF2 = String.fromCharCode(10);
       const stale = ['- id: dsh-ops-shell', '  disabled: false', '  config:', '    promptPolicy: true',
         '    publishBashTool: false', '    shellPolicy: advise', '    allowSystemShellFallback: false',
-        '    configUpdateVersion: 1', '', '- id: dsh-ops-background', '  disabled: false', '  config:',
-        '    enableShellTools: true', '    allowSystemShellFallback: true', '    configUpdateVersion: 1', ''].join(LF2);
+        '    configUpdateVersion: ' + enable.CONFIG_UPDATE_VERSION, '',
+        '- id: dsh-ops-background', '  disabled: false', '  config:',
+        '    enableShellTools: true', '    allowSystemShellFallback: true', ''].join(LF2);
       const once = planEnable(stale, { bashPath: 'C:/Fake/git/bin/bash.exe' });
       if (once.patched.length !== 2) return '两行都该收敛，实得 ' + JSON.stringify(once.patched);
       if (once.text.indexOf('publishBashTool: true') < 0) return 'publishBashTool 没被改成 true（ROWS 改了但 profile 不收敛 = 静默失真）';
@@ -4137,6 +4161,57 @@ async function main() {
       // 角色必须推导正确（plan-critic-verify 不能被误判成 plan——最长前缀匹配的意义）。
       if (roster.deriveRole('plan-critic-verify') !== 'plan-critic') return 'plan-critic-verify 的角色推导错了';
       if (roster.deriveRole('scout-core') !== 'scout') return 'scout-core 的角色推导错了';
+      return true;
+    });
+
+    // ── task_id 绑定失败：诊断必须带**官方错误码**（2026-10-29）────────────────────
+    // 官方 TeamError 是 HarnessError 的子类，code 是稳定可路由的失败类
+    // （dsh-llm/lib/types/error.js 原话 "route on this, never by parsing message"）。
+    // 旧实现只取 error.message，把 code 丢掉 → 诊断只能给一句猜测清单。
+    // 这里走**真工具执行路径**（spawn 成功、reassign 抛官方错误），逐码核对输出。
+    const bindDiagnosticsByCode = {};
+    const bindCodes = ['TEAM_TASK_INVALID_TRANSITION', 'TEAM_TASK_BLOCKED', 'TEAM_TASK_NOT_FOUND', 'TEAM_LEAD_REQUIRED'];
+    for (const code of bindCodes) {
+      const bindTools = toolsModule.teamToolDefinitions({
+        runtime: spawnRuntime,
+        agentTeams: {
+          listMembers: () => [],
+          spawnTeammate: async (_caller, request) => ({
+            member: { id: `agent-${request.name}`, name: request.name, role: 'teammate', status: 'inactive', diagnostics: [] },
+          }),
+          getTask: async () => ({ id: 'task-1', revision: 3, status: 'pending' }),
+          updateTask: async () => {
+            // 精确复刻官方 TeamError 的形状：Error 子类 + 稳定 code。
+            const error = new Error('official failure text for ' + code);
+            error.name = 'TeamError';
+            error.code = code;
+            throw error;
+          },
+        },
+        include: roster.LEAD_TEAM_TOOL_NAMES,
+      });
+      const bindTool = bindTools.find((definition) => definition.name === 'spawn_teammate');
+      const result = await bindTool.execute(
+        { role: 'scout', name: 'scout-bind', description: 'x', prompt: 'y', task_id: 'task-1' },
+        { agent: caller },
+      );
+      bindDiagnosticsByCode[code] = Array.isArray(result?.diagnostics) ? result.diagnostics.join(' ') : '';
+    }
+    check('spawn_teammate 的 task_id 绑定失败：诊断带上官方错误码与对应的下一步（用户 2026-10-29）', () => {
+      for (const code of bindCodes) {
+        const text = bindDiagnosticsByCode[code];
+        if (text === '' ) return `${code}：绑定失败却没留任何诊断`;
+        if (!text.includes(code)) return `${code}：诊断里没有官方错误码（只有 message 时无法路由）——实际：${text}`;
+        // 每个码的下一步指引必须**各不相同**（否则等于没分诊）。
+        if (text.includes('[object Object]')) return `${code}：诊断里出现了 [object Object] —— ${text}`;
+      }
+      const distinct = new Set(bindCodes.map((code) => {
+        const text = bindDiagnosticsByCode[code];
+        return text.replace(/official failure text for \S+/u, '').replace(/\bTEAM_[A-Z_]+\b/gu, '');
+      }));
+      if (distinct.size === 1) return '四个错误码给出了同一条下一步指引（等于没分诊）';
+      // 反向：spawn 本身不许被报成失败（队员已经建出来了）。
+      if (bindDiagnosticsByCode.TEAM_TASK_BLOCKED.includes('未创建')) return '绑定失败把 spawn 报成了失败（会诱导 Lead 重派一个队员）';
       return true;
     });
   })();
