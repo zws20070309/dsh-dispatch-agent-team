@@ -116,13 +116,27 @@ function spawnWorkerBridge(argv, options) {
   return { done, collected: { stdout: out, stderr: err } };
 }
 
-/** 一套最小但真实的宿主：SystemPrompt + ToolRuntime + ptcRuntime + 权限/子进程替身。 */
+/**
+ * 一套最小但真实的宿主：SystemPrompt + ToolRuntime + ptcRuntime + 权限/子进程替身。
+ *
+ * ⚠️ `fs` / `sandbox` 两个服务是 **dsh-ptc-runtime-node 的 inject 依赖**，缺一个它就不激活。
+ * 2026-10-29 真踩：装机 dsh-ops 0.5.0 上本探针**整段崩溃**（A 段第一句 `wireSchemas` 抛
+ * 「mode "ptc" requires a PTC runtime」）。根因不是 ops 改了，而是这里少给了服务：
+ *   * `@deepseek-ai/dsh-ptc-runtime-node/lib/index.js` 的 `NodePtcRuntime.inject = ['fs','subprocess','sandbox','sandboxPolicy']`；
+ *   * cordis 的 inject 语义是「缺依赖 → fiber 停在 pending、不 publish 服务」；
+ *   * 于是 `ctx.get('ptcRuntime')` 永远是 undefined，dsh-tools 的 ptc 档一用就抛。
+ * 实测判据：补齐这两个服务后 fiber.state 从 0 变 2，`ptcRuntime` 立刻可取。
+ * 两个替身都是**空实现**：本探针从不让它们真干活（沙箱解析走 sandboxPolicy 的替身）。
+ */
 async function makeRoot() {
   const root = new Context();
   root.plugin(SystemPrompt, { includeHarnessIdentity: true, personaPrefix: '', includeRuntimeContext: false });
   root.plugin(ToolRuntime, { mode: 'native' });
   await tick(4);
-  root.provide('sandboxPolicy', { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: PROFILE }) });
+  // dsh-ptc-runtime-node 的 inject 依赖（见上方注释）：缺一个它就永不发布 ptcRuntime。
+  root.provide('fs', {});
+  root.provide('sandbox', {});
+  root.provide('sandboxPolicy', { resolve: () => ({ mode: 'danger-full-access', workspaceRoot: PROFILE, sessionId: 'probe-session' }) });
   // subprocess：PTC 的 worker 桥要用它（装机 dsh-ops lib/ptc/worker.js:61）。早先这里是个「一律抛错」
   // 的替身 —— 那样 PTC 的实调只能停在桥前（实测报 SANDBOX_UNAVAILABLE: probe: no real spawn），
   // 验不到「这名队员真能调用 ops_batch」。现在放过一个进程：**只有**装机 dsh-ops 自己的原生 worker，
@@ -165,6 +179,71 @@ async function makeMember(root, id, mode) {
 
 const PTC_TOOLS = ['ops_batch', 'ops_result'];
 const FILE_TOOLS = ['ops_inspect_local_file', 'ops_grep', 'ops_glob', 'ops_replace'];
+
+// ── 装机 dsh-ops 的**能力面**（判据全部由它派生，不在这里写死）────────────────────
+// 2026-10-29：0.5.0 把 bundle patch 从「四个遗留组件行」改成「一条预设一档的 mode 行族」，
+// 并把 file 工具从「全部常驻」改成 discoverable。探针必须**按装机那代的真实装配**去挂，
+// 否则测的是 profile 已经不挂的东西（旧版 A 段就是这么对着一份 0.5.0 打 ✗ 的）。
+const OPS_PATCH_TEXT = (() => {
+  try { return fs.readFileSync(path.join(opsRoot, 'cordis.patch.yml'), 'utf8'); } catch { return ''; }
+})();
+
+/**
+ * 解析 dsh-ops 自己 patch 里 insert 的行（id / name / disabled / config）。
+ *
+ * 只认本文件真正需要的形状（缩进块 + 标量/空数组），**不写一个 YAML 解析器**：
+ * 探针要的是「这一版到底会挂哪些行、配了什么」，够用即可；解析不到就如实报错，
+ * 绝不用一份手写的默认配置去冒充生产（2026-10-16 的假绿灯就是这么来的）。
+ * @returns {Array<{id:string,name?:string,disabled:boolean,config:Record<string,unknown>}>}
+ */
+function insertedOpsRows() {
+  const rows = [];
+  let current = null;
+  let inConfig = false;
+  const TOP = 4; // "- id:" 的缩进（位于 - insert: 之下）
+  for (const line of OPS_PATCH_TEXT.split(String.fromCharCode(10))) {
+    if (line.trim() === '' || line.trim().startsWith('#')) continue;
+    const indent = line.length - line.replace(/^\s+/u, '').length;
+    const idMatch = new RegExp('^\\s{2,' + TOP + '}-\\s*id:\\s*(\\S+)\\s*$', 'u').exec(line);
+    if (idMatch !== null) {
+      current = { id: idMatch[1], disabled: false, config: {} };
+      rows.push(current);
+      inConfig = false;
+      continue;
+    }
+    if (current === null) continue;
+    if (indent <= TOP - 3) { current = null; inConfig = false; continue; }
+    const keyMatch = /^\s*(\S+?):\s*(.*)$/u.exec(line);
+    if (keyMatch === null) continue;
+    const [, key, rawValue] = keyMatch;
+    if (key === 'id') continue;
+    if (key === 'config') { inConfig = true; continue; }
+    if (key === 'name') { current.name = rawValue.trim(); continue; }
+    if (key === 'disabled') { current.disabled = rawValue.trim() === 'true'; continue; }
+    if (!inConfig) continue;
+    const raw = rawValue.trim();
+    if (raw === '[]') current.config[key] = [];
+    else if (raw === 'true') current.config[key] = true;
+    else if (raw === 'false') current.config[key] = false;
+    else if (/^-?\d+$/u.test(raw)) current.config[key] = Number(raw);
+    else if (raw !== '') current.config[key] = raw;
+  }
+  return rows;
+}
+
+const OPS_INSERTED_ROWS = insertedOpsRows();
+/** 装机那代：'mode'（0.5.0+）还是 'legacy'（0.3.x 的四组件行）。 */
+const OPS_GENERATION = OPS_INSERTED_ROWS.some((row) => /^dsh-ops-mode-/u.test(row.id)) ? 'mode' : 'legacy';
+
+const OPS_WORKER_FILE = (() => {
+  // 与 dsh-ops 自己的候选顺序一致：runtime/<platform>-<arch>/ ← native/target/release/
+  const name = process.platform === 'win32' ? 'dsh-ops-worker.exe' : 'dsh-ops-worker';
+  const candidates = [
+    path.join(opsRoot, 'runtime', process.platform + '-' + process.arch, name),
+    path.join(opsRoot, 'native', 'target', 'release', name),
+  ];
+  return candidates.find((candidate) => { try { return fs.existsSync(candidate); } catch { return false; } }) ?? null;
+})();
 // 与 tools/ops-enable.cjs 写进 profile 的那句同源（直接 require 那份常量，不各写一份）。
 const OPS_ENABLE = createRequire(path.join(PLUGIN, 'tools', 'x.js'))('./ops-enable.cjs');
 const OPS_TEAM_SHELL_GUIDANCE = OPS_ENABLE.SHELL_OVERRIDE_TEXT;
@@ -228,44 +307,74 @@ say('模块基准：' + ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deep
 say('dsh-ops = ' + JSON.parse(fs.readFileSync(path.join(opsRoot, 'package.json'), 'utf8')).version + ' @ ' + opsRoot);
 say('');
 
-// ── A：交付态 —— 原版 dsh-ops（本包不改它一行源码）+ file 组件 ──────────────
-say('A) 装机 dsh-ops（原版，未改）+ file 组件：');
+// ── A：交付态 —— 按**装机那一代**的真实装配挂原版 dsh-ops（本包不改它一行源码）──
+//
+// 0.3.x：bundle patch insert 的是四个遗留组件行（shell/file/background/ptc）；
+// 0.5.0：改成「一条预设一档」的 mode 行族 + discovery，遗留组件行**不再被 insert**。
+// 探针必须按装机那一代挂，否则测的是 profile 已经不挂的东西（旧 A 段就是这么对
+// 一份 0.5.0 打 ✗ 的：它还在 apply(`lib/components/file/index.js`)，而那一行早已不在 patch 里）。
+const mountGenerationCore = async (root) => {
+  if (OPS_GENERATION === 'legacy') {
+    const fileComp = await import(opsFile('lib/components/file/index.js'));
+    fileComp.apply(root, { promptPolicy: true, required: false });
+    await tick(8);
+    const ptcComp = await import(opsFile('lib/components/ptc/index.js'));
+    ptcComp.apply(root, { required: false });
+    await tick(8);
+    return;
+  }
+  // mode 代：把 patch 里**默认启用**的 mode 行原样挂上（config 逐键来自装机 patch，不手写）。
+  for (const row of OPS_INSERTED_ROWS) {
+    if (row.disabled) continue;
+    if (!/^dsh-ops-(mode-|discovery)/u.test(row.id)) continue;
+    const component = row.id === 'dsh-ops-discovery' ? 'discovery' : row.id.replace('dsh-ops-', '');
+    const mod = await import(opsFile('lib/components/' + component + '/index.js'));
+    mod.apply(root, row.config);
+    await tick(8);
+  }
+};
+
+say('A) 装机 dsh-ops（原版，未改）· 装配代数 = ' + OPS_GENERATION
+  + (OPS_WORKER_FILE === null ? ' · 原生 worker = 未安装' : ' · 原生 worker = ' + path.basename(OPS_WORKER_FILE)) + '：');
 const rootA = await makeRoot();
-const fileComp = await import(opsFile('lib/components/file/index.js'));
-fileComp.apply(rootA, { promptPolicy: true, enableShellTools: false, required: false, toolCallTimeoutMs: 300000, configUpdateVersion: 1 });
-await tick(8);
-const ptcComp = await import(opsFile('lib/components/ptc/index.js'));
-ptcComp.apply(rootA, { required: false });
-await tick(8);
-// 两名队员：一名纯 PTC 档（本包「批量调用 开」的装配结果），一名批量档（原生 + run_code 的环境）。
+await mountGenerationCore(rootA);
+// 两名队员：一名纯 PTC 档（本包「批量调用 开」的装配结果），一名原生档。
 // 注意这两名是**测试台架直接 presentAs 出来的**，不经过 applyMemberBatch —— 它们验的是 ops 的门，
 // 不是本包的开关映射（后者由 integration-test 的装配断言负责）。
 const matePtc = await makeMember(rootA, 'mate-ptc', 'ptc');
-const mateBoth = await makeMember(rootA, 'mate-both', 'both');
+const mateNtv = await makeMember(rootA, 'mate-native', 'native');
 const aPtc = await report(rootA, matePtc, '纯 PTC 档队员');
-const aBoth = await report(rootA, mateBoth, '批量档队员');
-const fileOk = FILE_TOOLS.every((n) => aPtc.opsSeen.includes(n) && aBoth.opsSeen.includes(n));
-// 纯 PTC 档的判据是**可见**（view 里有 = run_code 程序里 await tools.ops_batch(...) 调得到）；
-// 它不进 wire 是官方设计 —— ptc 档把送给模型的工具裁成一个 run_code（dsh-tools:2840-2843），
-// 所以这里若拿 opsWire 判就永远不成立（第一版 A2 就是这么误判 ✗ 的）。
-const ptcOk = PTC_TOOLS.every((n) => aPtc.opsSeen.includes(n));
-const bothNo = PTC_TOOLS.every((n) => !aBoth.opsSeen.includes(n));
-let okA = fileOk && ptcOk;
-say('  判定 A1（file 四件套人人可见）= ' + (fileOk ? '✓' : '✗'));
-say('  判定 A2（纯 PTC 档队员可见 ops_batch/ops_result，即可在 run_code 程序里调用）= ' + (ptcOk ? '✓ 本包的杠杆成立，且没动 ops 一行源码' : '✗ 没拿到'));
-say('  附带事实（批量档队员没有那两个工具，符合 ops 原版设计）= ' + (bothNo ? '✓' : '✗ 与预期不符'));
+const aNtv = await report(rootA, mateNtv, '原生档队员');
 
-// 可见 ≠ 可用（C 段对 job 工具立过这条规矩，这里对 PTC 工具同样办）：真调一次 ops_batch 的 plan。
-// plan 是**无副作用**的预检（dsh-ops lib/ptc/contract.js:37 原话 "action=plan requires operations
-// and creates a no-effect audit plan"），不碰磁盘；它的 execute 会**再查一遍** ptcOnly（装机
-// lib/ptc/index.js:53）—— 所以这一调同时验掉「呈现档在调用时仍然成立」，比看可见层强。
+// 判据按**能力是否可能发布**分叉：没有原生 worker 时 file/PTC 工具按设计就不发布
+// （dsh-ops lib/ptc/runtime.js 的 resolveWorker 抛错 → 组件 warn 后不发布任何工具）。
+// 那种情况下把它报成「适配失败」是错的 —— 本插件的适配对象是**行与呈现档**，不是别人的二进制。
+const fileOk = FILE_TOOLS.every((n) => aPtc.opsSeen.includes(n) && aNtv.opsSeen.includes(n));
+const ptcOk = PTC_TOOLS.every((n) => aPtc.opsSeen.includes(n));
+const nativeNoPtc = PTC_TOOLS.every((n) => !aNtv.opsSeen.includes(n));
+if (OPS_WORKER_FILE === null) {
+  // 无 worker：这一段的 file/PTC 判据**不适用**（null = 跳过，不是失败）。
+  say('  判定 A1（file 工具可见）= 跳过（本机 dsh-ops 没装原生 worker：runtime/ 与 native/target/ 都不存在，'
+    + 'file 与 PTC 工具按设计不发布 —— 这是**装机缺件**，不是本插件适配坏了）');
+  say('  判定 A2（纯 PTC 档可见 ops_batch/ops_result）= 跳过（同上）');
+} else {
+  say('  判定 A1（file 工具人人可见）= ' + (fileOk ? '✓' : '✗'));
+  // 纯 PTC 档的判据是**可见**（view 里有 = run_code 程序里 await tools.ops_batch(...) 调得到）；
+  // 它不进 wire 是官方设计 —— ptc 档把送给模型的工具裁成一个 run_code。
+  say('  判定 A2（纯 PTC 档可见 ops_batch/ops_result，即可在 run_code 程序里调用）= '
+    + (ptcOk ? '✓ 本包的杠杆成立，且没动 ops 一行源码' : '✗ 没拿到'));
+}
+say('  附带事实（原生档没有那两个工具，符合 ops 原版设计）= ' + (nativeNoPtc ? '✓' : '✗ 与预期不符'));
+let okA = OPS_WORKER_FILE === null ? null : (fileOk && ptcOk);
+if (okA === null && nativeNoPtc !== true) okA = false;
+
+// 可见 ≠ 可用：真调一次 ops_batch 的 plan。plan 是**无副作用**的预检
+// （dsh-ops lib/ptc/contract.js 原话 "action=plan … creates a no-effect audit plan"），不碰磁盘；
+// 它的 execute 会**再查一遍**呈现档 —— 所以这一调同时验掉「呈现档在调用时仍然成立」，比看可见层强。
 let execA = '（未测）';
 if (ptcOk) {
   try {
     const def = rootA.get('tools').get('ops_batch', matePtc);
-    // root = 插件真实根（package.json 在那儿，源文件必须真存在，否则 plan 报的是前置条件不符，
-    // 测不到"工具能不能被这个作用域调用"）。目标是 .probe-tmp 里一个不存在的名字 —— plan 无副作用，
-    // 不会落盘；contract 明写 no overwrite，所以也绝不覆盖任何现有文件。
     const plan = await def.execute({
       root: fs.realpathSync(PLUGIN),
       action: 'plan',
@@ -286,33 +395,38 @@ if (ptcOk) {
 say('  真调一次 ops_batch(action=plan，无副作用) = ' + execA);
 say('');
 
-// ── B：负对照 —— 同一份原版组件，both 档 vs ptc 档只差在呈现档 ───────────────
+// ── B：负对照 —— 同一份原版组件，只差呈现档 ───────────────────────────────────
 // 目的：证明 A2 的因果在**呈现档**（本包能配的那一项），不是环境凑巧。
+// 没有 worker 时 PTC 工具在两种档下都不会出现 —— 此时这段**不适用**（okB = null），
+// 而不是把「两者都拿不到」报成「负对照不成立」。
 let okB = null;
-{
+if (OPS_WORKER_FILE === null) {
+  say('B) 负对照：跳过（本机没有原生 worker，PTC 工具在任何呈现档下都不会发布 —— 用它做负对照证明不了任何事）');
+  say('');
+} else {
   const rootB = await makeRoot();
-  const compB = await import(opsFile('lib/components/ptc/index.js'));
-  compB.apply(rootB, { required: false, binaryPath: path.join(opsRoot, 'runtime', 'win32-x64', 'dsh-ops-worker.exe') });
+  const ptcCompB = await import(opsFile('lib/components/ptc/index.js'));
+  ptcCompB.apply(rootB, { required: false });
   await tick(8);
   const seenOf = async (mode, tag) => {
-    const agent = mode === 'ptc' ? await makeMember(rootB, tag, 'ptc') : await makeMember(rootB, tag, 'both');
+    const agent = await makeMember(rootB, tag, mode);
     const seen = [...rootB.get('tools').view(agent).visible.keys()];
     return PTC_TOOLS.filter((n) => seen.includes(n));
   };
   // 组件的注册是异步 reconcile（agent/created 之后还要跑一轮），所以两种档各试几轮。
   let gotPtc = [];
   for (let i = 1; i <= 3 && gotPtc.length < 2; i += 1) gotPtc = await seenOf('ptc', 'mate-b-ptc-' + i);
-  let gotBoth = [];
-  for (let i = 1; i <= 3; i += 1) { gotBoth = await seenOf('both', 'mate-b-both-' + i); if (gotBoth.length > 0) break; }
-  okB = gotPtc.length === 2 && gotBoth.length === 0;
-  say('B) 负对照（同一份原版组件，只差呈现档）：ptc 档拿到 ' + JSON.stringify(gotPtc) + '，both 档拿到 ' + JSON.stringify(gotBoth));
+  let gotNative = [];
+  for (let i = 1; i <= 3; i += 1) { gotNative = await seenOf('native', 'mate-b-native-' + i); if (gotNative.length > 0) break; }
+  okB = gotPtc.length === 2 && gotNative.length === 0;
+  say('B) 负对照（同一份原版组件，只差呈现档）：ptc 档拿到 ' + JSON.stringify(gotPtc) + '，native 档拿到 ' + JSON.stringify(gotNative));
   say('  判定 B = ' + (okB
-    ? '✓ ptc 档拿到 / both 档拿不到 —— 因果确实在呈现档。'
-      + '（2026-10-21 语义：本包「批量调用 **开**」= ptc 档 → 拿得到这两个工具；关 = native → 拿不到。'
-      + '旧文案写的是「预设 ptc + 关批量档」，那是 both 还在时的老杠杆，已不适用）'
+    ? '✓ ptc 档拿到 / native 档拿不到 —— 因果确实在呈现档。'
+      + '（2026-10-21 语义：本包「批量调用 开」= ptc 档 → 拿得到这两个工具；关 = native → 拿不到）'
     : '✗ 与预期不符：说明 ops 的门或本包的杠杆需要重新核对'));
   say('');
 }
+
 
 // ── C：background 组件（真 spawn FastCtx 服务器）───────────────────────────────
 // 为什么必须实测它：四个组件里只有它的发布门最长 —— 要 fastctx 二进制 + bash 可解析
@@ -413,50 +527,65 @@ say('');
 
 say('');
 
-// ── D：shell 组件（ops_bash 是否发布 + 冲突提示词是否被本包的 extraGuidance 说清）────
-// 为什么测这两件事而不是真跑命令：ops_bash 的执行要 ctx.get('subprocess')（宿主提供），
-// 台架里给的是抛错替身 —— 所以这里测**注册**与**提示词**，执行留给真机重启后的探针。
-// 冲突点：ops 的 shell 段会写「Prefer bash … do not switch shells」
-// （dsh-ops lib/policy.js:61），与本团队 preset 的 persistent-pwsh 矛盾。本包用 ops 自己的
-// 公开扩展点 extraGuidance（lib/config.js 接受、lib/policy.js:64 追加到段尾）把口径改回来，
-// 不改它一行源码。文案与 ops-enable.cjs 的 ROWS 同源（同一份 SHELL_OVERRIDE_TEXT）。
-say('D) shell 组件（ops_bash + extraGuidance）：');
+// ── D：shell 通道（ops_bash 是否发布 + 冲突口径是否被本包的 extraGuidance 消解）────
+//
+// 冲突点：ops 的 routing 段写「Prefer ops_bash … do not switch shells」，与本团队 preset 的
+// persistent-pwsh 矛盾。本包用 ops 自己的**公开扩展点** extraGuidance 把口径改回来（不改其源码）。
+//
+// 为什么这里不做「挂组件 + 读 assemble 段」：0.5.0 的段文本函数在
+// `entries.get(agent)` 为空时**按设计返回空串**（lib/modes/native.js：`if (!entry || entry.owned.size === 0) return '';`），
+// 而 entries 要原生 worker 才能填。本机没 worker → 段恒为空 → 拿 assemble 判就永远是假红
+// （第一版 D 段就是这样对一份 0.5.0 打 ✗ 的）。改用 ops 自己渲染段的那个函数本身：
+// `renderToolingPolicy({published, shellComponent, extraGuidance})` 是**纯函数**，
+// 参数取本机实测的发布集合，判据因此确定且可复现。
+say('D) shell 通道（ops_bash + extraGuidance）· 装配代数 = ' + OPS_GENERATION + '：');
 let okD = null;
 try {
-  // 配置**必须来自 ROWS**，不许在这里手写 —— 2026-10-16 真机 P0 的根因就是这里手写了一份：
-  // 上一版 D 段自己塞了 `bashPath: detectBash()`，而生产 profile 的 shell 行**没有** bashPath，
-  // 于是真机上 resolveShells 解析不到 bash（@dsh-ops/bash-win32-x64 没装、fallback 我们又刻意
-  // 关成 false）→ ops_bash 从来没发布（Lead 与两名队员的 wire 里都没有它，状态文件 visibleTools
-  // 也只有 file 四件套），D 段照样打 ✓ —— 典型的「测试比生产多给一个键」造成的假绿灯。
-  // 现在两边同源：生产写什么，这里就挂什么（ROWS 是唯一真值）。
-  const shellRowConfig = rowConfigOf('dsh-ops-shell');
-  say('  shell 行配置（与 ops-enable ROWS 同源）= ' + JSON.stringify(shellRowConfig));
-  const rootD = await makeRoot();
-  const shellComp = await import(opsFile('lib/components/shell/index.js'));
-  shellComp.apply(rootD, shellRowConfig);
-  await tick(12);
-  const mateD = await makeMember(rootD, 'mate-shell', 'both');
-  const seenD = [...rootD.get('tools').view(mateD).visible.keys()];
-  // 生产的 assemble 上下文是 { agent, scope: agent }（dsh-agent/lib/index.js:291-297）——
-  // ops 的段用 context.agent 取可见工具，只传 scope 会拿到空表（第一版就是这么误判"段是空的"）。
-  const asmD = await rootD.get('systemPrompt').assemble({ agent: mateD, scope: mateD });
-  const secD = asmD.sections.find((section) => section.name === 'dsh-ops:repository-tooling:shell');
-  const textD = secD === undefined ? '' : String(secD.text);
-  const bashPublished = seenD.includes('ops_bash');
-  const overrideIn = textD.indexOf('OPS-TEAM OVERRIDE') >= 0;
+  // ① ops_bash 在真实装配里是否真的发布（A 段那次 mount 的实测结果，不另起一套装配）。
+  const bashPublished = aNtv.opsSeen.includes('ops_bash') || aPtc.opsSeen.includes('ops_bash');
+  // ② 本包的 extraGuidance 是否真的被 ops 的渲染函数追加到段尾。
+  const policyMod = await import(opsFile('lib/policy.js'));
+  const publishedForRender = [...new Set([...aNtv.opsSeen, ...aPtc.opsSeen])].filter((n) => n.startsWith('ops_'));
+  const rendered = String(policyMod.renderToolingPolicy({
+    published: publishedForRender,
+    shellComponent: true,
+    extraGuidance: OPS_TEAM_SHELL_GUIDANCE,
+  }) || '');
+  const overrideIn = rendered.indexOf('OPS-TEAM OVERRIDE') >= 0;
+  const originalIn = /Prefer ops_bash/u.test(rendered);
   okD = bashPublished === true && overrideIn === true;
-  say('  ops_bash 已发布 = ' + bashPublished + '；ops 原文「Prefer bash…」在段里 = ' + /Prefer bash/.test(textD)
-    + '；本包的 OVERRIDE 追加在段尾 = ' + overrideIn);
+  say('  本机实际发布的 ops_* = ' + JSON.stringify(publishedForRender));
+  say('  ops_bash 已发布 = ' + bashPublished);
+  say('  ops 原文「Prefer ops_bash…」在段里 = ' + originalIn
+    + '；本包的 OVERRIDE 追加在段里 = ' + overrideIn);
+  if (overrideIn) {
+    const tail = rendered.slice(Math.max(0, rendered.indexOf('OPS-TEAM OVERRIDE') - 40));
+    say('  段尾（OVERRIDE 那一段）= ' + JSON.stringify(tail.slice(0, 160)));
+  }
   say('  判定 D = ' + (okD
     ? '✓ ops_bash 可用，且冲突口径由 ops 自己的公开扩展点消解（未改其源码）'
-    : '✗ ops_bash 未发布或 extraGuidance 没进段（检查 shell 组件配置与 ops-enable 的 ROWS）'));
+    : '✗ ops_bash 未发布，或 extraGuidance 没进渲染结果（检查 SHELL_OVERRIDE_TEXT 与 ops 的 renderToolingPolicy）'));
 } catch (error) {
-  say('  判定 D = 挂载失败：' + (error && error.message ? error.message : String(error)));
+  say('  判定 D = 失败：' + (error && error.message ? error.message : String(error)));
 }
 say('');
 
-const pass = okA === true && (okB === true || okB === null) && (okC === true || okC === null) && (okD === true || okD === null);
-say(pass ? '总体：通过（A 交付态' + (okB === null ? '，B 跳过' : '，B 负对照成立') + (okC === null ? '，C 跳过' : '，C 后台任务实测') + (okD === null ? '，D 跳过' : '，D shell 实测') + '）' : '总体：不通过');
+
+// 总体判定：null = **不适用**（跳过），与 true 同样放行；false = 真失败。
+// 2026-10-29 修：旧式写的是 `okA === true && ...`，于是 A 段一旦跳过（本机没原生 worker）
+// 总体就恒为「不通过」—— 把「环境缺件」报成了「插件坏了」。四个判定语义统一成三值。
+const verdict = (value) => value !== false;
+const parts = [
+  ['A ' + (okA === null ? '跳过' : '交付态'), okA],
+  ['B ' + (okB === null ? '跳过' : '负对照'), okB],
+  ['C ' + (okC === null ? '跳过' : '后台任务'), okC],
+  ['D ' + (okD === null ? '跳过' : 'shell'), okD],
+];
+const pass = parts.every(([, value]) => verdict(value));
+const failedParts = parts.filter(([, value]) => value === false).map(([label]) => label);
+say(pass
+  ? '总体：通过（' + parts.map(([label]) => label).join(' / ') + '）'
+  : '总体：不通过（失败项：' + failedParts.join(' / ') + '）');
 process.exitCode = pass ? 0 : 1;
 // FastCtx 子进程/管道句柄会钉住事件循环；判定已打印并已落盘，直接结束进程。
 setTimeout(() => process.exit(pass ? 0 : 1), 500).unref?.();

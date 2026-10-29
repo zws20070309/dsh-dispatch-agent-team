@@ -2900,8 +2900,16 @@ function functionBodyOf(source, needle) {
     // 判据：必须能问出「上游还 insert 不 insert」，且 --check 的输出必须按答案分叉。
     assert.ok(enableSrc.includes('legacyRowsStillInserted'),
       'ops-enable 必须能判断「上游还 insert 不 insert 这四行」（否则 0.5.0 上 --check 是假绿灯）');
-    assert.ok(/legacy === false/u.test(enableSrc),
-      'ops-enable 的 --check 输出必须按 legacyRowsStillInserted() 分叉：孤儿行不能报「已启用且配置齐备」');
+    // 2026-10-29 升级判据：从「必须如实分叉」提到「必须真的**清理**」。
+    // 只说明不够 —— 那四行（+ hide-official）会一直躺在 profile 里当史山，而且 plan()
+    // 还会在 0.5.0 上把它们当「缺行」补回来，与清理动作互相打架（这正是史山的成因）。
+    assert.ok(enableSrc.includes('findOrphanRows') && enableSrc.includes('MANAGED_IDS'),
+      'ops-enable 必须能识别并清理**孤儿覆盖**（上游已不再 insert 的托管行，含 dsh-ops-hide-official）');
+    assert.ok(/legacyStillInserted === false/u.test(enableSrc),
+      'plan() 必须按代数分叉：0.5.0 上不许把死配置当「缺行」补回 profile');
+    assert.ok(/--prune/u.test(enableSrc), 'ops-enable 必须提供 --prune（只清死配置，不动其它行）');
+    assert.ok(/orphanInfo\.legacyStillInserted === false/u.test(enableSrc),
+      '「无需动作」的文案必须按代数说准（0.5.0 上四行本就不该在 profile 里）');
     assert.ok(!/configUpdateVersion: 1'/u.test(enableSrc),
       'ops-enable 里又出现了写死的 configUpdateVersion: 1（上游升到 2 时会把用户配置降级）');
     // shell / file 两行要带标记；background **不许带**（0.3.2 的 config-updates.js:22 明写

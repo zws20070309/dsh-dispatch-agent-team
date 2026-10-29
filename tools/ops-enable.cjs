@@ -191,6 +191,56 @@ const ROWS = [
 const IDS = ROWS.map((row) => row.id);
 
 /**
+ * 全部会被本包**清理**的 dsh-ops 行 id —— 比 ROWS 多一个 `dsh-ops-hide-official`。
+ *
+ * 为什么它不是 ROWS 的一员：本包从不负责写它的 config（它归 dsh-ops 自己），
+ * 但 0.5.0 起它同样**不再被 insert**，于是 profile 里留下的那一行也是死的。
+ * 清理动作（--revert / 自动清理）必须一并覆盖它，否则「清干净」之后还剩一行孤儿。
+ */
+const MANAGED_IDS = [...IDS, 'dsh-ops-hide-official'];
+
+/**
+ * 上游**当前真正会 insert** 的行 id（读装机 dsh-ops 的 cordis.patch.yml）。
+ * 读不到时返回 null（调用方必须当成「不知道」，不许猜）。
+ * @returns {Set<string>|null}
+ */
+function upstreamInsertedIds() {
+  const pkg = resolveOpsPackageJson();
+  if (pkg === null) return null;
+  try {
+    const text = fs.readFileSync(path.join(path.dirname(pkg), 'cordis.patch.yml'), 'utf8');
+    const ids = [...text.matchAll(/^\s*-\s*id:\s*(\S+)/gmu)].map((match) => match[1]);
+    return ids.length === 0 ? null : new Set(ids);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * profile 里**已经没有对应 insert** 的托管行（= 孤儿覆盖，patch 找不到目标只会 warn 并跳过）。
+ *
+ * 2026-10-29：这是「史山」的判据。dsh-ops 0.5.0 把四组件行换成了 mode 行族，
+ * 老 profile 里那四行（+ hide-official）从此一个字节都不生效，却还占着 60 多行注释与配置。
+ * 光「如实说明」不够 —— 用户要的是**清干净**，而且这件事必须可判定、可复现、可回滚，
+ * 不能靠人手删（那正是它当初堆积起来的原因）。
+ * @param text - profile 的 cordis.patch.yml 全文。
+ * @param [options] - `{ inserted }`：注入「上游会 insert 哪些行」（测试用；缺省读装机那份）。
+ *   注入是必须的：运行期判据依赖**装机环境**，台架没法靠改文本模拟「老版本还在 insert」，
+ *   而那条反向路径恰恰是最危险的一条 —— 判错就会删掉用户真在用的配置。
+ * @returns {{orphans:string[], legacyStillInserted:boolean|null}}
+ */
+function findOrphanRows(text, options) {
+  const injected = options !== undefined && options !== null && options.inserted !== undefined ? options.inserted : undefined;
+  const inserted = injected === undefined ? upstreamInsertedIds() : injected;
+  const present = new Set(splitRows(text.split(LF)).map((row) => row.id));
+  // 上游还 insert 这四行 = 它们是活的，一个都不能删。
+  if (inserted === null || IDS.some((id) => inserted.has(id))) {
+    return { orphans: [], legacyStillInserted: inserted === null ? null : true };
+  }
+  return { orphans: MANAGED_IDS.filter((id) => present.has(id)), legacyStillInserted: false };
+}
+
+/**
  * 找一个**真能用**的 bash（background 组件的 job 工具要它）。
  *
  * 为什么不能只靠 allowSystemShellFallback：dsh-ops 的 PATH 兜底只排除 %SystemRoot%
@@ -375,6 +425,17 @@ function wantedValue(wantLine) {
 function plan(text, options) {
   const bashPath = options && typeof options.bashPath === 'string' && options.bashPath !== ''
     ? options.bashPath : null;
+  // 2026-10-29：**上游还 insert 不 insert 这四行**决定 plan 该不该补行。
+  // dsh-ops 0.5.0 起不再 insert 它们 —— 此时「补行」等于往 profile 里重新种**死配置**，
+  // 而清理动作刚把它们删掉。两个动作互相打架就是史山的成因，所以在这里一次判清：
+  //   * legacyStillInserted !== false → 老版本，照旧补齐/翻转/对齐（有承载物）；
+  //   * === false → 新版，plan **一个字节都不写**（连 flipped/patched 也清空）。
+  const legacyAlive = (options && options.legacyStillInserted !== undefined)
+    ? options.legacyStillInserted
+    : legacyRowsStillInserted();
+  if (legacyAlive === false) {
+    return { text, flipped: [], patched: [], appended: [], kept: IDS.filter((id) => splitRows(text.split(LF)).some((entry) => entry.id === id)) };
+  }
   let working = text.split(LF);
   const blocks = splitRows(working);
   const flipped = [];
@@ -484,7 +545,7 @@ function plan(text, options) {
  * @returns {string[]} 不认识的参数（空 = 全部认识）。
  */
 function unknownArgs(argv) {
-  const known = new Set(['--check', '--revert', '--apply', '--help', '-h']);
+  const known = new Set(['--check', '--revert', '--apply', '--prune', '--help', '-h']);
   return argv.slice(2).filter((arg) => !known.has(arg));
 }
 
@@ -492,67 +553,137 @@ function main() {
   const argv = process.argv;
   // 读不到 dsh-ops 的迁移版本号就不动手：写死一个数字等于赌上游没升过版，
   // 2026-10-21 就是这么把 2 降成 1 的（见 detectConfigVersion 的注释）。
-  if (MARKER === null) {
-    console.error('定位不到装机 dsh-ops 的 lib/config-updates.js（或里面没有 CONFIG_UPDATE_VERSION）。');
-    console.error('本脚本要靠它决定写哪个迁移版本号；读不到就拒绝改用户配置。先确认 dsh-ops 装好了，或用 --check 看现状。');
-    return 2;
-  }
   const bad = unknownArgs(argv);
   if (bad.length > 0) {
     console.error('不认识的参数：' + bad.join(' ') + '（本脚本会改 profile 配置，未知参数一律不执行）');
-    console.error('用法：node tools/ops-enable.cjs [--check | --revert]   # 不带参数 = 补齐/翻转并写盘');
+    console.error('用法：node tools/ops-enable.cjs [--check | --prune | --revert]   # 不带参数 = 补齐/翻转并写盘');
+    return 2;
+  }
+  // 迁移标记只有「写那四行」才需要。**删除**（--prune / --revert）与它无关：
+  // 2026-10-29 真机上出现这条误拦 —— 一台**已经升到 0.5.0** 的机器上，那四行正是要删的死配置，
+  // 而这里因为读不到 CONFIG_UPDATE_VERSION 直接退 2，用户被卡在一个「想清理却不让清理」的状态。
+  // 判据改成：只有**会写**的路径（默认动作）才要求 MARKER。
+  const revertsOrPrunes = argv.includes('--revert') || argv.includes('--prune');
+  if (MARKER === null && !revertsOrPrunes) {
+    console.error('定位不到装机 dsh-ops 的 lib/config-updates.js（或里面没有 CONFIG_UPDATE_VERSION）。');
+    console.error('本脚本要靠它决定写哪个迁移版本号；读不到就拒绝改用户配置。');
+    console.error('（只做清理不受影响：node tools/ops-enable.cjs --prune / --revert）');
     return 2;
   }
   if (argv.includes('--help') || argv.includes('-h')) {
-    console.log('用法：node tools/ops-enable.cjs [--check | --revert]');
-    console.log('  （不带参数）  需要时补齐/翻转这四行并写盘；重启 DSH 生效');
+    console.log('用法：node tools/ops-enable.cjs [--check | --prune | --revert]');
+    console.log('  （不带参数）  补齐/翻转四行；若发现**死配置**（上游已不再 insert 的行）一并清掉');
     console.log('  --check      只报告，不写盘（退出码 1 = 需要处理）');
-    console.log('  --revert     删掉这四行（回到 dsh-ops 自带默认）');
-    // 版本前提必须写在帮助里：0.5.0 之后这四行已不是开关载体，
-    // 用户照着「补齐/翻转」去维护会得到一份看着齐备、实际不生效的 profile。
+    console.log('  --prune      只清死配置（上游已不再 insert 的托管行），不动其它行');
+    console.log('  --revert     删掉本工具管过的**全部**行（含 dsh-ops-hide-official），回到 dsh-ops 自带默认');
     if (legacyRowsStillInserted() === false) {
       console.log('');
-      console.log('⚠ 本机 dsh-ops 已改版：它的 bundle patch 不再 insert 这四个遗留行，');
+      console.log('⚠ 本机 dsh-ops 已改版（0.5.0+）：bundle patch 不再 insert 四组件行，');
       console.log('  改装 dsh-ops-mode-{minimal,standard,ptc,cordis} + dsh-ops-discovery。');
-      console.log('  本脚本的写盘动作对那一版**没有意义**（那四行只是没有目标的孤儿覆盖）；');
-      console.log('  开关以插件页的 mode 行为准，状态见 ~/.dsh/dispatch-agent-team-status.json 的 opsIntegration。');
+      console.log('  那四行（+ hide-official）在 profile 里是**没有目标的孤儿覆盖**，一个字节都不生效；');
+      console.log('  本脚本会给它们做清理，开关以插件页的 mode 行为准，');
+      console.log('  状态见 ~/.dsh/dispatch-agent-team-status.json 的 opsIntegration。');
     }
     return 0;
   }
   const check = argv.includes('--check');
   const revert = argv.includes('--revert');
+  const prune = argv.includes('--prune');
   const file = locatePatch();
   if (file === null) {
     console.error('定位不到 profile 的 cordis.patch.yml（试过 DSH_PROFILE_DIR / DSH_HOME/profiles/{desktop,web}）。');
     return 2;
   }
   const text = fs.readFileSync(file, 'utf8');
-  if (revert) {
+  const backup = () => fs.copyFileSync(file, file + '.bak-' + Date.now() + '-pre-ops-enable');
+  // 孤儿覆盖：profile 里有、但上游 0.5.0+ 已经不再 insert 的托管行（见 findOrphanRows）。
+  const orphanInfo = findOrphanRows(text);
+  const orphans = orphanInfo.orphans;
+
+  /**
+   * 删掉给定 id 的整块行**以及它上方紧邻的注释块**；返回删掉的 id。
+   *
+   * 为什么连注释一起删（2026-10-29）：只删配置行会留下几十行描述这些行的注释
+   * （本机实测：删 5 行配置后还孤零零剩 31 行讲「四行怎么配、为什么这么配」的说明）。
+   * 那比不删更糟 —— 下一个人读到注释会以为这些开关还在管事。
+   * 判据：从块首往上吃连续的注释/空行，**但只在紧邻到文件头或上一个配置行时**才吃，
+   * 且必须留一个空行分隔（不把上一段的注释也吞掉）。
+   * @param ids - 要删的行 id。
+   * @returns {{removed:string[], text:string}}
+   */
+  const dropRows = (ids) => {
     const lines = text.split(LF);
     const drop = new Set();
-    for (const block of splitRows(lines).filter((row) => IDS.includes(row.id))) {
+    const removed = [];
+    for (const block of splitRows(lines).filter((row) => ids.includes(row.id))) {
       for (let index = block.start; index <= block.end; index += 1) drop.add(index);
+      removed.push(block.id);
     }
-    if (drop.size === 0) { console.log('无需还原：profile 里没有这四行（已是 dsh-ops 自带默认）。'); return 0; }
-    fs.copyFileSync(file, file + '.bak-' + Date.now() + '-pre-ops-enable');
-    fs.writeFileSync(file, lines.filter((_, index) => !drop.has(index)).join(LF), 'utf8');
-    console.log('已删掉 profile 里的这四行（shell/file 回到 dsh-ops 自带默认=启用，background/ptc=关闭）。');
+    if (drop.size === 0) return { removed: [], text };
+    // 扩到上方紧邻的注释块（含注释块与配置行之间的**单个空行**：profile 里就是这么排的，
+    // 实测 473 是空行、471-472 才是注释，只吃"连续注释"会在空行处停住 → 注释全留下）。
+    // 规则：先跳过最多一个空行，再连续吃注释；遇到第一个非注释立刻停。
+    const expanded = new Set(drop);
+    for (const block of splitRows(lines).filter((row) => ids.includes(row.id))) {
+      let index = block.start - 1;
+      if (index >= 0 && lines[index].trim() === '') index -= 1;
+      for (; index >= 0; index -= 1) {
+        if (!lines[index].trim().startsWith('#')) break;
+        expanded.add(index);
+      }
+    }
+    // 收尾：把因此产生的连续空行压成一个，避免留下双空行。
+    const kept = lines.filter((_, index) => !expanded.has(index));
+    const compact = [];
+    for (const line of kept) {
+      if (line.trim() === '' && compact.length > 0 && compact[compact.length - 1].trim() === '') continue;
+      compact.push(line);
+    }
+    return { removed, text: compact.join(LF) };
+  };
+
+  if (revert) {
+    // 还原 = 把**本工具管过的所有行**都删掉（含 hide-official），回到 dsh-ops 自带默认。
+    const dropped = dropRows(MANAGED_IDS);
+    if (dropped.removed.length === 0) { console.log('无需还原：profile 里没有本工具管的行（已是 dsh-ops 自带默认）。'); return 0; }
+    backup();
+    fs.writeFileSync(file, dropped.text, 'utf8');
+    console.log('已删掉 profile 里的 ' + dropped.removed.length + ' 行：' + dropped.removed.join(', '));
     console.log('⚠ 重启 DSH 生效。备份在同目录 .bak-*-pre-ops-enable。');
     return 0;
   }
-  const result = plan(text, { bashPath: detectBash() });
+
+  // 孤儿清理（默认动作的一部分，也可由 --prune 单独触发）：
+  // 这些行在上游已经没有 insert 目标，留着只会让下一个人以为它们在管事。
+  if (orphans.length > 0 && (prune || !check)) {
+    const dropped = dropRows(orphans);
+    backup();
+    fs.writeFileSync(file, dropped.text, 'utf8');
+    console.log('已清理 ' + dropped.removed.length + ' 行**死配置**：' + dropped.removed.join(', '));
+    console.log('  原因：装机 dsh-ops 的 bundle patch 不再 insert 这些行（0.5.0 改成 mode-* 行族），'
+      + 'patch 找不到目标只会 warn 并跳过 —— 它们一个字节都不生效。');
+    console.log('  真正的开关在插件页的 dsh-ops mode 行；状态见 ~/.dsh/dispatch-agent-team-status.json 的 opsIntegration。');
+    console.log('⚠ 重启 DSH 生效。备份在同目录 .bak-*-pre-ops-enable。');
+    if (check) return 1;
+    if (prune) return 0;
+    return 0;
+  }
+  if (check && orphans.length > 0) {
+    console.log('需要处理：这些行是**死配置**（上游已不再 insert，patch 找不到目标只 warn 并跳过）：'
+      + orphans.join(', '));
+    console.log('修法：node tools/ops-enable.cjs --prune（只清死配置，不改其它）或直接跑默认动作。');
+    return 1;
+  }
+
+  const result = plan(text, { bashPath: detectBash(), legacyStillInserted: orphanInfo.legacyStillInserted });
   const need = result.flipped.length + result.appended.length + result.patched.length;
-  // 上游是否还 insert 这四行（见 legacyRowsStillInserted 的注释）。
-  // false = 这四行在 profile 里只是**没有目标的孤儿覆盖**，一个字节都不生效；
-  // 此时「齐备」这句话本身就是误导，必须换成事实说明。
-  const legacy = legacyRowsStillInserted();
   if (need === 0) {
-    if (legacy === false) {
-      console.log('profile 里这四行确实都在、config 也齐（' + file + '），但它们**已经不再是开关的载体**：');
-      console.log('装机 dsh-ops 的 bundle patch 不再 insert dsh-ops-shell/file/background/ptc，');
-      console.log('改成了 dsh-ops-mode-{minimal,standard,ptc,cordis} + dsh-ops-discovery 行族。');
-      console.log('patch 找不到目标只会 warn 并跳过 —— 这四行现在不生效，也不需要再维护。');
-      console.log('实际的开关状态请看插件页的 dsh-ops 行，或状态文件的 opsIntegration 字段。');
+    // 两种情况都可能是「无需动作」，但**必须说准是哪一种** —— 0.5.0 上这四行根本不在
+    // profile 里（也不需要），照着「四行都在」去读会以为配置丢了。
+    if (orphanInfo.legacyStillInserted === false) {
+      console.log('无需动作：本机 dsh-ops 已改版（0.5.0+），bundle patch 不再 insert 四组件行，');
+      console.log('  profile 里也**没有**这些死配置了（' + file + '）。');
+      console.log('  真正的开关在插件页的 dsh-ops mode 行；状态见 ~/.dsh/dispatch-agent-team-status.json 的 opsIntegration。');
       return 0;
     }
     console.log('已启用且配置齐备：四行都在 profile 层，没有 disabled:true，且每行的 config 与 ROWS 逐键一致（' + file + '）。');
@@ -564,7 +695,7 @@ function main() {
       + '；补齐键 ' + (result.patched.join(', ') || '无'));
     return 1;
   }
-  fs.copyFileSync(file, file + '.bak-' + Date.now() + '-pre-ops-enable');
+  backup();
   fs.writeFileSync(file, result.text, 'utf8');
   console.log('已写入 ' + file);
   if (result.flipped.length > 0) console.log('  翻转 disabled: ' + result.flipped.join(', '));
@@ -575,4 +706,4 @@ function main() {
 }
 
 if (require.main === module) process.exitCode = main();
-module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT, yamlScalar, normalizePathValue, CONFIG_UPDATE_VERSION, legacyRowsStillInserted };
+module.exports = { plan, splitRows, rowLines, detectBash, locatePatch, IDS, MANAGED_IDS, ROWS, MARKER, SHELL_OVERRIDE_TEXT, yamlScalar, normalizePathValue, CONFIG_UPDATE_VERSION, legacyRowsStillInserted, findOrphanRows, upstreamInsertedIds };
