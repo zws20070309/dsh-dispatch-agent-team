@@ -101,6 +101,13 @@ function createReactStub() {
         hooks[index] = deps;
         if (changed) effects.push(fn);
       },
+      // useRef 只存**同一个 mount 内**的稳定槽位（与 useState 同表格，但没有 setter）：
+      // 侧栏面板用它拿容器 DOM（openWorkspace 的挂点）。
+      useRef(initial) {
+        const index = cursor++;
+        if (!(index in hooks)) hooks[index] = { current: initial };
+        return hooks[index];
+      },
     },
     /** 渲染一轮并执行本轮登记的 effect。 */
     render(component, props) {
@@ -159,20 +166,26 @@ async function main() {
     });
     let component;
     let anchorComponent;
+    let panelIcon;
+    let panelComponent;
     let localeDict;
     let injections = 0;
     const registered = [];
+    const registrations = [];
     const ctx = {
       effect(fn) { fn(); return () => {}; },
       slots: Object.freeze({
         inject(name, factory) { injections += 1; return factory(); },
         register(slot, candidate) {
           registered.push(slot.name);
-          // 2026-10-08：本包现在注册**两个**组件（配置页 + 工作区入口锚点）。
-          // 锚点必须注册在 conversation.session.header.actions（官方 TeamAction 同一个槽），
-          // 配置页必须留在 plugins.bundle.config —— 各拿各的，别互相覆盖。
+          // 2026-11-06：注册**四个**组件 —— 配置页、工作区锚点、侧栏图标、侧栏面板。
+          // 前两个各 2026-10-08 的老账；后两个是左侧栏入口（成对注册，id/key 同名）。
+          // 这里按槽名分流；注册项本体也留一份，供形状断言逐个核对。
+          registrations.push({ slot, candidate });
           if (slot.name === 'plugins.bundle.config') component = candidate;
           if (slot.name === 'conversation.session.header.actions') anchorComponent = candidate;
+          if (slot.name === 'sidebar.panellist') panelIcon = candidate;
+          if (slot.name === 'main') panelComponent = candidate;
           return () => {};
         },
       }),
@@ -197,9 +210,14 @@ async function main() {
       exportsObject,
       injections: () => injections,
       registered: () => registered,
+      registrations: () => registrations,
       anchor: () => anchorComponent,
+      panelIcon: () => panelIcon,
+      panel: () => panelComponent,
       /** 再渲染一轮（用于交互之后）。 */
       repaint() { tree = runtime.render(component, props); return tree; },
+      /** 用同一套 hooks 运行时渲染**另一个**组件（侧栏面板复用的是同一个配置页组件）。 */
+      renderComponent(other, otherProps) { return runtime.render(other, otherProps); },
       tree: () => tree,
       /** 交互后需要把 Promise 链走完再渲染。 */
       async settle() { await flush(); return this.repaint(); },
@@ -216,19 +234,86 @@ async function main() {
       get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: '1:1', diagnostics: [] },
       'list-models': { ok: true, groups: [], failures: [] },
     });
-    check('注册形状：id / name / inject / 两个槽位与字典各注册一次', () => {
+    check('注册形状：id / name / inject / 四个槽位与字典各注册一次', () => {
       if (registration.id !== '@zws/dsh-dispatch-agent-team') return `id=${registration.id}`;
       if (page.exportsObject.name !== 'dsh-dispatch-agent-team-client') return `name=${page.exportsObject.name}`;
       const inject = page.exportsObject.inject;
       if (!Array.isArray(inject) || !inject.includes('slots') || !inject.includes('locale')) {
         return `inject=${JSON.stringify(inject)}（需要 slots 与 locale）`;
       }
-      if (page.injections() !== 2) return `slots.inject 调用了 ${page.injections()} 次（应为 2：配置页 + 工作区锚点）`;
+      // `main` / `sidebar.panellist` 是官方 bundle 提供的**槽位**，不是服务 ——
+      // 把它们写进 exports.inject 会让整行 apply 不了（services 里没有它们）。
+      for (const name of ['main', 'sidebar.panellist', 'sidebar']) {
+        if (inject.includes(name)) return `inject 里混进了槽位名 ${name}（那是槽，不是服务）`;
+      }
+      if (page.injections() !== 4) {
+        return `slots.inject 调用了 ${page.injections()} 次（应为 4：配置页 + 工作区锚点 + 侧栏图标 + 侧栏面板）`;
+      }
       const names = page.registered();
       if (!names.includes('plugins.bundle.config')) return '配置页槽位没注册';
       if (!names.includes('conversation.session.header.actions')) return '工作区锚点槽位没注册（官方 TeamAction 同一个槽）';
+      if (!names.includes('sidebar.panellist')) return '侧栏入口槽位没注册（左侧栏不会出现这一行）';
+      if (!names.includes('main')) return '主面板槽位没注册（侧栏那一行点了会抛 selectPanel 未注册）';
       if (typeof page.anchor() !== 'function') return '工作区锚点组件没注册';
+      if (typeof page.panelIcon() !== 'function') return '侧栏图标组件没注册';
+      if (typeof page.panel() !== 'function') return '主面板组件没注册';
       if (page.dict() === undefined || typeof page.dict().zh !== 'object') return '字典没注册';
+      return true;
+    });
+
+    check('侧栏入口：list 槽用 id（不是 key），且与 main 槽的 key 是同一个字符串', () => {
+      // 官方 LayoutController.selectPanel 按 `entry.options.key === id` 校验 main 槽
+      // （dsh-client-ui-layout/lib/client.js:523-527，校验失败直接抛错），而 sidepanel 行
+      // 点击传的就是它自己的 id（dsh-client-ui-sidebar/lib/client.js:218-225）。
+      // 两个字符串一旦写成不一样的名字，点侧栏的那一下就会抛错——这里是唯一能拦住它的地方。
+      const icon = page.registrations().find((row) => row.slot.name === 'sidebar.panellist');
+      const panel = page.registrations().find((row) => row.slot.name === 'main');
+      if (icon === undefined || panel === undefined) return '侧栏图标或主面板没有注册';
+      if (typeof icon.slot.id !== 'string' || icon.slot.id === '') {
+        return `sidebar.panellist 的 id=${JSON.stringify(icon.slot.id)}（list 槽缺 id 在 register 时直接抛）`;
+      }
+      if (icon.slot.key !== undefined) return 'sidebar.panellist 写了 key（list 槽只认 id，多写的字段没人读）';
+      if (typeof panel.slot.key !== 'string' || panel.slot.key === '') {
+        return `main 的 key=${JSON.stringify(panel.slot.key)}（keyed 槽缺 key 在 register 时直接抛）`;
+      }
+      if (panel.slot.id !== undefined) return 'main 写了 id（keyed 槽只认 key）';
+      if (icon.slot.id !== panel.slot.key) {
+        return `侧栏 id(${icon.slot.id}) 与主面板 key(${panel.slot.key}) 不同名 —— 点侧栏会抛 layout.selectPanel 未注册`;
+      }
+      if (typeof icon.slot.label !== 'function') {
+        return 'label 不是 thunk（写死字符串时切换语言后侧栏名字不会变）';
+      }
+      if (typeof icon.slot.label() !== 'string' || icon.slot.label() === '') return 'label() 没返回文案';
+      if (typeof icon.slot.order !== 'number') return `order=${JSON.stringify(icon.slot.order)}（排序不定会让入口跑到列表末尾）`;
+      return true;
+    });
+
+    check('侧栏图标：只读 { size, active }，按 size 出图（不写死尺寸）', () => {
+      // 官方 renderSlot('sidebar.panellist', { size: wide ? 16 : 18, active }, { only: id })
+      // （dsh-client-ui-sidebar/lib/client.js:229-232）：组件只拿到这两个字段。
+      const icon = page.panelIcon();
+      const small = icon({ size: 16, active: false });
+      const large = icon({ size: 18, active: true });
+      if (small === null || small === undefined || small.type !== 'svg') return '图标不是 svg 根节点';
+      if (Number(small.props.width) !== 16) return `width=${String(small.props.width)}（应跟随 size=16）`;
+      if (Number(large.props.width) !== 18) return `width=${String(large.props.width)}（应跟随 size=18）`;
+      if (Number(small.props.height) !== 16) return `height=${String(small.props.height)}（应跟随 size=16）`;
+      if (small.props.viewBox !== '0 0 32 32') return `viewBox=${String(small.props.viewBox)}`;
+      if (small.props['aria-hidden'] !== 'true') return '图标没有 aria-hidden（侧栏行本身已有 aria-label）';
+      // 空 props 也必须能画：官方若哪天不传参，抛错会连带炸掉整个侧栏。
+      const bare = icon();
+      if (bare === null || bare === undefined || bare.type !== 'svg') return '无 props 时图标抛错/没出 svg';
+      if (!(Number(bare.props.width) > 0)) return '无 props 时 width 不是正数';
+      return true;
+    });
+
+    check('侧栏面板：无参渲染也不崩（侧栏若哪天不传 t 也不能白屏）', () => {
+      // 面板不再依赖任何宿主服务（内容就是配置页），这里覆盖「props 什么都没有」这条路径。
+      const tree = page.panel()();
+      if (tree === null || tree === undefined) return '面板无参调用返回空树';
+      if (tree.props === undefined || tree.props.className !== 'dat-panel') {
+        return `面板根 className=${String(tree.props === undefined ? undefined : tree.props.className)}（应为 dat-panel）`;
+      }
       return true;
     });
 
@@ -1517,6 +1602,58 @@ async function main() {
     check('加载失败：重载可用（否则用户无法恢复）', () => {
       const reload = findAll(tree, (node) => node.type === 'button' && textOf(node).includes('重新载入'))[0];
       return reload !== undefined && reload.props.disabled !== true ? true : '加载失败后「重新载入」不可用';
+    });
+  }
+
+  // ── 13) 侧栏面板渲染的是**配置页本体**（2026-11-06，用户纠正过一轮）──
+  // 为什么必须单独一条：第一版把侧栏做成工作区画布的容器，用户当场纠正
+  // 「跳转的不是工作区！跳转的是配置界面！」。这条断言钉的就是「面板内容 = 配置表单」：
+  // 面板必须把 RoleConfigPage 真的渲染出来（有角色行、有保存按钮），
+  // 而不是又一块画布或一块白板。走真实调用链：apply → 找到 main 槽组件 → 渲染。
+  {
+    const page = await mount({
+      get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: '1:1', diagnostics: [] },
+      'list-models': { ok: true, groups: [], failures: [] },
+    });
+    const panel = page.panel();
+    const t = (key) => page.dict().zh[key] === undefined ? key : page.dict().zh[key];
+    const tree = panel({ t, view: 'page' });
+    check('侧栏面板：根节点是 .dat-panel（给滚动与留白的容器）', () => {
+      if (tree === null || tree === undefined) return '面板没有渲染出任何东西（点了侧栏是白板）';
+      if (tree.props === undefined || tree.props.className !== 'dat-panel') {
+        return `面板根 className=${String(tree.props === undefined ? undefined : tree.props.className)}（应为 dat-panel）`;
+      }
+      return true;
+    });
+    check('侧栏面板：内容就是配置页组件（不是画布，也不是另抄一份页面）', () => {
+      // 用户 2026-11-06 原话：「跳转的不是工作区！跳转的是配置界面！」——
+      // 判据：面板根之下的唯一孩子 === 配置页组件（同一个函数引用），且传给它的 view 是 page。
+      // 用引用相等而不是比较输出：比较输出在 hooks 状态不同时会假红/假绿，引用相等才是
+      // 「没有另抄一份」的充分证据。
+      const kids = tree.props.children === undefined ? [] : tree.props.children;
+      if (kids.length !== 1) return `面板下有 ${kids.length} 个孩子（应为 1：配置页）`;
+      const child = kids[0];
+      if (child === null || child === undefined || typeof child.type !== 'function') {
+        return `面板的孩子不是组件（type=${String(child === null || child === undefined ? child : child.type)}）`;
+      }
+      if (child.props.view !== 'page') {
+        return `传给配置页的 view=${JSON.stringify(child.props.view)}（必须是 page：summary 分支只渲染一行摘要）`;
+      }
+      if (typeof child.props.t !== 'function') return '没有把 t 透传给配置页（英文界面会退回中文）';
+      return true;
+    });
+    check('侧栏面板：渲染出来的确实是配置表单（角色行 + 保存按钮）', () => {
+      // 上一条钉「是不是走的配置页」，这条钉「配置页在面板里真的画出了表单」——
+      // 两条都要：只钉引用相等时，配置页自己变成空壳也测不出来。
+      // ⚠️ 必须走 mount() 那套 runtime（它带 hooks/effect/回执）：直接 child.type(props)
+      // 会跳过 effect，phase 永远停在 loading —— 那测的是「绕过渲染」的假路径。
+      const child = tree.props.children[0];
+      const rendered = page.renderComponent(child.type, child.props);
+      const roles = findAll(rendered, (node) => node.props !== undefined && String(node.props.className || '').includes('dat-role'));
+      const save = findAll(rendered, (node) => node.type === 'button' && textOf(node).includes('保存'));
+      if (roles.length === 0) return '面板里的配置页没有画出任何角色行';
+      if (save.length === 0) return '面板里的配置页没有保存按钮';
+      return true;
     });
   }
 

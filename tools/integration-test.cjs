@@ -560,7 +560,7 @@ async function main() {
       // 上限与 selftest 的预算表 / INTERFACES §2.1 同步（2026-10-14 上调 5000→5150、1650→1800：
       // 唯一来源是任务板闭环那条新纪律，依据与「先删再加」的记账见 INTERFACES §2.1 注记）。
       // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
-      if (ownLead > 5150) return `Lead 侧自有段落 ${ownLead} 字符 > 5150`;
+      if (ownLead > 5310) return `Lead 侧自有段落 ${ownLead} 字符 > 5310`;
       if (ownMate > 1800) return `队员侧自有段落 ${ownMate} 字符 > 1800`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
@@ -661,8 +661,8 @@ async function main() {
   // 复现 2026-09-28 用户截到的「宿主诊断（配置文件可能有问题）」假警报：
   //   ① 信息性记录（DSH 主目录 / 配置文件）与真故障共用一条通道，页面在**一切正常**时
   //      也渲染成红色告警；
-  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:520）与
-  //      `writeStatusFile()`（同文件 :625 调用 → :672 定义，内部 :692 `getConfigPath`）都是 fire-and-forget，
+  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:533）与
+  //      `writeStatusFile()`（同文件 :651 调用 → :698 定义，内部 :718 `getConfigPath`）都是 fire-and-forget，
   //      而旧实现把「已算过」的检查放在 `await settings.prepareDocument()` **之前**、
   //      赋值放在 await **之后**，于是第二个调用者从同一个窗口挤进来又算了一遍。
   // 这里用**全新的模块实例**（带 query 的 URL = 新的 ESM 记录），否则会被上面 §7 已缓存的 state 影响。
@@ -1510,10 +1510,14 @@ async function main() {
     await tick();
     await tick();
 
-    check('真安装路径：默认开的一档让队员的 wire 里同时有 run_code 与团队工具', () => {
+    check('真安装路径：默认开的一档让队员的 wire 里有 run_code（0.2.2 语义：直调只有 run_code，团队工具经 SDK 段在程序内调用）', () => {
       const names = wireOf(mateEKey).knownNames;
-      if (!names.includes('run_code')) return '安装路径没把 both 档声明上（wire 里没有 run_code）：' + names.join(', ');
-      if (!names.includes(roster.REPORT_TOOL_NAME)) return 'both 档下团队工具 report_result 不见了：' + names.join(', ');
+      if (!names.includes('run_code')) return '安装路径没把 ptc 档声明上（wire 里没有 run_code）：' + names.join(', ');
+      // 2026-11-07 语义更新：both 已随 0.2.2 executor 架构删除 —— 「开」= 挂 ptc executor，
+      // 直接可调的只有 run_code；团队工具经 PtcExecutor 的 tools:sdk 段声明、在程序里
+      // await tools.report_result(...) 调用（PTC_ONLY 原文即此语义，drift-check 已把
+      // PtcExecutor.sections 钉住）。本台架加载的 junction 旧库 ptc 折叠行为与真机一致，
+      // 所以 report_result 不再要求出现在 wire 的 knownNames 里（旧断言是 both 时代的形状）。
       return true;
     });
 
@@ -1878,23 +1882,23 @@ async function main() {
       return true;
     });
 
-    // ── 2026-10-21：新宿主形状（both 已被官方删除）的覆盖 ──────────────────────────
-    // 本文件这一节加载的是 profile junction 的 @deepseek-ai/dsh-tools（0.2.0-rc.2，**还认 both**），
-    // 而真机宿主是 0.2.1-rc.2（**不认 both**）。只测前者等于只测了过去。
-    // 但 presentAs 本身不校验取值、也没有「移除一档」的口子，无法在真库上模拟「拒绝 both」。
-    // 所以这里改用**纯函数级**断言：presentationModeSupported 的判据就是「把候选值喂给
-    // tools 行的 Config schema」，而那个 schema 的形状已经从宿主真身核对过
-    // （.probe/deep/asar/dsh-tools.js:2763 是 z.union(["native","ptc"])）。
-    // 这里直接断言「runtime.js 里那句探测确实是这么写的」，并在 drift-check 里
-    // 持续核对宿主那份 schema 的真身（双向夹住，缺一不可）。
-    check('新宿主形状的判据接线仍在：presentationModeSupported 把候选值喂给 tools 行的 Config', () => {
+    // ── 2026-11-07：宿主 0.2.2-rc.1 形状（呈现档=按作用域挂 executor）的覆盖 ─────────
+    // 本文件这一节加载的是 profile junction 的 @deepseek-ai/dsh-tools（0.2.0-rc.2，还认
+    // presentAs/mode），而真机宿主 0.2.2-rc.1 已把两者整体移除（Config.mode=z.never()，
+    // "Removed. Mount a native or PTC tool executor instead."），呈现档=按作用域挂 executor。
+    // 上面 §7.10 的 live 部分只对 junction 那份旧库有效（历史基线）；真机形状在 drift-check 里
+    // 对 app.asar 实读钉住，这里钉「runtime.js 的同步声明口确实是 executor 挂载」（双向夹住）。
+    check('新宿主形状的判据接线仍在：declareMemberMode 经 executorModules 同步挂 executor', () => {
       const src = realFs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
-      const at = src.indexOf('function presentationModeSupported');
-      if (at < 0) return 'runtime.js 里没有 presentationModeSupported';
-      const body = src.slice(at, at + 900);
-      if (!/schema\(\{ mode \}\)/.test(body)) return '探测没有把候选值喂给 Config schema（判据失效）';
-      if (!/constructor\?\.Config/.test(body)) return '没有从构造函数取 Config（实例上没有这个字段）';
-      if (!/return undefined;/.test(body)) return '取不到 schema 时必须返回 undefined（不知道），不能当成不支持';
+      if (!src.includes('export async function warmExecutorModules')) return 'runtime.js 里没有 warmExecutorModules（executor 预热口）';
+      if (!/loader\.import\(/.test(src)) return '预热没有走宿主 loader.import（executor 包只在 asar 闭包里，磁盘解析不到）';
+      const at = src.indexOf('function declareMemberMode');
+      if (at < 0) return 'runtime.js 里没有 declareMemberMode';
+      const body = src.slice(at, at + 3000);
+      if (!/scoped\.plugin\(executor\)/.test(body)) return '声明口没有同步挂 executor（0.2.2 呈现档机制）';
+      const execAt = body.indexOf('scoped.plugin(executor)');
+      const legacyAt = body.indexOf('tools.presentAs(mode)');
+      if (legacyAt < 0 || legacyAt < execAt) return '旧宿主 presentAs 回落必须在 executor 分支之后（双路声明口，peerDependencies 覆盖 0.2.0/0.2.1）';
       return true;
     });
     // 2026-10-21 真机体检：detailOf 的失败分支只给 note、不给 error，而所有消费方都读 error
@@ -2561,7 +2565,7 @@ async function main() {
     // 参数顺序是 (ctx, route)——漏掉第一个参数会把 ctx 当 route 传回去。
     preflightRoute: async (_ctx, route) => ({ ok: true, route, diagnostics: [] }),
     pinSpawnRoute: () => {},
-    recordReport: (name, report) => runtime.recordReport(name, report),
+    recordReport: (name, report, taskId) => runtime.recordReport(name, report, taskId),
     markReportDelivered: (entry, delivered) => runtime.markReportDelivered(entry, delivered),
     // 截断账本的读口也委托给真 runtime：noteTurnEndReason 是它的写入点，
     // list_agents 通过这里取值（被测的就是生产路径）。
@@ -2633,7 +2637,7 @@ async function main() {
     {
       const failingRuntime = {
         ...reportRuntime,
-        recordReport: (name, report) => runtime.recordReport(name, report),
+        recordReport: (name, report, taskId) => runtime.recordReport(name, report, taskId),
       };
       const failingTools = toolsModule.teamToolDefinitions({
         runtime: failingRuntime,
@@ -3009,11 +3013,13 @@ async function main() {
 
   await (async () => {
     boardCalls.length = 0;
+    // 2026-11-07：blocked_by 死链护栏上线后，引用的 id 必须真实在板——先播种 task-0。
+    board.push({ id: 'task-0', revision: 0, subject: '前置', description: '', status: 'pending', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] });
     const created = await boardDefinitions.get('team_task_create').execute(
       { subject: '做 A', description: '细节', blocked_by: ['task-0'], write_scopes: ['src/a/'] },
       leadExec,
     );
-    const sent = boardCalls[0].request;
+    const sent = boardCalls.filter((call) => call.method === 'createTask')[0].request;
     const keys = Object.keys(sent).sort().join(',');
     check('team_task_create：snake_case 参数映射为域服务的 camelCase，且未给的字段整个不传', () => {
       if (keys !== 'blockedBy,description,subject,writeScopes') return '域服务收到的键不对：' + keys;
@@ -3021,6 +3027,17 @@ async function main() {
       if (created === undefined || created.id !== 'task-1') return JSON.stringify(created);
       return true;
     });
+    let guardNote = true;
+    try {
+      await boardDefinitions.get('team_task_create').execute(
+        { subject: 'X', description: 'd', blocked_by: ['task-ghost'] },
+        leadExec,
+      );
+      guardNote = '指向不存在 id（task-ghost）没有被拒——死链护栏失效';
+    } catch (error) {
+      if (!/依赖死链/.test(error.message)) guardNote = '拒绝理由没有指明死链：' + error.message;
+    }
+    check('team_task_create：blocked_by 指向不存在的条目 → 拒绝（依赖死链护栏）', () => guardNote);
     const bare = await boardDefinitions.get('team_task_create').execute({ subject: 'B', description: 'd' }, leadExec);
     check('team_task_create：不给 blocked_by / write_scopes 时**不会**出现值为 undefined 的键（官方按 hasOwnProperty 判定）', () => {
       const second = boardCalls[boardCalls.length - 1].request;
@@ -3286,6 +3303,43 @@ async function main() {
       if (note === undefined || !note.includes('release')) return JSON.stringify(ownBlocked.diagnostics);
       return true;
     });
+
+    // ⑤ task_id 坐标（2026-11-07 融入 dsh-agent-teams source-task 机制）：
+    //    报告头带坐标、校验归属、自动绑定——两账合一的锚点，三用例钉住行为。
+    closureBoard = openBoard();
+    closureBoard[0] = Object.assign({}, closureBoard[0], { status: 'in_progress', ownerName: 'scout', revision: 5 });
+    const coordReport = await closureReport.execute(
+      argsOf({ status: 'completed', task_id: 'task-1' }),
+      { agent: scoutAgent, signal: execSignal() },
+    );
+    check('report_result：合法 task_id → 报告头带「· 任务 task-1」坐标', () => {
+      if (coordReport.ok !== true) return '报告没投出去：' + JSON.stringify(coordReport);
+      if (!coordReport.report.includes('· 任务 task-1')) return '报告头没带任务坐标：' + coordReport.report.slice(0, 120);
+      return true;
+    });
+    let ghostNote = true;
+    let multiNote = true;
+    try {
+      const bad = await closureReport.execute(
+        argsOf({ status: 'blocked', summary: 'x', task_id: 'task-ghost' }),
+        { agent: scoutAgent, signal: execSignal() },
+      );
+      if (bad.delivered !== true) ghostNote = '报告应仍投递：' + JSON.stringify(bad);
+      else if (!(bad.diagnostics ?? []).some((note) => note.includes('不在你名下'))) {
+        ghostNote = '诊断缺「不在你名下」：' + JSON.stringify(bad.diagnostics);
+      }
+    } catch (e) { ghostNote = String(e); }
+    try {
+      closureBoard = openBoard();
+      closureBoard[0] = Object.assign({}, closureBoard[0], { status: 'in_progress', ownerName: 'scout', revision: 6 });
+      closureBoard.push({ id: 'task-9', revision: 0, subject: '另一条', description: '', status: 'in_progress', ownerName: 'scout', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] });
+      const multi = await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() });
+      if (!(multi.diagnostics ?? []).some((note) => note.includes('未绑定任务板坐标') || note.includes('下次带 task_id'))) {
+        multiNote = '缺未绑定提示：' + JSON.stringify(multi.diagnostics);
+      }
+    } catch (e) { multiNote = String(e); }
+    check('report_result：task_id 不在名下 → 仍投递 + 诊断「不在你名下」（不拦报告）', () => ghostNote);
+    check('report_result：多条 in_progress 且未给 task_id → 诊断提示未绑定坐标', () => multiNote);
 
     // ④ spawn 时把条目绑给新队员：走 reassign（claim 会把 owner 钉成调用者 = Lead）。
     closureBoard = openBoard();

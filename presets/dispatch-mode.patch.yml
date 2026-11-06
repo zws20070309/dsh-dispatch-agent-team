@@ -207,8 +207,6 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
               # 注意：这里**刻意不写** `modelSelectionSettings: true`（极简灰度那一行是写的）。
               # 见本文件头「与极简灰度的三处差异」第 3 条：调度模式里「给谁挑模型」只有一个
               # 入口（本插件的配置页：每个角色一个模型/强度），不叠加官方那套。

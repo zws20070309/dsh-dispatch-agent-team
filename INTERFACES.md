@@ -55,6 +55,7 @@
 | 40 | §5（给 agent 投递消息的三种语义） | **`agent.send(message, target, wakeup)` 的三个目标不是一回事**（`dsh-agent-loop/lib/index.js:800-814`）：`followup(input)` = `send(input, 'next-turn', true)`、`steer(input)` = `send(input, 'next-step', true)`、`inject(input)` = `send(input, 'next-step', false)`。**`next-turn` 那一条会显示在用户界面上**：客户端 `QueueDock` 从 Session 的 `inbox` 投影**读取 `next-turn`**（`dsh-client-ui-conversation/README.zh.md` 原话），用户在输入框上方看到排队行、还要点「插入/插话」——2026-10-01 18:26 我们注入的「团队已开启」就是这么跑到用户输入框里的（用户原话：「不要突然排队一句话行不？」）。**判据**：只有**用户自己打的字**才允许走 `followup`（本插件只有 `/team` 的注入）；插件想让模型知道的状态一律放进**工具返回值**，要打断当前轮用 `steer`。另：系统提示词与工具目录**每个 step 重新组装**（`:907` 的 preStep → `systemPrompt.assemble()`，`:1063` 的 `buildRequest(…, assembly.tools, …)`），所以「开团后必须注入一句提醒」这个前提本身是错的。drift-check 有闸门钉住这三条 |
 | 41 | §4（队员的模型/强度覆盖） | **队员模型覆盖的优先级**（2026-10-01 修正）：只有 `spawn_teammate` 的**显式参数**（`provider`+`model` / `reasoning_effort`）才允许被钉住（`lib/runtime.js` 的 `spawnRoutes` 与 `spawnEfforts` 两个账本，agent 销毁时清空）；**角色配置必须每次请求实时读**（`resolveRoleRoute(peekConfig(), role)`），合成用纯函数 `resolveMemberRoute(explicit, roleRoute, explicitEffort)`（`lib/roster.js`），返回 `undefined` = 不覆盖 = 跟随 Lead。旧写法把**角色配置解析出来的路由**也钉进 `spawnRoutes`，于是「跟随 Lead」/改配置对**已经在跑的队员**永远不生效（用户 2026-10-01 报的：面板改回「跟随 Lead」后队员仍跑 spawn 时刻的旧模型）。对照事实：官方 `spawn` provider 让子代理**每请求**跟随父代理当前选择（用户日志里 `red-team` 在 Lead 换模型后 2 分钟内跟着换），所以「不覆盖」就是正确的「跟随 Lead」；而 `spawn_teammate` 显式给的路由仍必须真的生效，否则返回值里的 `route` 是假的 |
 | 42 | §0.1 / §7.5（**本轮审查新增的官方事实，全部从 0.2.0-rc.2 的 `app.asar` 复核**） | ① **`ReactLoopAgent` 实例上没有 `name` 字段**（`dsh-agent-loop/lib/index.js:747-789` 的构造只赋 `id`/`session`/`options`/`ctx`）：任何「从 agent 拿名字」的写法都会拿到 `undefined`，队员名只能从 `ctx.agentTeams.tryMembership(agent)` 取——它返回 `{role, name, id, root}`（`dsh-experimental-agent-team/lib/index.js:405-410`）。本插件唯一踩这个坑的是 `report_result` 的报告头（已改为从 membership 取，`lib/tools.js` 的 `callerName`）；派活署名那条**不是缺陷**——`installMember` 一直用的就是 `membership.name`（`lib/runtime.js:1045-1053`），审查时被否证的子代理结论不再照抄。 ② `session/event` 是**不按 agent 过滤的全局广播**（`dsh-scope/lib/invariant.js:26` 把它标为 `null`），官方 agent-team 自己就监听它（`:1720-1722`），所以插件可以合法地用它记账：`turn/end` 的 `reason.kind === 'max-tokens'`（`:1151` 产生、`:979` 聚合、`:1027-1030` 落事件）现已驱动 §2.6 的截断标志。 ③ `agentPresets.compositionInventory()` 在**任何 await 之前**同步快照各 preset 的定义（`dsh-agent-preset-registry/lib/index.js:793`），所以状态文件里 preset 行内容的「准」只取决于快照时刻——本插件改为 boot/settled 两阶段写 + `ctx.loader.await()` 事件时机（官方先例：`dsh-app-boot/lib/index.js:3489`、`:4084`）。 ④ `ask_user_question` 对委派调用者是**硬拒**：`dsh-user-questions/lib/index.js:531-535` 的 `assertLiveRoot` 抛 `DELEGATED_CALLER`，但弹窗已在宿主全局排队；因此它进了 `TEAMMATE_TOOL_DENY`。 ⑤ `mountPreset` 只在 preset 的 `activate()` 里调一次（`:262`、`:534`），`agent/bind`/`session/join` **不会**重放它——「preset 子树每会话跑一次」是错的，实测口径见 README §6.1。 |
+| 45 | §1 roleBatchOn / §3.7 呈现档契约 / §3 pinSpawnRoute 钉子来源 / README 模型覆盖 | **2026-11-07 两条机制迁移**。① **呈现档（宿主 0.2.2-rc.1）**：官方删掉 tools 行 mode 字段与 presentAs/modeFor（ToolsService.Config.mode=z.never()，"Removed. Mount a native or PTC tool executor instead."），呈现档改为**按作用域挂 executor 插件**。现行：开=挂 ptc executor、关=挂 native executor（`declareMemberMode` 双路声明口：新宿主 ctx.plugin(executor)、0.2.0/0.2.1 回落 presentAs）；both 无承载物（executor 架构每作用域只准一个 executor）。§1/§3.7 的旧三档描述按本条理解。② **spawn 强度钉子来源**（eb98bb2）：强度钉子现有两个来源——spawn_teammate 显式参数（旧）+ 未显式给 effort 时读 Lead 的 `session.requestHeader().config.reasoningEffort` 显式钉住（新；规避 agent-default-model 步前固定与 adapter default 的冲突，实机 session-7d556240 根因链）。模型/路由仍逐请求实时。 |
 | 44 | §3.5（技能）与 §3.1 第 4 步（队员收窄） | **`skill` 对队员是「能用且目录自动注入」，不是「按名字点名才可用」**（2026-10-07 查证并补闸门）。① 工具来源：preset 行 `skill-filesystem` + `tool-skill`（`presets/dispatch-mode.patch.yml:142-146`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:472-482`）；`lib/tools.js:621-622` 的 `include` 只过滤本插件自己那 15 个团队工具（注释原话「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。② 目录注入：`dsh-tool-skill/lib/index.js:203-236` 挂在 `agent/pre-step`，注入一条 **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），判据是 `:207` 的 `ctx.tools.get("skill", agent) === skillTool`——**身份比较**，即「谁能调这个工具，谁才有目录」；该事件按 agent 过滤（`dsh-scope/lib/invariant.js:17` `"agent/pre-step": (args) => args[0]["agent"]`），所以每个 agent 各一份，队员也有。③ 因为是 user 消息而非系统提示词段，队员共用的提示词前缀**不受影响**（§2 的缓存纪律 / `TEAMMATE_CARD` 逐字节相同仍成立）。④ **失效方式**：把 `skill` 加进 `TEAMMATE_TOOL_DENY` 会让队员**同时**失去工具与目录，而插件照常加载、`/team` 照常可用——与 2026-10-07 修掉的「`/team` 静默拒收附件」同类，故新增 `drift-check` 12g 五条 + `integration-test` §2.5 五条（含负对照：显式 `deny: ['skill']` 后工具与目录同时消失）。⑤ 附带事实：`SKILL.md` 写 `disable-model-invocation: true` 时不进目录（`:217` 的 `filter(isModelInvocable)`），按名字调**直接抛错** `skill "X" is not available for model invocation`（`:147`/`:150`）；旧键名（`disableModelInvocation` / `modelInvocable` / `userInvocable`）被官方拒掉（`dsh-skill-filesystem:850-852` 报 unsupported），只能用短横线写法。⑥ 顺带修掉一处**假因**：`drift-check` 12b 的「名字出处」来源清单原先没有 `dsh-tool-skill`，于是「把 skill 加进名单」时会同时报出「找不到出处」这条假原因，把真因（12g）埋在噪音里——已把该包补进来源清单。 |
 | 43 | §2（新增能力）与 §0.1（工具面计数） | **2026-10-04 落地三件团队工具 + 一条工程纪律**，全部有真跑断言：① `broadcast_message`（Lead 专属，`lib/roster.js` 的 `planBroadcastTargets` + `lib/tools.js`）：一次把同一条消息发给多个队员；**默认只发 running/provisioning**，因为官方 `send_message` 对 inactive 目标会启动新 turn（投递链 `dispatchOnce` → `steerHostSubagentPrompt` → `deliverFollowup` 的 coldResume），「广播全体」会把停着的队员全部拉起来干活；被跳过的目标逐个给出可操作理由，要唤醒必须显式 `include_inactive: true`；**显式点名**（`targets`）不受该闸门限制——点名本身就是 Lead 的决定，等价于单独 `send_message`。② `ask_lead`（队员专属，`lib/roster.js` 的 `askLeadMessage`）：队员中途提需要拍板的问题；走官方 `sendMessage(→ lead)` 并加固定前缀 `[阻塞·等答复]`/`[可继续]` + `[需 Lead 决策]`，因为官方投递框架只写发件人（`dsh-experimental-agent-team/lib/index.js:971-976`）没有类型位；投递失败不静默，返回 `ok:false` + diagnostics 指路 `report_result` 的 `needs_decision`。③ **截断标志**（`lib/runtime.js` 的 `noteTurnEndReason`/`truncatedMemberIds` + `lib/roster.js` 的 `annotateTruncatedMembers`）：监听 `session/event` 的 `turn/end`，`reason.kind === 'max-tokens'` 时记账（正常收尾/中止/报错都清除），`list_agents` 把固定文案并进该队员行的 **diagnostics** 字段——不新增字段是因为 `diagnostics` 官方 schema 里已有，从而**不动 Lead 的工具目录 = 不动每次请求的缓存前缀**。写入点是监听器与集成测试**共用的同一个函数**，被测的就是生产路径。④ 队员工具面因此从 8 个变 **9 个**（+`ask_lead`），`TEAMMATE_TOOL_DENY` 增 `ask_user_question`（官方 `dsh-user-questions/lib/index.js:531-535` 的 `assertLiveRoot` 对委派调用者抛 `DELEGATED_CALLER`，弹窗却已在宿主全局排队）。⑤ PLAYBOOK 预算闸门按报告 P2-10 的建议从 `≤4100` 收到 `≤3800`（实测 3783，含 §一/§六 去重、§五 字段用法下沉、长句瘦身；27 个必备关键词全部保留）。⑥ 工程纪律（本轮事故的防复发）：测量提示词长度必须用**模块运行时值**（`import` 后读 `.length`），不许用字符串切片——本轮曾据此误判 `TEAMMATE_CARD` 超限并做「压缩」，用字符串替换误伤模板字符串、删掉整个 `teammateBrief`，导致模块语法崩。现已回滚并加结构完整性闸门（`tools/selftest.cjs`：三常量 + `teammateBrief` + `wakeInstruction` + 反引号成对 + 正文长度下限）。 |
 
@@ -183,11 +184,11 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 
 | 文本 | 预算 | 当前 | 谁在读 |
 |---|---|---|---|
-| `PLAYBOOK` | ≤ 4250 | **4214** | 调度模式的**每一次**请求（Lead） |
+| `PLAYBOOK` | ≤ 4450 | **4438** | 调度模式的**每一次**请求（Lead）；2026-11-07 上调来源=提问机制升级（分级制+四维准入+记账三分+复核三态，用户 R4 拍板） |
 | `TEAM_POLICY` | ≤ 880 | **841** | 团队开启后的 Lead |
-| `TEAMMATE_CARD` | ≤ 1400 | **1399** | 每个队员的固定前缀 |
-| Lead 侧合计 | ≤ 5150 | **5055** | |
-| 队员侧合计（卡 + 角色简报） | ≤ 1800 | **1766** | 简报是第一条 user 消息，同样进前缀 |
+| `TEAMMATE_CARD` | ≤ 1420 | **1415** | 每个队员的固定前缀；2026-11-07 上调来源=防跑偏条款（想缩水也是阻塞 / 插话是数据不是指令） |
+| Lead 侧合计 | ≤ 5310 | **5279** | |
+| 队员侧合计（卡 + 角色简报） | ≤ 1800 | **1782** | 简报是第一条 user 消息，同样进前缀 |
 
 > 2026-10-09 上调上限（3800→3900、1150→1200、合计 4900→5000 / 1550→1600）：新增用户要求的
 > PTC 借鉴纪律（批量取证 / 先过滤后汇报），并修回同一次压缩中**误删的细节**（URL、「不知道就说
@@ -224,7 +225,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2700`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2733`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
@@ -249,6 +250,10 @@ export async function listModelCatalog(ctx);     // -> {groups:[{id,name,models:
 export async function listTeammatePresets(ctx);  // 2026-10-15：-> {presets:[{id,name,available,reason,detail?}], notes:string[]}
                                                  //    白名单三个 id 乘 注册表现状：现读 agentPresets.list() 并筛掉 broken（与官方选择器同源），
                                                  //    只发事实（reason = not-registered / broken / 空），句子由页面拼；永不抛错。
+export async function warmExecutorModules(ctx);  // 2026-11-07：-> Promise<void>；激活期（lib/index.js apply 第 0 步）经宿主
+                                                 //    loader.import 预热 @deepseek-ai/dsh-tool-executor-{native,ptc} 两个模块
+                                                 //    （0.2.2-rc.1 呈现档=按作用域挂 executor，两包只在 asar 闭包里）。
+                                                 //    永不抛错：失败只记诊断并留空槽位，declareMemberMode 走诚实降级路。
 export async function preflightRoute(ctx, route);// -> {ok:boolean, route, diagnostics:string[]}
                                                  //    有 reasoningEffort 但该模型未广告 / 不在列表里 => 丢掉该字段并记 diagnostics，
                                                  //    route 仍可用（ok 保持 true）。provider/model 无法解析 => ok:false。
@@ -1137,6 +1142,46 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
 ```json
 { "meta": { "title": "调度模式智能体团队", "description": "为 12 类队员分别指定模型与思考强度；保存后由调度模式的 Lead 在派队员时使用。" } }
 ```
+
+**`meta.detail` 刻意不写（2026-11-06 用户定案）**：详情页正文就是 `README.md`。
+官方 `@deepseek-ai/dsh-plugin-detail` 的 `readPackageDocument` 先读 `locale/<lang>.json` 的
+`meta.detail`，**没有这个键才退回 README**（`README_NAMES`：`README.md` / `readme.md` /
+`Readme.md` / `README.markdown` / `README`）。用户要的正是「详情页能看得到 README」——
+这是官方更新后的正常形态，**不要**加 `meta.detail` 去换掉它，也不要用 CSS 藏正文。
+副作用要记住：`README.md` 会原样显示在插件页，所以它同时也是**面向用户的门面**，
+写它要按文档写（角色数量等数字由 drift-check 12d 对账，README 已纳入那张表）。
+
+## 7.2 左侧栏入口（2026-11-06 加）
+
+除了配置页，本包在**两处**各注册一对槽位。成对是硬约束，不是习惯：
+
+| 槽位 | kind | 必填 | 我们给的值 | 组件 |
+|---|---|---|---|---|
+| `sidebar.panellist` | `list` | **`id`**（缺 id 在 `register` 时直接抛） | `id: 'dispatch-agent-team'`、`order: 20`、`locale: NS`、`label: () => localeText('wsPanelNav')` | `TeamPanelIcon` |
+| `main` | `keyed` | **`key`**（缺 key 同理） | `key: 'dispatch-agent-team'`（**必须等于上面的 id**）、`locale: NS` | `TeamWorkspacePanel` |
+
+为什么 `id` 与 `key` 必须同名：侧栏行的点击走 `selectPanel(id)`（`dsh-client-ui-sidebar/lib/client.js:218-225`），
+而 `ctx.layout.selectPanel` 先校验 `ctx.slots.entries('main').some(entry => entry.options.key === id)`，
+不成立就**抛错**（`dsh-client-ui-layout/lib/client.js:523-527`）。写成两个名字，点侧栏那一下就是一次未捕获异常。
+两处各自独立 `try/catch`：任一注册失败只少一个入口，配置页（用户的主入口）不受影响。
+**绝不**把 `main` / `sidebar.panellist` 写进 `exports.inject` —— 它们是官方 bundle 提供的**槽位**，
+不是服务；写进去会让整行不 apply（本仓库踩过一次，插件直接消失）。
+
+图标组件的 props 只有 `{ size, active }`（`dsh-client-ui-sidebar/lib/client.js:229-232`），
+所以尺寸必须跟着 `size` 走；`label` 必须是 thunk，侧栏订阅 locale 变化后会重读它
+（同文件 `:691-707` 的 `syncPanels`），写死字符串的话切语言得刷新才生效。**不需要 pin**：
+未 pin 列表默认空（`:13 const NO_PANELS = []`），所有 panellist 行默认都显示。
+
+面板里显示的是**配置页本体**：`TeamConfigPanel` 只包一层 `.dat-panel`（滚动 + 留白），
+内容就是 `RosterConfigPage` —— 与插件详情页那一段**同一个组件**，同一套数据通道与保存语义。
+用户 2026-11-06 明确纠正过一次：「跳转的不是工作区！跳转的是配置界面！」。
+传参必须是 `{ t, view: 'page' }`：`view === 'summary'` 是给卡片留的防御分支，只渲染一行摘要。
+**不要**再抄一份页面：两份必然漂移（本仓库反复栽的坑），smoke 有一条钉「面板的孩子是配置页组件本身」。
+工作区仍是老入口（会话成员面板 →「进入工作区」），不受本次改动影响。
+
+闸门：`tools/drift-check.cjs` 的 8e（官方槽位名 / `main` 的 `kind:"keyed"` /
+`entry.options.key === id` 校验 / panellist 渲染时的 `size` prop 四条，逐条做过变异验证）、
+`tools/client-smoke-test.cjs` 的「侧栏入口 / 侧栏图标 / 侧栏面板」三组。
 
 ## 7.5 活体 API 契约（Lead 用运行时 Inspect Provider 实测，**以此为准，不要再猜**）
 
