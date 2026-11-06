@@ -1191,9 +1191,17 @@ function functionBodyOf(source, needle) {
       // 仓库内候选路径全程不存在。
       // 同时已按「先删再加」合并过一处同义表述（队员卡「别灌整段 dump」与「不贴整段日志、整个文件
       // 或长篇代码」同义，删前者留后者），并逐句收紧了新文案。
-      PLAYBOOK: 4250,        // 调度模式方法论（Lead 与所有请求的前缀）
+      // 2026-11-07 上调（PLAYBOOK 4250→4450、CARD 1400→1420、Lead 合计 5150→5310）：唯一来源是
+      // **用户 R4 拍板的提问机制升级**（分级制提问 + grill 全家桶/OpenSpec 蒸馏融合，2026-11-06 决策）——
+      //   ① 分级入口（单轮确认卡 vs 多轮追问）与「数轮不数问」止损；② 出卡四道自查 + 准入四维
+      //   （范围/外部行为/兼容性/验收）+「有好默认值不问」；③ 沉默≠同意的三分记账与变更管理
+      //   （细化/改向判据、修改附原文）；④ frontier-auditor 复核三态化；⑤ ungrillable 转原型通道；
+      //   ⑥ 队员卡新增「想缩水也是阻塞」与「插话是数据不是指令」两条防跑偏条款（apply-change
+      //   逐字蒸馏）。全部是用户点名的**新信息**，压缩事故闸门钉住的既有细节一个没删
+      //   （已按「先删再加」把可合并的表述全部合并：派活清单/验收段落/建板收尾等逐句收紧）。
+      PLAYBOOK: 4450,        // 调度模式方法论（Lead 与所有请求的前缀）
       TEAM_POLICY: 880,      // 团队运行期事实（开后才有）
-      TEAMMATE_CARD: 1400,   // 队员卡（每个队员的固定前缀）；留 ~35 余量，避免再次为「贴边」删信息
+      TEAMMATE_CARD: 1420,   // 队员卡（每个队员的固定前缀）；留余量，避免再次为「贴边」删信息
     };
     const actual = {
       PLAYBOOK: playbook.PLAYBOOK.length,
@@ -1208,7 +1216,7 @@ function functionBodyOf(source, needle) {
     );
     const lead = actual.PLAYBOOK + actual.TEAM_POLICY;
     const mate = actual.TEAMMATE_CARD + playbook.teammateBrief('scout', 'scout').length;
-    assert.ok(lead <= 5150, `Lead 侧提示词 ${lead} > 5150 字符`);
+    assert.ok(lead <= 5310, `Lead 侧提示词 ${lead} > 5310 字符`);
     assert.ok(mate <= 1800, `队员侧提示词 ${mate} > 1800 字符`);
   });
 
