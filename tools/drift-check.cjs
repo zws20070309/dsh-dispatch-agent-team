@@ -391,6 +391,30 @@ check('工作区入口依赖的官方面板标记与 sessionId prop 仍在（改
   return missing.length === 0 ? true : `官方这些标记变了，lib/client.js 的入口注入要跟着改：${missing.join('、')}`;
 });
 
+
+// 8e) 左侧栏入口依赖的官方槽位与校验语义（2026-11-06 落地时加的闸门）。
+// 侧栏那一行点下去会走 ctx.layout.selectPanel(id)，而 LayoutController 先拿 `main` 槽的
+// entries 校验 `entry.options.key === id`（dsh-client-ui-layout/lib/client.js），校验不过
+// **直接抛错**；同时 `sidebar.panellist` 是 kind:"list"，缺 id 在 register 时抛。
+// 官方任一改名/换 kind，左侧栏入口就会静默不出现（或点了抛错），所以这两条必须可跑。
+const officialLayout = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/client.js') || '';
+const officialSidebar = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-sidebar/lib/client.js') || '';
+check('左侧栏入口依赖的官方槽位、panel id 校验与渲染 props 仍在（改名会让入口静默消失）', () => {
+  if (officialLayout === '') return '读不到 dsh-client-ui-layout/lib/client.js';
+  if (officialSidebar === '') return '读不到 dsh-client-ui-sidebar/lib/client.js';
+  const missing = [];
+  // sidebar.panellist 必须是 list 且声明在 sidebar 的子槽表里（list 槽才认 id）。
+  if (!officialSidebar.includes('"sidebar.panellist"')) missing.push('槽 sidebar.panellist');
+  if (!/renderSlot\("sidebar\.panellist",\s*\{[^}]*size:/u.test(officialSidebar)) missing.push('panellist 渲染时注入的 size prop');
+  // 行点击 → selectPanel(id)（本插件把 id 与 main 的 key 写成同一个值就靠这条）。
+  if (!officialSidebar.includes('selectPanel(id)')) missing.push('侧栏行点击调用的 selectPanel(id)');
+  // "main" 槽必须仍是 keyed（keyed 认 key，list 认 id —— 换了我们两侧的注册形状就都错）。
+  if (!/"main":\s*\{\s*kind:\s*"keyed"/u.test(officialLayout)) missing.push('main 槽的 kind:"keyed"');
+  // 校验语义：selectPanel 按 `entry.options.key === id` 判断主面板是否注册。
+  if (!officialLayout.includes('entry.options.key === id')) missing.push('selectPanel 的 key === id 校验');
+  return missing.length === 0 ? true : `官方这些约定变了，lib/client.js 的侧栏注册要跟着改：${missing.join('、')}`;
+});
+
 // 8d) 工作区画布读取的官方**团队事件字段名**（2026-10-08 落地时加的闸门）。
 // lib/graph.js 折叠会话日志时按字段名取值：读错了不会抛错，只会让某条通道**静默变成 0**
 // （实测踩过两次：team/message/delivered 是扁平形状、不带 message 包装，按 data.message 读
@@ -1431,6 +1455,10 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
         'locale/en.json': readFileOr(path.join(PLUGIN_DIR, 'locale', 'en.json')),
         'presets/dispatch-mode.patch.yml': ourPresetPatch,
         'package.json': readFileOr(path.join(PLUGIN_DIR, 'package.json')),
+        // 插件详情页的正文（2026-11-06 起由 meta.detail 指定）：它同样会写角色数，
+        // 而这份文案此前**不在任何闸门里** —— 扩编/缩编时它会静默停在旧数字上。
+        'docs/DETAIL.zh.md': readFileOr(path.join(PLUGIN_DIR, 'docs', 'DETAIL.zh.md')),
+        'docs/DETAIL.md': readFileOr(path.join(PLUGIN_DIR, 'docs', 'DETAIL.md')),
       };
       const wrong = [];
       const patterns = [

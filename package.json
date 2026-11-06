@@ -19,6 +19,7 @@
     "tools",
     "presets",
     "locale",
+    "docs",
     "cordis.patch.yml",
     "icon.svg",
     "README.md",

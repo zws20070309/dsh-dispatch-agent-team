@@ -101,6 +101,13 @@ function createReactStub() {
         hooks[index] = deps;
         if (changed) effects.push(fn);
       },
+      // useRef 只存**同一个 mount 内**的稳定槽位（与 useState 同表格，但没有 setter）：
+      // 侧栏面板用它拿容器 DOM（openWorkspace 的挂点）。
+      useRef(initial) {
+        const index = cursor++;
+        if (!(index in hooks)) hooks[index] = { current: initial };
+        return hooks[index];
+      },
     },
     /** 渲染一轮并执行本轮登记的 effect。 */
     render(component, props) {
@@ -159,20 +166,26 @@ async function main() {
     });
     let component;
     let anchorComponent;
+    let panelIcon;
+    let panelComponent;
     let localeDict;
     let injections = 0;
     const registered = [];
+    const registrations = [];
     const ctx = {
       effect(fn) { fn(); return () => {}; },
       slots: Object.freeze({
         inject(name, factory) { injections += 1; return factory(); },
         register(slot, candidate) {
           registered.push(slot.name);
-          // 2026-10-08：本包现在注册**两个**组件（配置页 + 工作区入口锚点）。
-          // 锚点必须注册在 conversation.session.header.actions（官方 TeamAction 同一个槽），
-          // 配置页必须留在 plugins.bundle.config —— 各拿各的，别互相覆盖。
+          // 2026-11-06：注册**四个**组件 —— 配置页、工作区锚点、侧栏图标、侧栏面板。
+          // 前两个各 2026-10-08 的老账；后两个是左侧栏入口（成对注册，id/key 同名）。
+          // 这里按槽名分流；注册项本体也留一份，供形状断言逐个核对。
+          registrations.push({ slot, candidate });
           if (slot.name === 'plugins.bundle.config') component = candidate;
           if (slot.name === 'conversation.session.header.actions') anchorComponent = candidate;
+          if (slot.name === 'sidebar.panellist') panelIcon = candidate;
+          if (slot.name === 'main') panelComponent = candidate;
           return () => {};
         },
       }),
@@ -197,7 +210,10 @@ async function main() {
       exportsObject,
       injections: () => injections,
       registered: () => registered,
+      registrations: () => registrations,
       anchor: () => anchorComponent,
+      panelIcon: () => panelIcon,
+      panel: () => panelComponent,
       /** 再渲染一轮（用于交互之后）。 */
       repaint() { tree = runtime.render(component, props); return tree; },
       tree: () => tree,
@@ -216,19 +232,97 @@ async function main() {
       get: { ok: true, config: { version: 1, roles: {} }, roles: ROLES, revision: '1:1', diagnostics: [] },
       'list-models': { ok: true, groups: [], failures: [] },
     });
-    check('注册形状：id / name / inject / 两个槽位与字典各注册一次', () => {
+    check('注册形状：id / name / inject / 四个槽位与字典各注册一次', () => {
       if (registration.id !== '@zws/dsh-dispatch-agent-team') return `id=${registration.id}`;
       if (page.exportsObject.name !== 'dsh-dispatch-agent-team-client') return `name=${page.exportsObject.name}`;
       const inject = page.exportsObject.inject;
       if (!Array.isArray(inject) || !inject.includes('slots') || !inject.includes('locale')) {
         return `inject=${JSON.stringify(inject)}（需要 slots 与 locale）`;
       }
-      if (page.injections() !== 2) return `slots.inject 调用了 ${page.injections()} 次（应为 2：配置页 + 工作区锚点）`;
+      // `main` / `sidebar.panellist` 是官方 bundle 提供的**槽位**，不是服务 ——
+      // 把它们写进 exports.inject 会让整行 apply 不了（services 里没有它们）。
+      for (const name of ['main', 'sidebar.panellist', 'sidebar']) {
+        if (inject.includes(name)) return `inject 里混进了槽位名 ${name}（那是槽，不是服务）`;
+      }
+      if (page.injections() !== 4) {
+        return `slots.inject 调用了 ${page.injections()} 次（应为 4：配置页 + 工作区锚点 + 侧栏图标 + 侧栏面板）`;
+      }
       const names = page.registered();
       if (!names.includes('plugins.bundle.config')) return '配置页槽位没注册';
       if (!names.includes('conversation.session.header.actions')) return '工作区锚点槽位没注册（官方 TeamAction 同一个槽）';
+      if (!names.includes('sidebar.panellist')) return '侧栏入口槽位没注册（左侧栏不会出现这一行）';
+      if (!names.includes('main')) return '主面板槽位没注册（侧栏那一行点了会抛 selectPanel 未注册）';
       if (typeof page.anchor() !== 'function') return '工作区锚点组件没注册';
+      if (typeof page.panelIcon() !== 'function') return '侧栏图标组件没注册';
+      if (typeof page.panel() !== 'function') return '主面板组件没注册';
       if (page.dict() === undefined || typeof page.dict().zh !== 'object') return '字典没注册';
+      return true;
+    });
+
+    check('侧栏入口：list 槽用 id（不是 key），且与 main 槽的 key 是同一个字符串', () => {
+      // 官方 LayoutController.selectPanel 按 `entry.options.key === id` 校验 main 槽
+      // （dsh-client-ui-layout/lib/client.js:523-527，校验失败直接抛错），而 sidepanel 行
+      // 点击传的就是它自己的 id（dsh-client-ui-sidebar/lib/client.js:218-225）。
+      // 两个字符串一旦写成不一样的名字，点侧栏的那一下就会抛错——这里是唯一能拦住它的地方。
+      const icon = page.registrations().find((row) => row.slot.name === 'sidebar.panellist');
+      const panel = page.registrations().find((row) => row.slot.name === 'main');
+      if (icon === undefined || panel === undefined) return '侧栏图标或主面板没有注册';
+      if (typeof icon.slot.id !== 'string' || icon.slot.id === '') {
+        return `sidebar.panellist 的 id=${JSON.stringify(icon.slot.id)}（list 槽缺 id 在 register 时直接抛）`;
+      }
+      if (icon.slot.key !== undefined) return 'sidebar.panellist 写了 key（list 槽只认 id，多写的字段没人读）';
+      if (typeof panel.slot.key !== 'string' || panel.slot.key === '') {
+        return `main 的 key=${JSON.stringify(panel.slot.key)}（keyed 槽缺 key 在 register 时直接抛）`;
+      }
+      if (panel.slot.id !== undefined) return 'main 写了 id（keyed 槽只认 key）';
+      if (icon.slot.id !== panel.slot.key) {
+        return `侧栏 id(${icon.slot.id}) 与主面板 key(${panel.slot.key}) 不同名 —— 点侧栏会抛 layout.selectPanel 未注册`;
+      }
+      if (typeof icon.slot.label !== 'function') {
+        return 'label 不是 thunk（写死字符串时切换语言后侧栏名字不会变）';
+      }
+      if (typeof icon.slot.label() !== 'string' || icon.slot.label() === '') return 'label() 没返回文案';
+      if (typeof icon.slot.order !== 'number') return `order=${JSON.stringify(icon.slot.order)}（排序不定会让入口跑到列表末尾）`;
+      return true;
+    });
+
+    check('侧栏图标：只读 { size, active }，按 size 出图（不写死尺寸）', () => {
+      // 官方 renderSlot('sidebar.panellist', { size: wide ? 16 : 18, active }, { only: id })
+      // （dsh-client-ui-sidebar/lib/client.js:229-232）：组件只拿到这两个字段。
+      const icon = page.panelIcon();
+      const small = icon({ size: 16, active: false });
+      const large = icon({ size: 18, active: true });
+      if (small === null || small === undefined || small.type !== 'svg') return '图标不是 svg 根节点';
+      if (Number(small.props.width) !== 16) return `width=${String(small.props.width)}（应跟随 size=16）`;
+      if (Number(large.props.width) !== 18) return `width=${String(large.props.width)}（应跟随 size=18）`;
+      if (Number(small.props.height) !== 16) return `height=${String(small.props.height)}（应跟随 size=16）`;
+      if (small.props.viewBox !== '0 0 32 32') return `viewBox=${String(small.props.viewBox)}`;
+      if (small.props['aria-hidden'] !== 'true') return '图标没有 aria-hidden（侧栏行本身已有 aria-label）';
+      // 空 props 也必须能画：官方若哪天不传参，抛错会连带炸掉整个侧栏。
+      const bare = icon();
+      if (bare === null || bare === undefined || bare.type !== 'svg') return '无 props 时图标抛错/没出 svg';
+      if (!(Number(bare.props.width) > 0)) return '无 props 时 width 不是正数';
+      return true;
+    });
+
+    check('侧栏面板：没有主视图会话时给一句说明，不是一块空白', () => {
+      // 面板在 `main` 槽里，root 作用域 —— 拿不到 sessionId prop，只能自己读宿主。
+      // 这里 ctx 是没有 sessions 服务的替身，正好覆盖「取不到会话」这条必须不崩的路径。
+      const panel = page.panel();
+      const tree = panel({ t: (key) => key });
+      if (tree === null || tree === undefined) return '面板返回空树';
+      if (tree.props === undefined || tree.props.className !== 'dat-panel') {
+        return `面板根 className=${String(tree.props === undefined ? undefined : tree.props.className)}（应为 dat-panel）`;
+      }
+      // 文案走 `makeText` 的兜底链（官方 t → 本文件 zh → key）：替身的 t 直接回 key，
+      // 于是这里落到 zh 字典那一句。判据同时钉住「不是裸键名」和「不是空串」。
+      const expected = page.dict().zh.wsPanelNoSession;
+      if (typeof expected !== 'string' || expected === '') return '字典里没有 wsPanelNoSession';
+      const text = textOf(tree);
+      if (text !== expected) return `空态文案=${JSON.stringify(text)}（应为字典里的 ${JSON.stringify(expected)}）`;
+      // 有会话时才挂画布容器：这里确认空态下**没有**去开工作区（否则会白起一条轮询链）。
+      const hosts = findAll(tree, (node) => node.props !== undefined && node.props.className === 'dat-panel-host');
+      if (hosts.length !== 0) return '没有会话时仍渲染了画布容器（会白开一个工作区）';
       return true;
     });
 
@@ -1518,6 +1612,168 @@ async function main() {
       const reload = findAll(tree, (node) => node.type === 'button' && textOf(node).includes('重新载入'))[0];
       return reload !== undefined && reload.props.disabled !== true ? true : '加载失败后「重新载入」不可用';
     });
+  }
+
+  // ── 13) 侧栏面板真的把工作区挂进自己的容器（2026-11-06）────────────────────
+  // 为什么必须单独一条：左侧栏入口的面板是 `main` 槽里的 React 组件，但它渲染的东西
+  // 由**命令式** openWorkspace 建出来（与全屏浮层共用同一份代码）。挂错地点不会报错：
+  // 挂到 body 上就变成又一个全屏浮层（把侧栏一起盖住），什么都不挂就是一块白板。
+  // 这里用极简 DOM 替身走一遍真实调用链：apply → 找到 main 槽组件 → 两轮渲染 →
+  // 断言根节点带 in-panel、挂在传入的容器里、body 一个子节点都没多。
+  {
+    const makeEl = (tag) => {
+      const el = {
+        tagName: tag, style: {}, dataset: {}, children: [], attributes: {},
+        className: '',
+        setAttribute(name, value) { this.attributes[name] = value; },
+        getAttribute(name) { return this.attributes[name]; },
+        append(...nodes) { for (const node of nodes) this.appendChild(node); },
+        appendChild(node) { this.children.push(node); if (node) node.__parent = this; return node; },
+        remove() {
+          if (!this.__parent) return;
+          const at = this.__parent.children.indexOf(this);
+          if (at >= 0) this.__parent.children.splice(at, 1);
+          this.__parent = null;
+        },
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        addEventListener() {},
+        removeEventListener() {},
+        classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+        getBoundingClientRect() { return { width: 800, height: 600, left: 0, top: 0, right: 800, bottom: 600 }; },
+      };
+      return el;
+    };
+    const savedDocument = globalThis.document;
+    const savedWindow = globalThis.window;
+    const savedRaf = globalThis.requestAnimationFrame;
+    const savedCancel = globalThis.cancelAnimationFrame;
+    const savedFetch = globalThis.fetch;
+    const bodyEl = makeEl('body');
+    globalThis.document = {
+      body: bodyEl, head: makeEl('head'), documentElement: makeEl('html'),
+      createElement: makeEl, createElementNS: (ns, tag) => makeEl(tag),
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+      addEventListener() {}, removeEventListener() {}, hidden: false,
+    };
+    // 自动刷新是 window.setTimeout 链：替身必须能真排定时器，否则 openWorkspace 一开就崩。
+    // 用例结束在 finally 里关掉工作区（dispose），不让链继续跑。
+    globalThis.window = {
+      addEventListener() {}, removeEventListener() {},
+      innerWidth: 1400, innerHeight: 900, devicePixelRatio: 1,
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (id) => clearTimeout(id),
+    };
+    globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+    globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
+    // 面板一挂上就会拉一轮 team-graph：用本地假回执，别把别的用例的 sent 台账弄脏。
+    globalThis.fetch = () => Promise.resolve({
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify({ ok: false, error: 'stub' })),
+    });
+    try {
+      // hooks 必须按**每次渲染**重置游标：用数组长度当索引会让第二轮读回初始值（探针踩过）。
+      const hooks = [];
+      let cursor = 0;
+      let effects = [];
+      const ReactStub = {
+        createElement,
+        useState(initial) {
+          const index = cursor++;
+          if (!(index in hooks)) hooks[index] = { value: typeof initial === 'function' ? initial() : initial };
+          return [hooks[index].value, (value) => {
+            hooks[index].value = typeof value === 'function' ? value(hooks[index].value) : value;
+          }];
+        },
+        useEffect(fn) { cursor += 1; effects.push(fn); },
+        useRef(initial) {
+          const index = cursor++;
+          if (!(index in hooks)) hooks[index] = { ref: { current: initial } };
+          return hooks[index].ref;
+        },
+      };
+      const renderPanel = (component) => { cursor = 0; effects = []; return component({ t: (key) => key }); };
+      const runtime = createReactStub();
+      Object.assign(runtime.React, ReactStub);
+      const exportsObject = registration.factory((specifier) => {
+        if (specifier === 'react') return runtime.React;
+        throw new Error(`client.js 只应该 require('react')，实际 require 了 "${specifier}"`);
+      });
+      let panelComponent;
+      // 宿主服务替身：只有 sessions（面板靠 retainedBy.mainView 找主视图会话）。
+      const sessionsService = {
+        list: {
+          getSnapshot: () => ({
+            ids: ['session-abc'],
+            byId: { 'session-abc': { id: 'session-abc', retainedBy: { mainView: 1 } } },
+          }),
+          subscribe: () => () => {},
+        },
+      };
+      const ctx = {
+        effect(fn) { fn(); return () => {}; },
+        reflect: { get: (name) => (name === 'sessions' ? sessionsService : undefined) },
+        slots: Object.freeze({
+          inject(name, factory) { return factory(); },
+          register(slot, candidate) {
+            if (slot.name === 'main') panelComponent = candidate;
+            return () => {};
+          },
+        }),
+        locale: Object.freeze({
+          register() { return () => {}; },
+          getSnapshot() { return { active: 'zh' }; },
+          subscribe() { return () => {}; },
+          bind() { return (key) => key; },
+        }),
+      };
+      exportsObject.apply(ctx);
+      if (typeof panelComponent !== 'function') throw new Error('main 槽没有注册组件');
+      // 第 1 轮：sessionId 还是空 → 空态；effect 里读到主视图会话并写回 state。
+      renderPanel(panelComponent);
+      for (const effect of effects) effect();
+      // 第 2 轮：这次有会话了 → children = [host]；把 ref 指到一个真容器再跑 effect。
+      const tree = renderPanel(panelComponent);
+      const flat = [];
+      const pushAll = (node) => {
+        if (Array.isArray(node)) { node.forEach(pushAll); return; }
+        if (node) flat.push(node);
+      };
+      pushAll(tree.props.children);
+      const hostEl = flat.find((node) => node.props.className === 'dat-panel-host');
+      const hostNode = makeEl('div');
+      if (hostEl === undefined) throw new Error('有主视图会话时没有渲染 dat-panel-host');
+      hostEl.props.ref.current = hostNode;
+      const disposers = [];
+      for (const effect of effects) {
+        const dispose = effect();
+        if (typeof dispose === 'function') disposers.push(dispose);
+      }
+      const mounted = hostNode.children[0];
+      check('侧栏面板：工作区挂进面板容器（不是 body），并带 in-panel 相对布局', () => {
+        if (mounted === undefined) return '面板容器里什么都没有（点了侧栏是一块白板）';
+        if (mounted.className !== 'dat-ws in-panel') {
+          return `挂上来的根节点 className=${JSON.stringify(mounted.className)}（应为 'dat-ws in-panel'：缺 in-panel 会按覆盖层画成全屏）`;
+        }
+        if (bodyEl.children.length !== 0) {
+          return `body 多出了 ${bodyEl.children.length} 个直接子节点（面板模式下工作区不该挂到 body —— 那会把侧栏一起盖住）`;
+        }
+        if (mounted.getAttribute('role') !== 'dialog') return '工作区根节点没有 role=dialog';
+        return true;
+      });
+      check('侧栏面板：卸载后工作区从容器里摘掉（否则轮询链一直活着）', () => {
+        for (const dispose of disposers) dispose();
+        if (hostNode.children.length !== 0) return `卸载后容器里还有 ${hostNode.children.length} 个节点`;
+        return true;
+      });
+    } finally {
+      globalThis.document = savedDocument;
+      globalThis.window = savedWindow;
+      globalThis.requestAnimationFrame = savedRaf;
+      globalThis.cancelAnimationFrame = savedCancel;
+      globalThis.fetch = savedFetch;
+    }
   }
 
   // ── 收尾 ──────────────────────────────────────────────────────────────────

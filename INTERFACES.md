@@ -224,7 +224,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2700`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2718`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
@@ -1133,10 +1133,50 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
 
-`meta.title` / `meta.description`，插件页与「已安装」列表卡片用它们：
+`meta.title` / `meta.description` / `meta.detail`，插件页与「已安装」列表卡片用它们：
 ```json
-{ "meta": { "title": "调度模式智能体团队", "description": "为 12 类队员分别指定模型与思考强度；保存后由调度模式的 Lead 在派队员时使用。" } }
+{ "meta": { "title": "调度模式智能体团队", "description": "为 12 类队员分别指定模型与思考强度；保存后由调度模式的 Lead 在派队员时使用。", "detail": "docs/DETAIL.zh.md" } }
 ```
+
+**`meta.detail` 不是可选装饰（2026-11-06）**：官方 `@deepseek-ai/dsh-plugin-detail` 的
+`readPackageDocument` 按 `locale/<lang>.json` 的 `meta.detail` 找详情文档，**找不到就退回 README**
+（`README_NAMES` 顺序：`README.md` / `readme.md` / `Readme.md` / `README.markdown` / `README`）。
+本包此前的 `locale/*.json` 没有这个键，于是 22 KB 的 README 被整篇塞进插件详情页 ——
+用户 2026-11-06 报的就是这个。取值是**包内相对的 Markdown 路径**（不能含 `\`、不能是绝对路径、
+不能有 `.`/`..` 段、必须 `.md`/`.markdown`），语言链按 `zh-CN → zh → en` 逐级取第一个声明了它的文件。
+两份文档都要进 `package.json` 的 `files`，以及 `tools/repair.cjs` 的 `PACKAGE_FILES` 与
+`tools/sync-to-dsh.cjs` 的 `FILES`（drift-check 有闸门守着这三处一致性）。
+
+## 7.2 左侧栏入口（2026-11-06 加）
+
+除了配置页，本包在**两处**各注册一对槽位。成对是硬约束，不是习惯：
+
+| 槽位 | kind | 必填 | 我们给的值 | 组件 |
+|---|---|---|---|---|
+| `sidebar.panellist` | `list` | **`id`**（缺 id 在 `register` 时直接抛） | `id: 'dispatch-agent-team'`、`order: 20`、`locale: NS`、`label: () => localeText('wsPanelNav')` | `TeamPanelIcon` |
+| `main` | `keyed` | **`key`**（缺 key 同理） | `key: 'dispatch-agent-team'`（**必须等于上面的 id**）、`locale: NS` | `TeamWorkspacePanel` |
+
+为什么 `id` 与 `key` 必须同名：侧栏行的点击走 `selectPanel(id)`（`dsh-client-ui-sidebar/lib/client.js:218-225`），
+而 `ctx.layout.selectPanel` 先校验 `ctx.slots.entries('main').some(entry => entry.options.key === id)`，
+不成立就**抛错**（`dsh-client-ui-layout/lib/client.js:523-527`）。写成两个名字，点侧栏那一下就是一次未捕获异常。
+两处各自独立 `try/catch`：任一注册失败只少一个入口，配置页（用户的主入口）不受影响。
+**绝不**把 `main` / `sidebar.panellist` 写进 `exports.inject` —— 它们是官方 bundle 提供的**槽位**，
+不是服务；写进去会让整行不 apply（本仓库踩过一次，插件直接消失）。
+
+图标组件的 props 只有 `{ size, active }`（`dsh-client-ui-sidebar/lib/client.js:229-232`），
+所以尺寸必须跟着 `size` 走；`label` 必须是 thunk，侧栏订阅 locale 变化后会重读它
+（同文件 `:691-707` 的 `syncPanels`），写死字符串的话切语言得刷新才生效。**不需要 pin**：
+未 pin 列表默认空（`:13 const NO_PANELS = []`），所有 panellist 行默认都显示。
+
+面板里显示的是**同一个**工作区：`openWorkspace(sessionId, host)` 的 `host` 参数决定挂点
+（省略 = `document.body` 的全屏浮层，成员面板那个入口走这条；给元素 = 挂进该元素，
+根节点额外带 `in-panel` 由 CSS 覆写成相对布局）。渲染逻辑只有一份，抄第二套必然漂移。
+会话 id 来自 `sessions.list` 里 `retainedBy.mainView > 0` 的那条 —— 官方自己也这么取
+（`dsh-client-ui-workspace/lib/client.js:3698`），不解析 DOM、不缓存面板挂载时刻的旧值。
+
+闸门：`tools/drift-check.cjs` 的 8e（官方槽位名 / `main` 的 `kind:"keyed"` /
+`entry.options.key === id` 校验 / panellist 渲染时的 `size` prop 四条，逐条做过变异验证）、
+`tools/client-smoke-test.cjs` 的「侧栏入口 / 侧栏图标 / 侧栏面板」三组。
 
 ## 7.5 活体 API 契约（Lead 用运行时 Inspect Provider 实测，**以此为准，不要再猜**）
 

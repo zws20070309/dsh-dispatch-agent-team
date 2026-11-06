@@ -181,6 +181,8 @@ const PACKAGE_FILES = [
   'icon.svg',
   'locale/zh.json',
   'locale/en.json',
+  'docs/DETAIL.md',
+  'docs/DETAIL.zh.md',
   'lib/index.js',
   'lib/preset.js',
   'lib/runtime.js',
