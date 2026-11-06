@@ -124,7 +124,9 @@ node tools/install.cjs
 - 统一选择时，思考强度会按新模型重算：仍然支持的档位保留，不支持的退回「模型默认」。
 - 改完**立即生效**：已经在跑的队员也在下一次请求就用上新路由，不需要重启。
 - 唯一的例外是 `spawn_teammate` 的显式参数（`provider`/`model`/`reasoning_effort`）——
-  那是「这一次派活」的命令，会钉在该队员身上。
+  那是「这一次派活」的命令，会钉在该队员身上。思考强度未显式给时，spawn 会**继承
+  Lead 当前生效档并钉住**（2026-11-07 修复：规避 agent-default-model 步前固定与
+  adapter default 的强度冲突）；模型与路由仍逐请求实时跟随。
 - 配置文件在 `~/.dsh/dispatch-agent-team.json`。
 
 ### 典型的协作节奏

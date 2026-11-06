@@ -2565,7 +2565,7 @@ async function main() {
     // 参数顺序是 (ctx, route)——漏掉第一个参数会把 ctx 当 route 传回去。
     preflightRoute: async (_ctx, route) => ({ ok: true, route, diagnostics: [] }),
     pinSpawnRoute: () => {},
-    recordReport: (name, report) => runtime.recordReport(name, report),
+    recordReport: (name, report, taskId) => runtime.recordReport(name, report, taskId),
     markReportDelivered: (entry, delivered) => runtime.markReportDelivered(entry, delivered),
     // 截断账本的读口也委托给真 runtime：noteTurnEndReason 是它的写入点，
     // list_agents 通过这里取值（被测的就是生产路径）。
@@ -2637,7 +2637,7 @@ async function main() {
     {
       const failingRuntime = {
         ...reportRuntime,
-        recordReport: (name, report) => runtime.recordReport(name, report),
+        recordReport: (name, report, taskId) => runtime.recordReport(name, report, taskId),
       };
       const failingTools = toolsModule.teamToolDefinitions({
         runtime: failingRuntime,
@@ -3303,6 +3303,43 @@ async function main() {
       if (note === undefined || !note.includes('release')) return JSON.stringify(ownBlocked.diagnostics);
       return true;
     });
+
+    // ⑤ task_id 坐标（2026-11-07 融入 dsh-agent-teams source-task 机制）：
+    //    报告头带坐标、校验归属、自动绑定——两账合一的锚点，三用例钉住行为。
+    closureBoard = openBoard();
+    closureBoard[0] = Object.assign({}, closureBoard[0], { status: 'in_progress', ownerName: 'scout', revision: 5 });
+    const coordReport = await closureReport.execute(
+      argsOf({ status: 'completed', task_id: 'task-1' }),
+      { agent: scoutAgent, signal: execSignal() },
+    );
+    check('report_result：合法 task_id → 报告头带「· 任务 task-1」坐标', () => {
+      if (coordReport.ok !== true) return '报告没投出去：' + JSON.stringify(coordReport);
+      if (!coordReport.report.includes('· 任务 task-1')) return '报告头没带任务坐标：' + coordReport.report.slice(0, 120);
+      return true;
+    });
+    let ghostNote = true;
+    let multiNote = true;
+    try {
+      const bad = await closureReport.execute(
+        argsOf({ status: 'blocked', summary: 'x', task_id: 'task-ghost' }),
+        { agent: scoutAgent, signal: execSignal() },
+      );
+      if (bad.delivered !== true) ghostNote = '报告应仍投递：' + JSON.stringify(bad);
+      else if (!(bad.diagnostics ?? []).some((note) => note.includes('不在你名下'))) {
+        ghostNote = '诊断缺「不在你名下」：' + JSON.stringify(bad.diagnostics);
+      }
+    } catch (e) { ghostNote = String(e); }
+    try {
+      closureBoard = openBoard();
+      closureBoard[0] = Object.assign({}, closureBoard[0], { status: 'in_progress', ownerName: 'scout', revision: 6 });
+      closureBoard.push({ id: 'task-9', revision: 0, subject: '另一条', description: '', status: 'in_progress', ownerName: 'scout', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] });
+      const multi = await closureReport.execute(argsOf({ status: 'completed' }), { agent: scoutAgent, signal: execSignal() });
+      if (!(multi.diagnostics ?? []).some((note) => note.includes('未绑定任务板坐标') || note.includes('下次带 task_id'))) {
+        multiNote = '缺未绑定提示：' + JSON.stringify(multi.diagnostics);
+      }
+    } catch (e) { multiNote = String(e); }
+    check('report_result：task_id 不在名下 → 仍投递 + 诊断「不在你名下」（不拦报告）', () => ghostNote);
+    check('report_result：多条 in_progress 且未给 task_id → 诊断提示未绑定坐标', () => multiNote);
 
     // ④ spawn 时把条目绑给新队员：走 reassign（claim 会把 owner 钉成调用者 = Lead）。
     closureBoard = openBoard();
