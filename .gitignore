@@ -42,3 +42,6 @@ MAINTAINER-NOTES.md
 # ops_batch 的审计存根：dsh-ops 原生 worker 自己写的 job manifest，由
 # tools/ops-mount-check.mjs A 段那次无副作用 plan 产生（state 一直是 pending，不落业务数据）
 /.dsh-ops/
+# 本地调试/回放用的临时副本（profile 内容是**用户本机数据 + 真实路径**，绝不能进仓库）
+/tmp-*.yml
+/tmp-*.yaml

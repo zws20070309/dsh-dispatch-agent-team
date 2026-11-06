@@ -391,17 +391,49 @@ check('工作区入口依赖的官方面板标记与 sessionId prop 仍在（改
   return missing.length === 0 ? true : `官方这些标记变了，lib/client.js 的入口注入要跟着改：${missing.join('、')}`;
 });
 
+
+// 8e) 左侧栏入口依赖的官方槽位与校验语义（2026-11-06 落地时加的闸门）。
+// 侧栏那一行点下去会走 ctx.layout.selectPanel(id)，而 LayoutController 先拿 `main` 槽的
+// entries 校验 `entry.options.key === id`（dsh-client-ui-layout/lib/client.js），校验不过
+// **直接抛错**；同时 `sidebar.panellist` 是 kind:"list"，缺 id 在 register 时抛。
+// 官方任一改名/换 kind，左侧栏入口就会静默不出现（或点了抛错），所以这两条必须可跑。
+const officialLayout = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/client.js') || '';
+const officialSidebar = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-sidebar/lib/client.js') || '';
+check('左侧栏入口依赖的官方槽位、panel id 校验与渲染 props 仍在（改名会让入口静默消失）', () => {
+  if (officialLayout === '') return '读不到 dsh-client-ui-layout/lib/client.js';
+  if (officialSidebar === '') return '读不到 dsh-client-ui-sidebar/lib/client.js';
+  const missing = [];
+  // sidebar.panellist 必须是 list 且声明在 sidebar 的子槽表里（list 槽才认 id）。
+  if (!officialSidebar.includes('"sidebar.panellist"')) missing.push('槽 sidebar.panellist');
+  if (!/renderSlot\("sidebar\.panellist",\s*\{[^}]*size:/u.test(officialSidebar)) missing.push('panellist 渲染时注入的 size prop');
+  // 行点击 → selectPanel(id)（本插件把 id 与 main 的 key 写成同一个值就靠这条）。
+  if (!officialSidebar.includes('selectPanel(id)')) missing.push('侧栏行点击调用的 selectPanel(id)');
+  // "main" 槽必须仍是 keyed（keyed 认 key，list 认 id —— 换了我们两侧的注册形状就都错）。
+  if (!/"main":\s*\{\s*kind:\s*"keyed"/u.test(officialLayout)) missing.push('main 槽的 kind:"keyed"');
+  // 校验语义：selectPanel 按 `entry.options.key === id` 判断主面板是否注册。
+  if (!officialLayout.includes('entry.options.key === id')) missing.push('selectPanel 的 key === id 校验');
+  return missing.length === 0 ? true : `官方这些约定变了，lib/client.js 的侧栏注册要跟着改：${missing.join('、')}`;
+});
+
 // 8d) 工作区画布读取的官方**团队事件字段名**（2026-10-08 落地时加的闸门）。
 // lib/graph.js 折叠会话日志时按字段名取值：读错了不会抛错，只会让某条通道**静默变成 0**
 // （实测踩过两次：team/message/delivered 是扁平形状、不带 message 包装，按 data.message 读
 // 让投递回执一直是死代码）。官方改名时这条闸门必须先红，而不是等用户发现「线不见了」。
 const officialTeamCore = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
-// 整个团队包：0.2.1-rc.2 起 index.js 只是外壳，邮件与投影落在 lib/types/*.js 里。
+// 整个团队包：0.2.1-rc.2 起 index.js 只是外壳，事件与投影落在 lib/types/*.js 里。
 // 判据要跟着**事件**走而不是跟着文件走 —— 只看 index.js 会在官方挪文件时假红（2026-10-21 实测）。
+// 2026-11-07：types/ 目录整个重构（mailbox.js 已删，新增性 activity/journal/lifecycle/persisted/
+// session-message/task-board/task-graph/task-view/validation 等）—— 不再点名文件，直接遍历目录。
+const teamTypesDir = (() => {
+  let node = asar.json;
+  for (const segment of 'dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types'.split('/')) {
+    node = node?.files?.[segment];
+    if (node === void 0) return [];
+  }
+  return node?.files === void 0 ? [] : Object.keys(node.files);
+})();
 const officialTeamAll = [officialTeamCore,
-  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/mailbox.js') || '',
-  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/projection.js') || '',
-  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/roster.js') || '',
+  ...teamTypesDir.map((f) => asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/' + f) || ''),
 ].join('\n');
 check('工作区读取的官方团队事件字段名仍在（改名会让画布的边/统计静默变 0）', () => {
   if (officialTeamCore === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
@@ -413,19 +445,15 @@ check('工作区读取的官方团队事件字段名仍在（改名会让画布�
   if (!officialTeamCore.includes('targetId')) missing.push('team/message 的 targetId');
   // team/message/delivered：**扁平**（version/teamId/messageId/targetId），不是 message 包装。
   //
-  // 2026-10-21：0.2.1-rc.2 把落盘点从 index.js 挪进了 lib/types/mailbox.js（Mailbox.markDelivered），
-  // 于是原来只在 officialTeamCore 里搜 appendAndFlush 的判据**假红**了一次。
-  // 判据要跟着事件走，而不是跟着文件走：在团队包的所有文件里找那次 append，
-  // 找到之后再逐字段核对形状（下面两条）。
-  if (!/appendAndFlush\([^)]*['"]team\/message\/delivered['"]/u.test(officialTeamAll)) {
-    missing.push('team/message/delivered 的落盘点');
+  // 2026-11-07：0.2.2-rc.1 重构后 appendAndFlush 与 mailbox.js 都没了；delivered 的 schema
+  // 解析（teamMessageDeliveredEventSchema）与状态迁移（按 messageId 找 queued、核对 targetId）
+  // 实读仍在 index.js/projection.js。判据继续跟事件走：① 事件名仍在；② schema 驱动仍在；
+  // ③ 状态迁移仍按 messageId/targetId 核对（graph.js 读的就是这三个字段）。
+  if (!officialTeamAll.includes("'team/message/delivered'") && !officialTeamAll.includes('"team/message/delivered"')) {
+    missing.push('team/message/delivered 事件名');
   }
-  // 形状判据：落盘点必须写这四个键（缺 teamId 就会被投影拒、缺 targetId 就回连不到发件人）。
-  const deliveredAt = officialTeamAll.indexOf("'team/message/delivered'");
-  const deliveredTail = deliveredAt < 0 ? '' : officialTeamAll.slice(deliveredAt, deliveredAt + 900);
-  for (const key of ['version', 'teamId', 'messageId', 'targetId']) {
-    if (!new RegExp(key + '\\b').test(deliveredTail)) missing.push('team/message/delivered 的 ' + key);
-  }
+  if (!/teamMessageDeliveredEventSchema/u.test(officialTeamAll)) missing.push('team/message/delivered 的 schema');
+  if (!/delivered before queueing/u.test(officialTeamAll)) missing.push('delivered 的状态迁移（messageId/targetId 核对）');
   if (!officialTeamCore.includes('messageId')) missing.push('team/message/delivered 的 messageId');
   // team/member：data.member.{id,name}（节点名来源）
   if (!officialTeamCore.includes('"team/member"')) missing.push('team/member 事件名');
@@ -587,7 +615,13 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
   // 判据复用 tools/ops-enable.cjs 的 plan()（同一份真值，不在这里重写一遍正则 ——
   // 两处各写一份就会各自漂，那是本仓库反复栽过的坑）。plan 报"要翻转/要补行"= 不健康。
-  const { plan, splitRows } = require('./ops-enable.cjs');
+  const { plan, splitRows, legacyRowsStillInserted } = require('./ops-enable.cjs');
+  // 2026-10-29：先问清「这四行还是不是开关的载体」。
+  // dsh-ops 0.5.0 起它自己的 bundle patch 不再 insert dsh-ops-shell/file/background/ptc，
+  // 改成 mode 行族 —— profile 里那四行于是只是**没有目标的孤儿覆盖**，patch 找不到目标
+  // 只 warn 并跳过。此时下面那些「四行齐不齐」的判据全是空转（会假绿灯），
+  // 真正该看的是 loader 里挂了哪些 mode 行（由 lib/ops-adapter.js 的 OPS_MODE_ROWS 采集）。
+  const legacyRows = legacyRowsStillInserted();
   const planResult = plan(fs.readFileSync(profilePatchPath, 'utf8'));
   if (planResult.flipped.length > 0) {
     return 'profile 层这些行仍是 disabled: true：' + planResult.flipped.join(', ')
@@ -624,6 +658,24 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   if (typeof expectedMarker !== 'string' || expectedMarker === '') {
     return '读不到装机 dsh-ops 的 CONFIG_UPDATE_VERSION：无法判断 profile 的迁移标记是否齐备'
       + '（ops-enable.cjs 也读不到时会拒绝改配置）。先确认 dsh-ops 装好了。';
+  }
+  // 上述「四行的 config 齐不齐 / 迁移标记 / bashPath」判据只在**四行仍是开关载体**时有意义。
+  // 0.5.0 起上游不再 insert 它们（见 legacyRowsStillInserted 的注释）：此时让这些判据继续
+  // 全绿就是假绿灯 —— 用户会以为「照 --check 提示维护这四行」等于 ops 配好了。
+  if (legacyRows === false) {
+    const adapter = require('../lib/ops-adapter.js');
+    if (!Array.isArray(adapter.OPS_MODE_ROWS) || adapter.OPS_MODE_ROWS.length === 0) {
+      return '装机 dsh-ops 已不再 insert 遗留四行，而 lib/ops-adapter.js 没有 OPS_MODE_ROWS —— '
+        + '能力盘点会把「五个 mode 行全在挂载」报成「一个组件都没挂」（假故障 + 队员丢 ops 指引）。';
+    }
+    const patchText = fs.readFileSync(path.join(PROFILE_DIR, 'node_modules', 'dsh-ops', 'cordis.patch.yml'), 'utf8');
+    const expectedModeIds = [...patchText.matchAll(/^\s*-\s*id:\s*(dsh-ops-mode-\S+|dsh-ops-discovery)\s*$/gmu)].map((m) => m[1]);
+    const missingMode = expectedModeIds.filter((id) => !adapter.OPS_MODE_ROWS.some((row) => row.id === id));
+    if (missingMode.length > 0) {
+      return 'dsh-ops 的 bundle patch 会 insert 这些 mode 行，而 OPS_MODE_ROWS 里没有：' + missingMode.join('、')
+        + ' —— 能力盘点会漏报该组件。';
+    }
+    return true;
   }
   for (const id of ['dsh-ops-shell', 'dsh-ops-file']) {
     const block = blockOf(id);
@@ -678,6 +730,41 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
   return true;
 });
 
+/**
+ * 从**装机的 dsh-ops** 里读一个原始名清单（如 FILE_TOOLS / PTC_TOOLS）。
+ *
+ * 为什么要按模块而不是正则：0.5.0 把目录搬去了 lib/capabilities/registry.js，
+ * lib/policy.js 只剩 re-export。正则抓不到时报出来的是「我们找错了文件」，不是「官方改了」——
+ * 2026-10-29 这条就是这样红了一整天。按模块解析后，名单搬家不再产生假红。
+ *
+ * 顺序：先 require（Node 22+ 可直接 require ESM；本机实测通过），
+ * 失败再退回「在 policy.js 与 registry.js 里做文本解析」，最后才判 FAIL。
+ * @param root - dsh-ops 包根。
+ * @param name - 导出的常量名。
+ * @returns {string[]|null} 原始名清单；两路都拿不到时 null。
+ */
+function resolveOpsNameList(root, name) {
+  const candidates = [path.join(root, 'lib', 'policy.js'), path.join(root, 'lib', 'capabilities', 'registry.js')];
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    try {
+      const loaded = require(file);
+      const value = loaded?.[name];
+      if (Array.isArray(value)) return value.map((item) => String(item));
+    } catch { /* 退回文本解析 */ }
+  }
+  for (const file of candidates) {
+    if (!fs.existsSync(file)) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    // 老版本写法：`export const FILE_TOOLS = Object.freeze(['a','b'])`。
+    // 0.5.0 写法是 map 出来的（`FILE_CAPABILITIES.map(…)`），文本解析拿不到 —— 那一路靠上面的 require。
+    const match = new RegExp(name + ' = Object\\.freeze\\(\\[([^\\]]*)\\]\\)', 'u').exec(text);
+    if (match === null) continue;
+    return match[1].split(',').map((part) => part.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  }
+  return null;
+}
+
 // 10g) 装机 dsh-ops 的实现事实：工具前缀与注册点没改名 + PTC 门已放宽到 ptc+both。
 // 这一条把「别人下载本插件后能不能用 ops」的前提钉住：ops 一旦升级，判据可能变化。
 check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖面）', () => {
@@ -696,9 +783,12 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   // 起因是真机抓到的一处**报表缺陷**：ops 0.3.2 的 FILE_TOOLS 已经是 11 个，
   // 而 lib/ops-adapter.js 的 OPS_TOOL_NAMES 还停着 0.3.0 的四个 —— 七个真在跑的工具
   // 从来没进过能力盘点。逐字面量比对只能发现「官方改了」，发现不了「我们少列了」。
-  const filesMatch = /FILE_TOOLS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(policy);
-  if (filesMatch === null) return 'dsh-ops ' + version + ' 的 FILE_TOOLS 形状变了：lib/ops-adapter.js 的名单要重核';
-  const fileTools = filesMatch[1].split(',').map((part) => part.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+  // 2026-10-29：dsh-ops **0.5.0** 把目录搬进了 lib/capabilities/registry.js，
+  // lib/policy.js 只剩一行 re-export（`export { FILE_TOOLS, … } from './capabilities/registry.js'`），
+  // 旧正则在这里抓不到任何东西 —— 它不是在报「官方改了」，是在报「我们找错了文件」。
+  // 判据改成：**按模块真值解析**（可 require 就 require，拿不到再退回文本解析），
+  // 这样「名单搬去别处」不再产生假红，而「名单内容真的变了」照样抓得住。
+  const fileTools = resolveOpsNameList(root, 'FILE_TOOLS');
   const adapter = require('../lib/ops-adapter.js');
   const expected = fileTools.map((raw) => 'ops_' + raw);
   const missing = expected.filter((name) => !adapter.OPS_TOOL_NAMES.includes(name));
@@ -729,14 +819,28 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   //    「预设 ptc + 关批量档 = 拿到 ops_batch/ops_result」这条杠杆的说明就要重核；
   // ② 宿主侧的装配段名没漂（本包判断呈现档只用这两个公开段名）。
   const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
-  if (!ptcIndex.includes("assembly.tools.length === 1 && assembly.tools[0].name === 'run_code'")) {
-    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（只认纯 ptc 那条判据没找到）：' 
-      + '本包 INTERFACES §3.8 与 lib/ops-adapter.js 里「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
+  // 2026-10-29：判据从「逐字包含一整行」改成**语义三要件**。
+  // 0.5.0 把同一句拆成了多行，并把 `assembly.tools[0].name` 写成 `assembly.tools[0]?.name`
+  // （可选链）—— 逐字比对因此红了一天，而门的语义一个字都没变。
+  // 三要件就是这条杠杆成立的全部前提：① 工具数组恰好 1 个；② 那一个叫 run_code；
+  // ③ 还要求 tools:ptc-only 段非空。缺任何一条，「预设 ptc + 关批量 = 拿到 ops_batch」就不成立。
+  const ptcCompact = ptcIndex.replace(/\s+/gu, ' ');
+  const ptcGate = /Array\.isArray\(assembly\.tools\)/u.test(ptcCompact)
+    && /assembly\.tools\.length === 1/u.test(ptcCompact)
+    && /assembly\.tools\[0\]\??\.name === ['"]run_code['"]/u.test(ptcCompact)
+    && /name === ['"]tools:ptc-only['"]/u.test(ptcCompact)
+    && /section\.text\.trim\(\) !== ['"]['"]/u.test(ptcCompact);
+  if (!ptcGate) {
+    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（「恰好一个 run_code + 非空 tools:ptc-only」'
+      + '这三要件没找齐）：本包 INTERFACES §3.8 与 lib/ops-adapter.js 里'
+      + '「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
   }
-  const toolsSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
-  if (toolsSrc === '') return '读不到 app.asar 里的 dsh-tools：无法验证呈现档的装配段名';
-  if (!/name:\s*"tools:sdk"/.test(toolsSrc) || !/name:\s*"tools:ptc-only"/.test(toolsSrc)) {
-    return '宿主 dsh-tools 的装配段名变了（tools:sdk / tools:ptc-only）：本包按呈现档给的指引与检测判据需要重核';
+  // 2026-11-07：0.2.2-rc.1 把装配段名从 dsh-tools 挪进了 ptc executor（PtcExecutor.sections：
+  // tools:ptc-only / tools:sdk，经 setExecutor 的 effect 注册）—— 判据跟着搬，语义不变。
+  const ptcExecutorSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-executor-ptc/lib/index.js') || '';
+  if (ptcExecutorSrc === '') return '读不到 app.asar 里的 dsh-tool-executor-ptc：无法验证呈现档的装配段名';
+  if (!/name:\s*"tools:ptc-only"/.test(ptcExecutorSrc) || !/name:\s*"tools:sdk"/.test(ptcExecutorSrc)) {
+    return '宿主 PTC executor 的装配段名变了（tools:sdk / tools:ptc-only）：本包按呈现档给的指引与检测判据需要重核';
   }
   return true;
 });
@@ -865,8 +969,11 @@ check('dsh-tools 仍提供 restrict() 且仍是「只过滤继承面」的语义
   if (!source.includes('restrictableNames')) {
     return 'restrict 的 known-name 校验（restrictableNames）不见了 —— 逐个 try/catch 调用的前提变了，请重新读官方实现';
   }
-  if (!/never what its OWN layer registers|A restriction filters what a scope inherits/u.test(source)) {
-    return 'restrict 的语义注释变了：不再是「过滤继承面、放行本作用域自己的注册」。'
+  // 2026-11-07 金丝雀换羽：0.2.2-rc.1 把注释改写成 "…Restrictions intersect; scoped
+  // registrations remain visible."（语义未变：own 层注册仍不受 restrict 影响，restrict(filter)/
+  // restrictableNames/view(chainLayers) 实测都在）。官方再改措辞时这里先红。
+  if (!/scoped registrations remain visible|A restriction filters what a scope inherits|never what its OWN layer registers/u.test(source)) {
+    return 'restrict 的语义注释变了：不再是「过滤继承面、放行本作用域自己的注册」（新原文锚点：scoped registrations remain visible）。'
       + '这会让队员工具名单（我们注册在 own layer）+ 收窄名单（继承面）的组合产生非预期结果，必须重读官方实现';
   }
   return true;
@@ -1085,15 +1192,14 @@ check('agent-loop 的投递语义未变（followup → next-turn 收件箱；工
 });
 
 const subagentControl = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-subagent-control/lib/index.js') || '';
-const subagentListAgents = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-subagent-control/lib/types/list-agents.js') || '';check('官方 dsh-tool-subagent-control 仍提供同名三工具 + agent_id 参数（我们收 agent_id 别名的原因）', () => {
+check('官方 dsh-tool-subagent-control 仍提供同名三工具 + agent_id 参数（我们收 agent_id 别名的原因）', () => {
   if (subagentControl === '') return '读不到 dsh-tool-subagent-control/lib/index.js';
-  if (subagentListAgents === '') return '读不到 dsh-tool-subagent-control/lib/types/list-agents.js';
-  // 分工（2026-10-01 实读）：lib/index.js 注册 send_message / interrupt_agent（都是 agent_id 参数），
-  // list_agents 在可独立加载的子模块 lib/types/list-agents.js 里。
-  const missing = ['send_message', 'interrupt_agent'].filter((name) => !subagentControl.includes(`"${name}"`));
+  // 2026-11-07：0.2.2-rc.1 把 list_agents 从 lib/types/list-agents.js（整个 types/ 目录已删）
+  // 收进了 lib/index.js 本体（"The globally named `list_agents` tool"，实读）。三工具与 agent_id 仍齐。
+  const missing = ['send_message', 'interrupt_agent', 'list_agents'].filter((name) => !subagentControl.includes(`"${name}"`));
   if (missing.length > 0) return `lib/index.js 不再注册 ${missing.join(', ')} —— 「重启后只剩三个名字」的归因需要重查`;
   if (!subagentControl.includes('agent_id')) return 'agent_id 参数不见了 —— lib/tools.js 的 target/agent_id 别名可以删掉';
-  if (!subagentListAgents.includes("name: 'list_agents'")) return 'list_agents 不在这个包了 —— 「重启后只剩三个名字」的归因需要重查';
+  if (!/name:\s*["']list_agents["']/u.test(subagentControl)) return 'list_agents 的注册形状变了（name: "list_agents" 找不到）—— 需要重读官方实现';
   return true;
 });
 
@@ -1357,6 +1463,9 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
         'locale/en.json': readFileOr(path.join(PLUGIN_DIR, 'locale', 'en.json')),
         'presets/dispatch-mode.patch.yml': ourPresetPatch,
         'package.json': readFileOr(path.join(PLUGIN_DIR, 'package.json')),
+        // README.md 就是插件详情页的正文（locale 没有 meta.detail 时官方退回 README），
+        // 它写着「12 个队员角色」。这份文案此前**不在任何闸门里** —— 扩编/缩编时它会静默停在旧数字上。
+        'README.md': readFileOr(path.join(PLUGIN_DIR, 'README.md')),
       };
       const wrong = [];
       const patterns = [
@@ -1754,7 +1863,7 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
-  check('工具行标签表与官方 locale 逐字一致（zh 与 en 两侧都比对）', () => {
+  check('工具行标签表与官方 locale 逐字一致（官方多语言中取 zh/en 两侧比对）', () => {
     // lib/graph.js 的 OFFICIAL_TOOL_TITLES / _EN 是浮窗里每一行工具调用的标签。
     // 用户 2026-10-09 的原话就是「一定要正确，和我用官方的对话框没太大区别」，
     // 所以这两张表**必须是官方 locale 的真值**，不是我觉得顺手的措辞 ——
@@ -1762,8 +1871,11 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 代码不会）。这里逐键逐值比对，官方改了我们就红。
     const conv = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js') || '';
     if (conv === '') return '读不到 dsh-client-ui-conversation/lib/client.js';
-    // 官方 locale 块里每个 key 出现两次：先 zh 后 en。判据不靠顺序猜：
-    // 两份都必须**恰好**出现一次（第三份=官方加了新语言，要人工决定跟哪份）。
+    // 2026-11-07：官方 locale 从 2 语言扩到 **8 语言**（createGoal 实测 8 份：
+    // zh,en,ja,es,fr,de,ru,pt）。判据相应改为：
+    // ① 每个键出现次数**全键一致**（出现结构性变化就大声失败让人重核，不猜）；
+    // ② zh = 含 CJK 且不含假名的那份（日语假名排除掉 zh-TW/zh 混淆）；
+    // ③ en = zh 的**下一份**且必须纯 ASCII —— 官方语言顺序一变这里就红，人工重核。
     const pairs = new Map();
     const re = /"tool\.title\.([A-Za-z]+)":\s*"([^"]*)"/g;
     let m;
@@ -1772,19 +1884,22 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       pairs.get(m[1]).push(m[2]);
     }
     if (pairs.size === 0) return '官方 locale 里找不到任何 tool.title.*（键的写法变了？抽表脚本与这条都要重核）';
+    const counts = new Map();
+    for (const [, values] of pairs) counts.set(values.length, (counts.get(values.length) ?? 0) + 1);
+    if (counts.size !== 1) {
+      return `官方 tool.title.* 的语言份数不一致（${[...counts.entries()].map(([n, c]) => `${n} 份×${c} 键`).join('、')}）—— 官方加了/减了语言或键结构变了，人工重核`;
+    }
     const officialZh = new Map();
     const officialEn = new Map();
     for (const [key, values] of pairs) {
-      if (values.length !== 2) {
-        return `官方 tool.title.${key} 出现 ${values.length} 次（预期 zh/en 各一次），两侧语言无法确定`;
+      const zhAt = values.findIndex((v) => /[\u4e00-\u9fff]/.test(v) && !/[\u3040-\u30ff]/.test(v));
+      if (zhAt < 0) return `tool.title.${key} 找不到中文值（语言集变了，人工重核）`;
+      const en = values[zhAt + 1];
+      if (en === undefined || !/^[\x20-\x7E]*$/u.test(en)) {
+        return `tool.title.${key} 的英文值不在中文值的下一份或不是纯 ASCII（官方 locale 顺序变了，人工重核）`;
       }
-      const [a, b] = values;
-      const aCjk = /[\u4e00-\u9fff]/.test(a);
-      const bCjk = /[\u4e00-\u9fff]/.test(b);
-      // 一份必须含中文、一份必须不含 —— 否则就是官方换了语言数，不能靠位置猜。
-      if (aCjk === bCjk) return `tool.title.${key} 的两份值语言属性相同（${a} / ${b}），无法判定哪份是 zh`;
-      officialZh.set(key, aCjk ? a : b);
-      officialEn.set(key, aCjk ? b : a);
+      officialZh.set(key, values[zhAt]);
+      officialEn.set(key, en);
     }
     const graphText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'graph.js'));
     if (graphText === '') return '读不到 lib/graph.js';
@@ -2039,18 +2154,22 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
   });
 
   check('网关仍校验远程事件返回值的 lossless-JSON（弹窗载荷为何不许含 undefined）', () => {
-    const gw = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-gateway/lib/client.js') || '';
-    if (gw === '') return '读不到 dsh-api-gateway/lib/client.js';
+    // 2026-11-07：lib/client.js 拆成了 client.node.js + client.browser.js（实读）。校验仍在：
+    // node 侧监听器结果走 "Remote event listener result is not lossless JSON data"（isRemoteJsonValue），
+    // browser 侧保留 visitJsonValue 与「非 object（含 undefined）判 false」的实现。
+    const gwNode = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-gateway/lib/client.node.js') || '';
+    const gwBrowser = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-gateway/lib/client.browser.js') || '';
+    if (gwNode === '' && gwBrowser === '') return '读不到 dsh-api-gateway 的 client.node.js / client.browser.js';
     // 这条钉的是「答案批次必须用条件展开」的**根因**：answer() → waterfall.resolve(answer)，
-    // 这个 answer 作为远程事件的返回值回传宿主并被下面这行校验；嵌套 undefined 判 false
+    // 这个 answer 作为远程事件的返回值回传宿主并被校验；嵌套 undefined 判 false
     // ⇒ 抛错 ⇒ 工具调用以 isError 结算（提问被打死）。
-    if (!/is not lossless JSON data/.test(gw)) {
+    if (!/is not lossless JSON data/.test(gwNode) && !/is not lossless JSON data/.test(gwBrowser)) {
       return '网关不再校验远程事件返回值 —— 弹窗答案批次的 undefined 约束可能已放宽，'
         + 'lib/client.js 的注释与 tools/selftest.cjs 的对应闸门需要重核';
     }
-    if (!/function visitJsonValue/.test(gw)) return 'visitJsonValue 不见了（校验实现改名/重构）';
+    if (!/function visitJsonValue/.test(gwBrowser)) return 'visitJsonValue 不见了（校验实现改名/重构）';
     // 它仍然把非 object（含 undefined）判 false —— 这就是嵌套 undefined 致命的依据。
-    if (!/if \(typeof value !== "object"\) return false;/.test(gw)) {
+    if (!/if \(typeof value !== "object"\) return false;/.test(gwBrowser)) {
       return 'visitJsonValue 对非 object（含 undefined）的处理变了 —— 重核弹窗批次形状约束';
     }
     // 并且 answer() 依然「永远 resolve」：所以弹窗必须自己验结算（bridgeQuestionOutcome）。
@@ -2098,7 +2217,10 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       return 'tools.view() 不再用 chainLayers(scope) —— 继承面算法变了，本插件对「换 preset = 换工具」的判断要重读';
     }
     // own 层豁免也是前提：我们注册的团队工具/队员卡必须不受重绑影响。
-    if (!/and never what its OWN layer registers/.test(tools)) return 'restrict/view 的 own 层豁免注释变了 —— 重读「重绑不伤 own 层」这条断言的依据';
+    // 2026-11-07 金丝雀换羽：0.2.2-rc.1 注释改为 "…scoped registrations remain visible."（语义未变）。
+    if (!/scoped registrations remain visible|and never what its OWN layer registers/.test(tools)) {
+      return 'restrict/view 的 own 层豁免注释变了（新原文锚点：scoped registrations remain visible）—— 重读「重绑不伤 own 层」这条断言的依据';
+    }
     return true;
   });
 
@@ -2163,69 +2285,77 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
-    // ── 批量调用档（both）所依赖的官方形状（2026-10-15 用户选路径 1）──────────────
-    // 本插件不开新预设、不改官方文件，只在队员自己的作用域喊一句 presentAs('both')。
-    // 这句话的全部效力都压在下面这几行官方代码上 —— 它们任一变动，功能就静默变成
+    // ── 批量调用开关所依赖的官方形状（2026-11-07 机制迁移：呈现档=按作用域挂 executor）──
+    // 官方 0.2.2-rc.1 删掉了 mode 字段与 presentAs（ToolsService.Config.mode=z.never()，
+    // 原话 "Removed. Mount a native or PTC tool executor instead."）。本插件改为：激活期经
+    // 宿主 Loader 预热 executor 模块（warmExecutorModules），队员安装时同步 scoped.plugin(executor)。
+    // 开关的全部效力压在下面这几行官方代码上 —— 它们任一变动，功能就静默变成
     // 「开关拨了但什么都没发生」，所以逐条钉住。
     const batchTools = asar.read('dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js') || '';
     const batchScope = asar.read('dsh/node_modules/@deepseek-ai/dsh-scope/lib/index.js') || '';
     const batchPres = asar.read('dsh/node_modules/@deepseek-ai/dsh-agent-tool-presentation/lib/index.js') || '';
     const batchMcp = asar.read('dsh/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js') || '';
+    const batchExecNative = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-executor-native/lib/index.js') || '';
+    const batchExecPtc = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-executor-ptc/lib/index.js') || '';
+    const batchLoader = asar.read('dsh/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js') || '';
+    const batchBoot = asar.read('dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js') || '';
 
-    check('官方呈现档只有 native|ptc（both 已被官方移除；本插件改为能力探测，官方加回时这条必须先红）', () => {
+    check('官方呈现档已改为按作用域挂 executor（Config.mode 已删；both 无承载物，官方回摆这条先红）', () => {
       if (batchTools === '') return '读不到 dsh-tools';
-      // ⚠️ 2026-10-21 判据翻转（原判据是「both 必须存在」）。
+      // ⚠️ 2026-11-07 判据翻转（原判据是「联合类型是 native|ptc」）。
       //
-      // DSH 0.2.1-rc.2 把呈现档收窄成 native|ptc：asar 实读 dsh-tools:2763 是
-      // `mode: z.union(["native", "ptc"]).default("native")`，台架实测 `Config({mode:"both"})`
-      // 抛 `$.mode expected "native" | "ptc" but got "both"`。所以现在要断言的是**它不在** ——
-      // lib/runtime.js 的 presentationModeSupported 正是靠这个联合类型判定要不要声明 both。
-      // 官方哪天把 both 加回来，这条必须先红：那时探测会返回 true，both 支自动恢复生效，
-      // 但要有人重新实测一次（不能靠「探测通过」当验证）。
-      if (batchTools.includes('"native", "ptc", "both"')) {
-        return '官方把 both 加回来了 —— 本插件的 presentationModeSupported 会返回 true、both 档恢复生效；'
-          + '请把那两条断言改回「支持」并真机实测一次再合';
+      // 0.2.2-rc.1 把呈现档机制整个换了：ToolsService.Config.mode 是 z.never()，官方原话
+      // "Removed. Mount a native or PTC tool executor instead."；官方 ptc.patch.yml 直接挂
+      // tool-executor-ptc 行。本插件 applyMemberBatch 已改走 executor 挂载（warmExecutorModules
+      // + scoped.plugin）。官方若把 mode 字段加回来，这条必须先红：那时 both 语义要人工重评。
+      if (!batchTools.includes('Removed. Mount a native or PTC tool executor instead.')) {
+        return 'ToolsService.Config.mode 的 "Removed. Mount …" 说明不见了 —— 官方可能恢复了 mode 字段，'
+          + 'applyMemberBatch 的 executor 挂载与 both 语义需要人工重评';
       }
-      if (!/mode: z\.union\(\["native", "ptc"\]\)/u.test(batchTools)) {
-        return '呈现档联合类型既不是 native|ptc 也不是 native|ptc|both —— 请重读 dsh-tools 的 Config，探测判据要跟着改';
+      if (!/mode:\s*z\.never\(\)/u.test(batchTools)) {
+        return 'Config.mode 不再是 z.never() —— 官方呈现档判据又变了，重读 dsh-tools 的 Config';
       }
-      // ptc 分支的语义仍要钉住（它现在是唯一能拿到 run_code 的档）。
-      if (!batchTools.includes('.filter((schema) => schema.name === RUN_CODE_NAME)')) {
-        return 'ptc 分支不再是「只留 run_code」：纯 PTC 档的呈现基线要重写';
+      if (/presentAs\(mode\) \{/.test(batchTools)) {
+        return 'dsh-tools 又出现了 presentAs —— 官方回摆了旧机制，declareMemberMode 需要人工重评';
       }
       return true;
     });
 
-    check('presentAs 仍是 per-scope 声明口，modeFor 仍是「最近的一层赢」', () => {
-      if (!batchTools.includes('presentAs(mode) {')) return 'ctx.tools.presentAs 不见了或改名了：applyMemberBatch 会走「取不到就记诊断」那条降级路';
-      if (!batchTools.includes('for (let index = layers.length - 1; index >= 0; index -= 1)')) {
-        return 'modeFor 不再是「从最近一层往前找第一个声明」：自己那层压不住预设那层，路径 1 的前提没了';
-      }
+    check('executor 选择=最近作用域赢（setExecutor 每作用域一个；本插件同步挂载依赖这个语义）', () => {
+      if (batchTools === '') return '读不到 dsh-tools';
+      if (!batchTools.includes('selectExecutor(scope) {')) return 'selectExecutor 不见了 —— 呈现档选择语义变了，declareMemberMode 的「最近一层赢」前提没了';
+      if (!/for \(const key of scopeChainOf\(scope\)\)/u.test(batchTools)) return 'selectExecutor 不再沿 scopeChainOf 走 —— 最近作用域赢的语义变了';
+      if (!batchTools.includes('Only one tool executor may be registered in each scope')) return '「每作用域一个 executor」的限制没了 —— both 语义要人工重评';
       if (!batchScope.includes('farthest ancestor first and the exact scope last')) {
-        return 'dsh-scope 的 chainLayers 顺序注释变了（顺序一旦翻转，上面那条判据就是假的，功能会反过来被预设压住）';
+        return 'dsh-scope 的 chainLayers 顺序注释变了（顺序一旦翻转，最近作用域赢的判据就是假的，功能会反过来被预设压住）';
       }
       return true;
     });
 
-    check('装配期仍要求 ptcRuntime —— 本插件那条守卫的理由还成立', () => {
-      if (!batchTools.includes('requires a PTC runtime')) {
-        return 'dsh-tools 不再因缺 PTC 运行时抛错：applyMemberBatch 里的守卫可以删（删之前请同步 §7.10 那条负对照）';
+    check('PTC executor 执行期仍要求 ptcRuntime（本插件那条守卫的理由还成立）', () => {
+      if (batchExecPtc === '') return '读不到 dsh-tool-executor-ptc';
+      if (!batchExecPtc.includes('requirePtcRuntime')) return 'ptc executor 的 requirePtcRuntime 不见了 —— runtime.js 的 ptcRuntime 守卫要重评';
+      if (!batchExecPtc.includes('requires a PTC runtime')) return 'PTC executor 不再因缺运行时报错 —— 守卫语义变了，重读官方实现';
+      if (!batchExecPtc.includes('ctx.get("ptcRuntime")')) return 'ptc executor 取运行时的口子变了（不再是 ctx.get("ptcRuntime")）';
+      if (!batchExecPtc.includes('is the only tool you can call directly')) {
+        return '官方 PTC_ONLY 文案变了：§7.10 拿它当钥匙，ptc 两条断言会假绿或假红，按新文案改判据';
       }
-      if (!batchTools.includes('mode !== "native"')) return 'run_code 的注入条件变了（不再是「非 native 就注入」）：both 档拿不到 run_code 时 §7.10 会先红';
-      if (!batchTools.includes('is the only tool you can call directly')) {
-        return '官方 PTC_ONLY 文案变了：§7.10 拿它当钥匙，both/ptc 两条断言会假绿或假红，按新文案改判据';
-      }
+      if (batchExecNative === '') return '读不到 dsh-tool-executor-native';
+      if (!batchExecNative.includes('setExecutor')) return 'native executor 不再调 setExecutor —— 挂载机制变了';
       return true;
     });
 
-    check('呈现档声明包仍把 native|ptc 转成 presentAs（官方换档机制没变；both 已于 2026-10-21 被官方移除）', () => {
+    check('deprecated 声明包仍在且按档挂 executor（本插件已改走 Loader 直挂；预热路径钉在这里）', () => {
       if (batchPres === '') return '读不到 dsh-agent-tool-presentation';
-      // 2026-10-21：官方把 both 从声明包的联合类型里删了（与 dsh-tools 的 Config 同步收窄）。
-      // 这里只钉仍在的两档；如果官方把 both 加回来，上一条「官方呈现档只有 native|ptc」会先红。
+      // 声明包仍只认 native|ptc 两档（.required()）；both 在 executor 架构下没有承载物。
       for (const value of ['"native"', '"ptc"']) {
         if (!batchPres.includes(value)) return '声明包的 Config 联合类型里少了 ' + value;
       }
-      if (!batchPres.includes('tools.presentAs(config.mode)')) return '声明包不再调 presentAs：官方换档机制变了，本插件直接 presentAs 的前提要重新核';
+      if (!batchPres.includes('NativeToolExecutor : PtcToolExecutor')) return '声明包不再按档挂 executor —— 官方换档机制又变了，重读';
+      // 本插件预热路径的依据：宿主挂了 Loader 服务（app-boot 挂载、ctx.get("loader") 可取），
+      // loader.import(name) 走内部模块解析（asar 闭包）。这两行变了，warmExecutorModules 要换路子。
+      if (batchBoot === '' || !batchBoot.includes('ctx.get("loader")')) return 'app-boot 不再暴露 loader 服务（ctx.get("loader")）—— warmExecutorModules 的模块来源断了，要换路子';
+      if (batchLoader === '' || !batchLoader.includes('import(name, getOuterStack)')) return 'Loader.import(name) 的形状变了 —— warmExecutorModules 要跟着改';
       return true;
     });
 
