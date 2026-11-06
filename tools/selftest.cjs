@@ -2837,6 +2837,16 @@ function functionBodyOf(source, needle) {
     const indexWarmSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
     assert.ok(/await\s+runtime\.warmExecutorModules\(ctx\)/.test(indexWarmSrc) && /export async function apply/.test(indexWarmSrc),
       'lib/index.js apply 必须 async 并 await runtime.warmExecutorModules（fire-and-forget 会有时序竞争：首名队员 spawn 赶不上预热完成 → 挂载静默失效，T9-3 实测）');
+    // 2026-11-07 T9-3 实机根因（Lead 修正）：配置快照陈旧 —— peekConfig() 只在配置页
+    // get/set 与启动预热时重建，绕过配置页直接改盘（队员文件工具/脚本）后快照停在旧值，
+    // spawn 整份按旧配置走且无报错（磁盘已是 minimal-grayscale，队员拿到 standard+ptc）。
+    // 两道闸必须同时钉住：resolveSpawn 前刷新 + 目录 watcher 旁路刷新。
+    assert.ok(/await\s+runtime\.loadConfig\(hostCtx\)/.test(readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8')),
+      'resolveSpawn 必须在路由决策前 await runtime.loadConfig(hostCtx) 对一次磁盘指纹（T9-3 实机根因：直接改盘后快照陈旧，spawn 整份按旧配置走）');
+    assert.ok(/export async function watchConfigFile/.test(runtimeSrc) && /watch\(dir,\s*\{\s*persistent:\s*false\s*\}/.test(runtimeSrc) && /stopConfigWatcher\(\)/.test(runtimeSrc),
+      'watchConfigFile 必须存在且 watch 配置目录（tmp+rename 原子落盘对文件级 watch 免疫才不致失明）+ 重装语义先收旧');
+    assert.ok(/await\s+runtime\.watchConfigFile\(ctx\)/.test(indexWarmSrc) && /await\s+runtime\.loadConfig\(ctx\)/.test(indexWarmSrc),
+      'lib/index.js apply 必须 await 首读配置并安装配置 watcher（冷恢复补装与后续 spawn 才能按当前磁盘配置走）');
     assert.ok(/export async function warmExecutorModules/.test(runtimeSrc) && /loader\.import\(/.test(runtimeSrc),
       'warmExecutorModules 必须经宿主 loader.import 预热 executor 模块（两包只在 asar 闭包里）');
     // 2026-10-21 回归（本轮真机体检抓到）：purePtc 原来写成 `!batchDeclared && preset==='ptc'`，

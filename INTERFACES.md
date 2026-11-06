@@ -278,6 +278,9 @@ export function inject(agent, text, attachments?); // 把 text（+ 可选的宿�
 export function pinSpawnRoute(name, route);// 给某个队员钉路由；**只**由 spawn 的显式参数产生（§0.1 第 41 条）
 export function watchAgents(ctx);          // 幂等订阅 agent/created、agent/disposed、session/event（截断记账的入口）
 export function reconcileAgents(ctx);      // 给所有活体 agent 补齐安装：冷恢复 + 补装的统一入口
+export async function watchConfigFile(ctx);// 盯配置文件所在目录（重装语义先收旧）：绕过配置页直接改盘 200ms 内刷新快照。
+                                            //    T9-3 实机根因闸门之一；watch 目录而非文件 = 对 saveConfig 的 tmp+rename 免疫。
+                                            //    永不抛错（失败只记诊断）；index.js apply 在 await loadConfig 首读之后调用
 export function disposeAll();              // 卸载全部注册并清内部状态（含截断账本与保活计时器）
 export function setStatusRefresh(fn);      // 注入「重算并写状态文件」的回调（lib/index.js 用它做 settled 阶段重写）
 export function installKeepalive(ctx);     // 挂 llm/stream 瀑布（缓存保活 + 统计）；幂等
