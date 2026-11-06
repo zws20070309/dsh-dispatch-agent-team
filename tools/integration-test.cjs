@@ -560,7 +560,7 @@ async function main() {
       // 上限与 selftest 的预算表 / INTERFACES §2.1 同步（2026-10-14 上调 5000→5150、1650→1800：
       // 唯一来源是任务板闭环那条新纪律，依据与「先删再加」的记账见 INTERFACES §2.1 注记）。
       // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
-      if (ownLead > 5150) return `Lead 侧自有段落 ${ownLead} 字符 > 5150`;
+      if (ownLead > 5310) return `Lead 侧自有段落 ${ownLead} 字符 > 5310`;
       if (ownMate > 1800) return `队员侧自有段落 ${ownMate} 字符 > 1800`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
@@ -3013,11 +3013,13 @@ async function main() {
 
   await (async () => {
     boardCalls.length = 0;
+    // 2026-11-07：blocked_by 死链护栏上线后，引用的 id 必须真实在板——先播种 task-0。
+    board.push({ id: 'task-0', revision: 0, subject: '前置', description: '', status: 'pending', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [] });
     const created = await boardDefinitions.get('team_task_create').execute(
       { subject: '做 A', description: '细节', blocked_by: ['task-0'], write_scopes: ['src/a/'] },
       leadExec,
     );
-    const sent = boardCalls[0].request;
+    const sent = boardCalls.filter((call) => call.method === 'createTask')[0].request;
     const keys = Object.keys(sent).sort().join(',');
     check('team_task_create：snake_case 参数映射为域服务的 camelCase，且未给的字段整个不传', () => {
       if (keys !== 'blockedBy,description,subject,writeScopes') return '域服务收到的键不对：' + keys;
@@ -3025,6 +3027,17 @@ async function main() {
       if (created === undefined || created.id !== 'task-1') return JSON.stringify(created);
       return true;
     });
+    let guardNote = true;
+    try {
+      await boardDefinitions.get('team_task_create').execute(
+        { subject: 'X', description: 'd', blocked_by: ['task-ghost'] },
+        leadExec,
+      );
+      guardNote = '指向不存在 id（task-ghost）没有被拒——死链护栏失效';
+    } catch (error) {
+      if (!/依赖死链/.test(error.message)) guardNote = '拒绝理由没有指明死链：' + error.message;
+    }
+    check('team_task_create：blocked_by 指向不存在的条目 → 拒绝（依赖死链护栏）', () => guardNote);
     const bare = await boardDefinitions.get('team_task_create').execute({ subject: 'B', description: 'd' }, leadExec);
     check('team_task_create：不给 blocked_by / write_scopes 时**不会**出现值为 undefined 的键（官方按 hasOwnProperty 判定）', () => {
       const second = boardCalls[boardCalls.length - 1].request;

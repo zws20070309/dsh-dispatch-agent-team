@@ -1251,8 +1251,14 @@ function functionBodyOf(source, needle) {
 
   await check('闭环联动的源码接线：四个落点都在（防止日后被重构成静默）', () => {
     const source = readFileSync(path.join(PLUGIN_DIR, 'lib', 'tools.js'), 'utf8');
-    assert.ok(source.includes('reportBoardFollowUps(safeTasks(agentTeams, caller), name, report.status)'),
+    assert.ok(source.includes('reportBoardFollowUps(tasks, name, report.status, taskId)'),
       'report_result 不再对账任务板（completed 不 complete / blocked 不 release 都没人提醒了）');
+    // 2026-11-07：报告必须携带任务坐标（融入 dsh-agent-teams 的 source-task 机制）——
+    // 两账合一的锚点：参数进 schema、自动绑定、坐标进报告头与插件记录。
+    assert.ok(/task_id: \{\s*\n\s*type: 'string',/.test(source) || source.includes("task_id: {"),
+      'report_result 没有 task_id 参数（报告与任务板无法对齐坐标）');
+    assert.ok(source.includes("formatReport(name, report, taskId)"), '报告头没有携带任务坐标');
+    assert.ok(/recordReport\(name, report, taskId\)/.test(source), '插件记录没有存任务坐标');
     assert.ok(source.includes("action: 'reassign'"), 'spawn_teammate 不再绑定 task_id');
     assert.ok(source.includes('callerIsLead(agentTeams, caller) ? boardClosureNote(safeTasks(agentTeams, caller)) : undefined'),
       'list_agents / wait_agent 的闭环提示接线不见了');
