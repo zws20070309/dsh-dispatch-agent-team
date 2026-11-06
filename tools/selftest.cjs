@@ -92,18 +92,7 @@ function functionBodyOf(source, needle) {
     const claimedEn = /(\d+)\s+teammate roles/u.exec(String(localeEn?.meta?.description ?? ''));
     assert.ok(claimedEn !== null, 'locale/en.json 的描述里找不到 "N teammate roles" 这句数量声明');
     assert.equal(Number(claimedEn[1]), roster.ROLES.length, `en.json 写的角色数(${claimedEn[1]})与 ROLES.length(${roster.ROLES.length})不一致`);
-    // meta.detail（2026-11-06）：官方 dsh-plugin-detail 按 locale 的 meta.detail 找详情文档，
-    // **找不到就退回 README** —— 这个键缺了不会报错，只会把 22KB 的 README 整篇塞进插件页
-    // （用户 2026-11-06 报的就是这个，肉眼才发现）。三条一起钉：键在、.md 结尾、文件真的在包里。
-    for (const [name, meta, expectedText] of [
-      ['zh', localeZh?.meta, 'docs/DETAIL.zh.md'],
-      ['en', localeEn?.meta, 'docs/DETAIL.md'],
-    ]) {
-      const detail = meta === undefined || meta === null ? undefined : meta.detail;
-      assert.equal(detail, expectedText, `locale/${name}.json 的 meta.detail 应为 ${expectedText}（缺了插件页会整篇渲染 README）`);
-      assert.ok(/\.(?:md|markdown)$/iu.test(String(detail)), `locale/${name}.json 的 meta.detail 必须指向 Markdown 文件`);
-      assert.ok(existsSync(path.join(PLUGIN_DIR, String(detail))), `locale/${name}.json 指向的 ${detail} 不存在（插件页会报 detail invalid）`);
-    }
+
     assert.equal(roster.ROLE_IDS.length, roster.ROLES.length);
     assert.equal(new Set(roster.ROLE_IDS).size, roster.ROLES.length, '角色 id 有重复');
     assert.deepEqual(Object.keys(roster.ROLE_BY_ID), roster.ROLE_IDS, 'ROLE_BY_ID 与 ROLE_IDS 不一致');

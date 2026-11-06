@@ -79,8 +79,6 @@ const FILES = [
   '.gitignore',
   'locale/zh.json',
   'locale/en.json',
-  'docs/DETAIL.md',
-  'docs/DETAIL.zh.md',
   'lib/index.js',
   'lib/preset.js',
   'lib/runtime.js',

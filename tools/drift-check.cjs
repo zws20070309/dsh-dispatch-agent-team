@@ -415,46 +415,6 @@ check('左侧栏入口依赖的官方槽位、panel id 校验与渲染 props 仍
   return missing.length === 0 ? true : `官方这些约定变了，lib/client.js 的侧栏注册要跟着改：${missing.join('、')}`;
 });
 
-// 8f) 插件详情页正文的隐藏 selector 依赖两个官方 DOM 标记（2026-11-06）。
-// 用户明确要求插件页**不要**那段长文（「点击智能体团队后还会看到 readme 的内容，这个不需要」），
-// 而官方没有「关掉正文」的开关：`meta.detail` 只能换内容，换不成「没有」——
-// 空文档会走 DetailDocument 的 `status==="none"` 分支，那条只在「既无 meta.detail 又无 README」
-// 时才成立，本包这两样都有。所以只能在 CSS 里按数据属性精确隐藏。
-// 两个标记任一改名/丢失，隐藏就**静默失效**（正文又整篇回来，没人报错）——钉死它们。
-/**
- * 在 dsh-web-frontend 的 dist/assets 里找包含某个标记的前端 bundle。
- *
- * 为什么不用写死文件名：那个文件名带内容哈希（index-BgUyXZcc.js），官方每次发版都会换，
- * 写死就是一条「升级即假红」的检查 —— 本仓库 2026-10-21 已经因为写死路径假红过 3 条。
- * @param {string} needle - 要在 bundle 里找到的标记。
- * @returns {string} 命中文件的内容；一个都没命中时返回 ''。
- */
-function readFrontendBundleWith(needle) {
-  const dir = ['dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets', 'node_modules/@deepseek-ai/dsh-web-frontend/dist/assets'];
-  for (const prefix of dir) {
-    let node = asar.json;
-    for (const segment of prefix.split('/')) { node = node?.files?.[segment]; if (node === void 0) break; }
-    if (node === void 0 || node.files === void 0) continue;
-    for (const name of Object.keys(node.files)) {
-      if (!name.endsWith('.js')) continue;
-      const text = asar.readAt(prefix + '/' + name);
-      if (text !== void 0 && text.includes(needle)) return text;
-    }
-  }
-  return '';
-}
-check('插件详情页正文的隐藏 selector 依赖的官方 DOM 标记仍在（改名会让长文静默回来）', () => {
-  const missing = [];
-  // 详情页根节点带 data-plugin-detail=<包名>，我们靠它把影响面限在本包。
-  if (!pluginManagerClient.includes('"data-plugin-detail"')) missing.push('详情页根 data-plugin-detail');
-  // 正文组件（primitives 的 DetailDocument）根节点带 data-detail-document，
-  // 且它的 none 分支必须仍然只渲染 null（那是「唯一的正规关闭路径」，虽然本包走不到）。
-  const bundle = readFrontendBundleWith('data-detail-document');
-  if (bundle === '') return '在 dsh-web-frontend 的前端 bundle 里找不到 data-detail-document（隐藏 selector 的第二个钩子无法核对）';
-  if (!bundle.includes('"data-detail-document"')) missing.push('正文根 data-detail-document');
-  return missing.length === 0 ? true : `官方这些标记变了，lib/client.js 里隐藏插件页正文的那条 CSS 要跟着改：${missing.join('、')}`;
-});
-
 // 8d) 工作区画布读取的官方**团队事件字段名**（2026-10-08 落地时加的闸门）。
 // lib/graph.js 折叠会话日志时按字段名取值：读错了不会抛错，只会让某条通道**静默变成 0**
 // （实测踩过两次：team/message/delivered 是扁平形状、不带 message 包装，按 data.message 读
@@ -1495,10 +1455,9 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
         'locale/en.json': readFileOr(path.join(PLUGIN_DIR, 'locale', 'en.json')),
         'presets/dispatch-mode.patch.yml': ourPresetPatch,
         'package.json': readFileOr(path.join(PLUGIN_DIR, 'package.json')),
-        // 插件详情页的正文（2026-11-06 起由 meta.detail 指定）：它同样会写角色数，
-        // 而这份文案此前**不在任何闸门里** —— 扩编/缩编时它会静默停在旧数字上。
-        'docs/DETAIL.zh.md': readFileOr(path.join(PLUGIN_DIR, 'docs', 'DETAIL.zh.md')),
-        'docs/DETAIL.md': readFileOr(path.join(PLUGIN_DIR, 'docs', 'DETAIL.md')),
+        // README.md 就是插件详情页的正文（locale 没有 meta.detail 时官方退回 README），
+        // 它写着「12 个队员角色」。这份文案此前**不在任何闸门里** —— 扩编/缩编时它会静默停在旧数字上。
+        'README.md': readFileOr(path.join(PLUGIN_DIR, 'README.md')),
       };
       const wrong = [];
       const patterns = [

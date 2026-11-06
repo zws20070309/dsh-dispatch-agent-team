@@ -1133,28 +1133,18 @@ for (const definition of controlToolDefinitions({ runtime, inject: ... })) ctx.e
 
 ## 7. `locale/zh.json` / `locale/en.json`（`builder-ui` 写）
 
-`meta.title` / `meta.description` / `meta.detail`，插件页与「已安装」列表卡片用它们：
+`meta.title` / `meta.description`，插件页与「已安装」列表卡片用它们：
 ```json
-{ "meta": { "title": "调度模式智能体团队", "description": "为 12 类队员分别指定模型与思考强度；保存后由调度模式的 Lead 在派队员时使用。", "detail": "docs/DETAIL.zh.md" } }
+{ "meta": { "title": "调度模式智能体团队", "description": "为 12 类队员分别指定模型与思考强度；保存后由调度模式的 Lead 在派队员时使用。" } }
 ```
 
-**详情页不显示长文（2026-11-06，用户明确要求）**。分两件事看：
-
-1. `meta.detail` 指向**一页短概要**（`docs/DETAIL.zh.md` 1.9 KB / `docs/DETAIL.md` 2.0 KB），
-   而不是 22 KB 的 README。官方 `@deepseek-ai/dsh-plugin-detail` 的 `readPackageDocument` 先读
-   `locale/<lang>.json` 的 `meta.detail`，**读不到才退回 README**
-   （`README_NAMES`：`README.md` / `readme.md` / `Readme.md` / `README.markdown` / `README`）。
-   本包此前没有这个键，所以 22 KB 的 README 被整篇塞进详情页。取值是**包内相对的 Markdown 路径**
-   （不能含 `\`、不能绝对、不能有 `.`/`..` 段、必须 `.md`/`.markdown`），语言链 `zh-CN → zh → en` 逐级取。
-   两份文档要进 `package.json` 的 `files`、`tools/repair.cjs` 的 `PACKAGE_FILES` 与 `tools/sync-to-dsh.cjs` 的 `FILES`
-   （drift-check 有闸门守这三处一致性，selftest 守「键在 + .md + 文件真的在包里」）。
-2. 详情页**连这一页概要也不显示**：整块 `[data-detail-document]` 由 CSS 隐藏（`.dat-panel` 那条旁边）。
-   为什么只能走 CSS：官方没有「关掉正文」的开关。`meta.detail` 只能**换内容**，换不成「没有」——
-   primitives 的 `DetailDocument` 在 `status === "none"` 时确实返回 `null`（整块消失），但那条分支
-   只在「**既无 `meta.detail` 又无 README**」时成立，本包这两样都有（README 属于包内容，不能删）。
-   两个 DOM 钩子：详情页根 `data-plugin-detail=<包名>`（`dsh-client-ui-plugin-manager/lib/client.js:5897`）、
-   正文根 `data-detail-document`（前端 bundle 里的 `DetailDocument`）。drift-check 8f 逐条钉住，
-   官方改名时那条闸门先红（已做过变异验证：把标记改成改名后的样子，闸门立刻报出具体缺哪一条）。
+**`meta.detail` 刻意不写（2026-11-06 用户定案）**：详情页正文就是 `README.md`。
+官方 `@deepseek-ai/dsh-plugin-detail` 的 `readPackageDocument` 先读 `locale/<lang>.json` 的
+`meta.detail`，**没有这个键才退回 README**（`README_NAMES`：`README.md` / `readme.md` /
+`Readme.md` / `README.markdown` / `README`）。用户要的正是「详情页能看得到 README」——
+这是官方更新后的正常形态，**不要**加 `meta.detail` 去换掉它，也不要用 CSS 藏正文。
+副作用要记住：`README.md` 会原样显示在插件页，所以它同时也是**面向用户的门面**，
+写它要按文档写（角色数量等数字由 drift-check 12d 对账，README 已纳入那张表）。
 
 ## 7.2 左侧栏入口（2026-11-06 加）
 
