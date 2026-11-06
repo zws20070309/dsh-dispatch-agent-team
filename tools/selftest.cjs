@@ -2830,10 +2830,13 @@ function functionBodyOf(source, needle) {
     // 防止「拨了没反应」的死代码回潮；官方回摆由 drift-check 钉 Config.mode 先红。
     assert.ok(!runtimeSrc.includes('批量调用（both）已开启') && !/presentAs\('both'\)/.test(runtimeSrc),
       'applyMemberBatch 不得再有 both 分支（0.2.2 executor 架构下没有承载物；官方回摆由 drift-check 先红提示）');
-    // 预热接线：激活期必须发起 executor 模块预热（index.js 第 0 步），队员同步路径才拿得到模块。
+    // 预热接线：激活期必须**await** executor 模块预热（index.js 第 0 步），队员同步路径才拿得到模块。
+    // 2026-11-07 T9-3 实机回归：预热若是 fire-and-forget，第一次 spawn 时预热可能未完成 →
+    // executorModules 为 undefined → declareMemberMode 走降级 → native/ptc 挂载静默失效。
+    // apply 必须 async 并 await 预热完成后才注册 watchAgents（warm 内部永不抛错，await 安全）。
     const indexWarmSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
-    assert.ok(/runtime\.warmExecutorModules\(ctx\)/.test(indexWarmSrc),
-      'lib/index.js apply 必须在激活期调用 runtime.warmExecutorModules（队员同步安装等不起动态 import）');
+    assert.ok(/await\s+runtime\.warmExecutorModules\(ctx\)/.test(indexWarmSrc) && /export async function apply/.test(indexWarmSrc),
+      'lib/index.js apply 必须 async 并 await runtime.warmExecutorModules（fire-and-forget 会有时序竞争：首名队员 spawn 赶不上预热完成 → 挂载静默失效，T9-3 实测）');
     assert.ok(/export async function warmExecutorModules/.test(runtimeSrc) && /loader\.import\(/.test(runtimeSrc),
       'warmExecutorModules 必须经宿主 loader.import 预热 executor 模块（两包只在 asar 闭包里）');
     // 2026-10-21 回归（本轮真机体检抓到）：purePtc 原来写成 `!batchDeclared && preset==='ptc'`，
