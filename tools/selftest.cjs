@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2718）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2733）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
