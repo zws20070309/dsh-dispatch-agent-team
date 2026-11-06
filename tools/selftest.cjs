@@ -2783,27 +2783,41 @@ function functionBodyOf(source, needle) {
     assert.ok(/const declaredMode = applyMemberBatch\(ctx, agent, role, notes, disposers\);/.test(runtimeSrc),
       'applyMemberBatch 的返回值（实际档名）必须被接住 —— purePtc 的唯一真值来源');
     // 2026-10-16 真机 P0（researcher-ops 白跑一轮 + 每步翻转）：预设 ptc + 关批量的队员，
-    // 必须在**自己那层同步** presentAs('ptc')。只靠异步预设重绑会带来两个后果：第一次请求跑在
+    // 必须在**自己那层同步**声明呈现档。只靠异步预设重绑会带来两个后果：第一次请求跑在
     // 继承来的 native 组合上；而且实测不是「晚一次」而是**每步翻转**（native→ptc→native→ptc）。
-    // 对照证据：scout-ops（批量开着，本包同步声明 both）逐请求是 both→both 稳定；
-    // researcher-ops（本包什么都没声明）是 native(76)→ptc(1)→native(76)→ptc(1)。
-    // 差别就在「自己那层有没有钉住」—— 所以这里钉住源码形状。
+    // 2026-11-07 机制迁移（0.2.2-rc.1）：官方删掉 mode 字段与 presentAs（ToolsService.Config.mode
+    // = z.never()，"Removed. Mount a native or PTC tool executor instead."），呈现档=按作用域挂
+    // executor 插件。同步声明口改为「Loader 预热模块 + scoped.plugin(executor)」，钉住源码形状。
     const dmAt = runtimeSrc.indexOf('function declareMemberMode');
-    assert.ok(dmAt >= 0, 'runtime.js 必须有 declareMemberMode（纯 PTC 档的同步声明口）');
-    const dmBody = runtimeSrc.slice(dmAt, dmAt + 2200);
-    // 2026-10-21：ptcRuntime 守卫只对**非 native** 档有意义（官方 requirePtcRuntime 在
-    // wireSchemas 的 `if (mode === "native") return …` 之后才调用）。断言改成认这个条件。
-    assert.ok(/mode !== 'native' && pick\(ctx, 'ptcRuntime'\) === undefined/.test(dmBody) && /presentAs\(mode\)/.test(dmBody),
-      'declareMemberMode 必须只在非 native 档探 ptcRuntime（native 装配根本不碰它），然后再 presentAs');
-    // 关掉批量 = 明确钉 native（2026-10-21 第二次修正：不再是「沿用预设」。
+    assert.ok(dmAt >= 0, 'runtime.js 必须有 declareMemberMode（呈现档的同步声明口）');
+    const dmBody = runtimeSrc.slice(dmAt, dmAt + 2600);
+    // 2026-10-21：ptcRuntime 守卫只对**非 native** 档有意义（native executor 不需要程序运行时；
+    // ptc executor 缺 runtime 时永远注册不出 run_code）。断言改成认这个条件。
+    assert.ok(/mode !== 'native' && pick\(ctx, 'ptcRuntime'\) === undefined/.test(dmBody),
+      'declareMemberMode 必须只在非 native 档探 ptcRuntime（native 装配根本不碰它）');
+    // 2026-11-07：声明口=executor 挂载优先，旧宿主（peerDependencies 覆盖区间）回落 presentAs。
+    assert.ok(/scoped\.plugin\(executor\)/.test(dmBody) && /executorModules\.(native|ptc)/.test(dmBody),
+      'declareMemberMode 必须经 executorModules 取模块并 scoped.plugin(executor) 同步挂载（0.2.2 呈现档机制）');
+    const execAt = dmBody.indexOf('scoped.plugin(executor)');
+    const legacyAt = dmBody.indexOf('tools.presentAs(mode)');
+    assert.ok(execAt >= 0 && legacyAt > execAt,
+      'presentAs 只能是 executor 之后的旧宿主回落 —— 排在前面等于回到已删除的旧机制');
+    assert.ok(/双路声明口|旧宿主回落/.test(dmBody),
+      '双路声明口必须有注释说明（0.2.2 executor 首选 / 0.2.0-0.2.1 presentAs 回落）');
+    // 关掉批量 = 明确挂 native（2026-10-21 第二次修正：不再是「沿用预设」。
     // 交付态里 12 个角色全是 preset ptc，沿用预设会让开关两端都是 ptc = 拨了没反应）。
-    // 2026-10-21：返回值改成档名后，这一句变成 `const declared = declareMemberMode(…'native'…) === true;`，
-    // 断言跟着放宽到「必须调用 declareMemberMode 且传 native」。
     assert.ok(/declareMemberMode\(ctx, agent, 'native', who, notes, disposers\)/.test(runtimeSrc),
-      'applyMemberBatch 关掉批量的那一支必须**明确声明 native**（否则开关拨到「关」与「开」没有可观测差异）');
-    const batchBodyStart = runtimeSrc.indexOf('批量调用（both）已开启');
-    assert.ok(batchBodyStart >= 0 && runtimeSrc.slice(batchBodyStart, batchBodyStart + 500).includes("return 'both';"),
-      "applyMemberBatch 的 both 成功路径必须返回 'both'（不是布尔）—— purePtc 判据依赖它");
+      'applyMemberBatch 关掉批量的那一支必须**明确挂 native executor**（否则开关拨到「关」与「开」没有可观测差异）');
+    // 2026-11-07：both 无承载物（executor 架构每作用域只准一个 executor）——both 分支必须已删，
+    // 防止「拨了没反应」的死代码回潮；官方回摆由 drift-check 钉 Config.mode 先红。
+    assert.ok(!runtimeSrc.includes('批量调用（both）已开启') && !/presentAs\('both'\)/.test(runtimeSrc),
+      'applyMemberBatch 不得再有 both 分支（0.2.2 executor 架构下没有承载物；官方回摆由 drift-check 先红提示）');
+    // 预热接线：激活期必须发起 executor 模块预热（index.js 第 0 步），队员同步路径才拿得到模块。
+    const indexWarmSrc = readFileSync(path.join(__dirname, '..', 'lib', 'index.js'), 'utf8');
+    assert.ok(/runtime\.warmExecutorModules\(ctx\)/.test(indexWarmSrc),
+      'lib/index.js apply 必须在激活期调用 runtime.warmExecutorModules（队员同步安装等不起动态 import）');
+    assert.ok(/export async function warmExecutorModules/.test(runtimeSrc) && /loader\.import\(/.test(runtimeSrc),
+      'warmExecutorModules 必须经宿主 loader.import 预热 executor 模块（两包只在 asar 闭包里）');
     // 2026-10-21 回归（本轮真机体检抓到）：purePtc 原来写成 `!batchDeclared && preset==='ptc'`，
     // 而语义改成「开=ptc / 关=native」之后这个式子**两个方向都算反**：
     //   batch=true  -> 实际 ptc  -> 旧式给 false（该 true）；
@@ -3111,31 +3125,29 @@ function functionBodyOf(source, needle) {
       '展开层正文没走等宽字体（用户要「展开后就能看到代码」）');
   });
 
-  await check('批量调用（both）档必须探测宿主还认不认这一档（DSH 0.2.1-rc.2 把它删了）', () => {
-    // 2026-10-21 复核：DSH 0.2.1-rc.2 的 tools 行把呈现档从 native|ptc|both 收窄成 native|ptc。
-    // 台架实测（宿主真身 dsh-tools/lib/index.js 解出来后直接喂 Config）：
-    //   Config({mode:'native'}) ok / Config({mode:'ptc'}) ok / Config({mode:'both'}) 抛
-    //   "$.mode expected \"native\" | \"ptc\" but got \"both\""。
-    // 而 presentAs() **不校验取值**（只把字符串写进 layer.mode），所以旧代码不会在这一步抛错：
-    // 开关拨了、诊断写着「已开启」，实际装配行为两边都不匹配 —— 静默退化。
+  await check('批量调用档已随 0.2.2 executor 架构收编（both 分支删除；官方回摆由 drift-check 先红）', () => {
+    // 2026-11-07 复核（0.2.2-rc.1 asar 实读）：官方把呈现档从 tools 行的 mode 字段
+    // （presentAs/modeFor）整体改成了**按作用域挂 executor 插件**——ToolsService.Config.mode
+    // 现在是 z.never()，官方原话 "Removed. Mount a native or PTC tool executor instead."；
+    // 且 executor 架构下**每作用域只准挂一个 executor**（"Only one tool executor may be
+    // registered in each scope"），「原生 + run_code 并存」的 both 在新架构里没有承载物。
+    // 原 presentationModeSupported 探测随死分支一并移除；宿主若回摆，drift-check 的
+    // 「Config.mode 已删」检查会先红，届时人工重评（不许靠探测自动恢复，必须真机实测）。
     const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
-    const at = runtimeSrc.indexOf('function presentationModeSupported');
-    assert.ok(at >= 0, 'runtime.js 必须有 presentationModeSupported（问注册表自己认不认这一档）');
-    const body = runtimeSrc.slice(at, at + 1200);
-    // 判据必须是「喂给 Config schema」：那是官方对合法取值的唯一声明。
-    assert.ok(/schema\(\{ mode \}\)/.test(body), '探测必须把候选值喂给 tools 行的 Config schema');
-    assert.ok(/constructor\?\.Config/.test(body), 'schema 要从 tools 服务的构造函数上取（实例上没有 Config）');
-    // 取不到 schema 时必须返回 undefined（不知道），让调用方退回老行为 —— 不许当成 false 把功能关掉。
-    assert.ok(/return undefined;/.test(body), '取不到 schema 必须返回 undefined（不知道），不能当成不支持');
-    // 守卫必须在 presentAs('both') **之前**，且失败时如实记一条「看得见」的说明。
-    const gate = runtimeSrc.indexOf("presentationModeSupported(ctx, 'both')");
-    const call = runtimeSrc.indexOf("tools.presentAs('both')");
-    assert.ok(gate >= 0 && call > gate, "both 的能力探测必须排在 presentAs('both') 之前");
-    assert.ok(runtimeSrc.slice(gate, call).includes('noteCapabilityOnce('),
-      '不支持时必须让用户看得见（否则开关拨了没反应，与旧缺陷一模一样）');
-    // 客户端那格开关的说明也要跟着说准：它现在只在「宿主支持 both」时才有意义。
+    assert.ok(!runtimeSrc.includes('function presentationModeSupported'),
+      'presentationModeSupported 必须已删（0.2.2 没有 mode 字段可探测，留着就是死代码）');
+    assert.ok(!/presentAs\('both'\)/.test(runtimeSrc) && !runtimeSrc.includes('批量调用（both）已开启'),
+      'both 分支必须已删 —— executor 架构下它是「拨了没反应」的死代码');
+    // 挂载真值来源必须还在：executor 预热缓存 + 同步挂载口 + ptcRuntime 守卫。
+    assert.ok(runtimeSrc.includes('export async function warmExecutorModules') && /loader\.import\(/.test(runtimeSrc),
+      'executor 模块必须经宿主 loader.import 预热（两包只在 asar 闭包里）');
+    assert.ok(/mode !== 'native' && pick\(ctx, 'ptcRuntime'\) === undefined/.test(runtimeSrc),
+      'ptcRuntime 守卫必须只在非 native 档生效（native executor 不需要程序运行时）');
+    // 客户端那格开关的说明也要跟着说准：两端都由开关决定，与所选预设无关。
     const clientSrc = readFileSync(path.join(__dirname, '..', 'lib', 'client.js'), 'utf8');
     assert.ok(clientSrc.includes('batchTip'), '批量开关的说明文案必须仍在（配置页那一格）');
+    assert.ok(!clientSrc.includes('关 = 完全按所选 agent 预设跑'),
+      'batchTip 还在教「关=沿用预设」—— 2026-10-21 语义改成「关=挂 native 执行器」后那是错的');
   });
 
   await check('会改用户配置的脚本：不认识的参数必须拒绝，不许落进默认写盘动作（2026-10-21 真事故）', () => {
@@ -3164,31 +3176,28 @@ function functionBodyOf(source, needle) {
     assert.ok(/argv\.includes\('--help'\)[\s\S]{0,1600}return 0;/u.test(src), '--help 必须单独走「只打印、直接返回」');
   });
 
-  await check('both 不被宿主支持时，预设 ptc 的队员仍必须同步声明 ptc（不许退回到 2026-10-16 的 P0）', () => {
-    // 这条是给 2026-10-21 那次修复补的**回归闸门**：加「both 能力探测」时，我曾让
-    // 「不支持 both」那一支直接 return —— 而它与「批量档关着」那一支本该**完全对称**。
-    // 差别只在预设是 ptc 的角色身上：不补 presentAs('ptc')，它第一次请求就跑在继承来的
-    // native 组合上（预设重绑是异步的，赶不上首次装配），于是队员把「没有 run_code」
-    // 当成事实报给 Lead，白跑一轮（session-00001005 的 researcher-ops 就是这样）。
+  await check('批量开/关两支必须都同步挂 executor 且档位相反（不许退回到 2026-10-16 的 P0）', () => {
+    // 这条是 2026-10-21 那次修复的**回归闸门**（0.2.2-rc.1 起载体从 presentAs 换成 executor 挂载）：
+    // 差别只在预设是 ptc 的角色身上：关批量若不**同步**挂 native executor，它第一次请求就跑在
+    // 继承来的 ptc 组合上（预设重绑是异步的，赶不上首次装配），于是队员把「有 run_code、没有
+    // 原生工具」当成事实报给 Lead，白跑一轮（session-00001005 的 researcher-ops 就是这样）。
     const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
-    const gate = runtimeSrc.indexOf("presentationModeSupported(ctx, 'both')");
-    assert.ok(gate >= 0, '缺少 both 能力探测');
-    // 探测之后的这一段里，必须同时出现「return」和「declareMemberMode(... 'ptc' ...)」，
-    // 且声明排在 return 之前（否则就是死代码）。
-    const tail = runtimeSrc.slice(gate, gate + 1600);
+    // 开批量的那一支：ptcRuntime 守卫之后必须同步 declareMemberMode(...'ptc'...)。
+    const guard = runtimeSrc.indexOf("if (pick(ctx, 'ptcRuntime') === undefined) {");
+    assert.ok(guard >= 0, 'applyMemberBatch 的 ptcRuntime 守卫不见了');
+    const tail = runtimeSrc.slice(guard, guard + 1800);
+    const note = tail.indexOf("noteCapabilityOnce('batch-ptc-pin'");
     const decl = tail.indexOf("declareMemberMode(ctx, agent, 'ptc'");
-    const ret = tail.indexOf('return;');
-    assert.ok(decl > 0, 'both 不支持的那一支必须给预设 ptc 的队员同步声明 ptc —— 否则退回真机那个 P0');
-    assert.ok(ret < 0 || decl < ret, 'ptc 声明必须排在 return 之前（排在后面就是永不执行的死代码）');
-    // 2026-10-21：对称性换了对象 —— 现在两端都由**开关**决定，且必须是**不同的档**：
-    // 开 -> ptc（拿 run_code），关 -> native（拿全套原生工具）。两边都只声明、都不等异步重绑。
+    assert.ok(decl > 0, '开批量那一支必须同步挂 ptc executor —— 否则退回真机那个 P0');
+    assert.ok(note >= 0 && decl > note, '两档语义的能力说明必须挂在 ptc 挂载之前（先让用户看得见）');
+    // 对称性：两端都由**开关**决定，且必须是**不同的档**：
+    // 开 -> ptc executor（拿 run_code），关 -> native executor（拿全套原生工具）。
     const offAt = runtimeSrc.indexOf('wantRunCode === false');
     assert.ok(offAt >= 0, 'applyMemberBatch 关门那一支必须由 wantRunCode 判据控制');
     assert.ok(runtimeSrc.slice(offAt, offAt + 700).includes("declareMemberMode(ctx, agent, 'native'"),
-      '关掉批量必须钉 native（与「开 -> ptc」形成真实差异）');
-    const onAt = runtimeSrc.indexOf('presentationModeSupported(ctx, \'both\')');
-    assert.ok(onAt >= 0 && runtimeSrc.slice(onAt, onAt + 1400).includes("declareMemberMode(ctx, agent, 'ptc'"),
-      '开批量（宿主无 both 时）必须钉 ptc');
+      '关掉批量必须挂 native executor（与「开 -> ptc」形成真实差异）');
+    assert.ok(runtimeSrc.slice(guard, guard + 1800).includes("noteCapabilityOnce('batch-ptc-pin'"),
+      '不支持时必须让用户看得见（否则开关拨了没反应，与旧缺陷一模一样）');
   });
 
   await check('工具行标签：本机工具面里的工具都必须有官方同类词，不许退成泛泛的「工具调用」（2026-10-21 真机）', () => {
@@ -3243,7 +3252,7 @@ function functionBodyOf(source, needle) {
     // 旧实现是自造文案（「已读取文件」「修改了文件」「已搜索代码」）—— 与官方不一致。
     const expect = {
       read: '读取', read_image: '读取图片', grep: '搜索文件内容', glob: '查找文件',
-      write: '写入', edit: '编辑', apply_patch: '编辑', bash: '运行命令', pwsh: '运行命令',
+      write: '写入', edit: '编辑', apply_patch: '应用补丁', bash: '运行命令', pwsh: '运行命令',
       web_search: '网页搜索', web_fetch: '网页获取', subagent: '创建子智能体',
       spawn_teammate: '创建队友', send_message: '发送消息', list_agents: '查看子智能体',
       wait_agent: '等待子智能体', team_task_create: '创建团队任务', get_team_task: '读取团队任务',

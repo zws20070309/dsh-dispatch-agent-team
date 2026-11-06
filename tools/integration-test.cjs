@@ -661,8 +661,8 @@ async function main() {
   // 复现 2026-09-28 用户截到的「宿主诊断（配置文件可能有问题）」假警报：
   //   ① 信息性记录（DSH 主目录 / 配置文件）与真故障共用一条通道，页面在**一切正常**时
   //      也渲染成红色告警；
-  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:520）与
-  //      `writeStatusFile()`（同文件 :625 调用 → :672 定义，内部 :692 `getConfigPath`）都是 fire-and-forget，
+  //   ② 同一句被记了两遍 —— apply() 里 `loadConfig()` 预热（lib/index.js:533）与
+  //      `writeStatusFile()`（同文件 :651 调用 → :698 定义，内部 :718 `getConfigPath`）都是 fire-and-forget，
   //      而旧实现把「已算过」的检查放在 `await settings.prepareDocument()` **之前**、
   //      赋值放在 await **之后**，于是第二个调用者从同一个窗口挤进来又算了一遍。
   // 这里用**全新的模块实例**（带 query 的 URL = 新的 ESM 记录），否则会被上面 §7 已缓存的 state 影响。
@@ -1510,10 +1510,14 @@ async function main() {
     await tick();
     await tick();
 
-    check('真安装路径：默认开的一档让队员的 wire 里同时有 run_code 与团队工具', () => {
+    check('真安装路径：默认开的一档让队员的 wire 里有 run_code（0.2.2 语义：直调只有 run_code，团队工具经 SDK 段在程序内调用）', () => {
       const names = wireOf(mateEKey).knownNames;
-      if (!names.includes('run_code')) return '安装路径没把 both 档声明上（wire 里没有 run_code）：' + names.join(', ');
-      if (!names.includes(roster.REPORT_TOOL_NAME)) return 'both 档下团队工具 report_result 不见了：' + names.join(', ');
+      if (!names.includes('run_code')) return '安装路径没把 ptc 档声明上（wire 里没有 run_code）：' + names.join(', ');
+      // 2026-11-07 语义更新：both 已随 0.2.2 executor 架构删除 —— 「开」= 挂 ptc executor，
+      // 直接可调的只有 run_code；团队工具经 PtcExecutor 的 tools:sdk 段声明、在程序里
+      // await tools.report_result(...) 调用（PTC_ONLY 原文即此语义，drift-check 已把
+      // PtcExecutor.sections 钉住）。本台架加载的 junction 旧库 ptc 折叠行为与真机一致，
+      // 所以 report_result 不再要求出现在 wire 的 knownNames 里（旧断言是 both 时代的形状）。
       return true;
     });
 
@@ -1878,23 +1882,23 @@ async function main() {
       return true;
     });
 
-    // ── 2026-10-21：新宿主形状（both 已被官方删除）的覆盖 ──────────────────────────
-    // 本文件这一节加载的是 profile junction 的 @deepseek-ai/dsh-tools（0.2.0-rc.2，**还认 both**），
-    // 而真机宿主是 0.2.1-rc.2（**不认 both**）。只测前者等于只测了过去。
-    // 但 presentAs 本身不校验取值、也没有「移除一档」的口子，无法在真库上模拟「拒绝 both」。
-    // 所以这里改用**纯函数级**断言：presentationModeSupported 的判据就是「把候选值喂给
-    // tools 行的 Config schema」，而那个 schema 的形状已经从宿主真身核对过
-    // （.probe/deep/asar/dsh-tools.js:2763 是 z.union(["native","ptc"])）。
-    // 这里直接断言「runtime.js 里那句探测确实是这么写的」，并在 drift-check 里
-    // 持续核对宿主那份 schema 的真身（双向夹住，缺一不可）。
-    check('新宿主形状的判据接线仍在：presentationModeSupported 把候选值喂给 tools 行的 Config', () => {
+    // ── 2026-11-07：宿主 0.2.2-rc.1 形状（呈现档=按作用域挂 executor）的覆盖 ─────────
+    // 本文件这一节加载的是 profile junction 的 @deepseek-ai/dsh-tools（0.2.0-rc.2，还认
+    // presentAs/mode），而真机宿主 0.2.2-rc.1 已把两者整体移除（Config.mode=z.never()，
+    // "Removed. Mount a native or PTC tool executor instead."），呈现档=按作用域挂 executor。
+    // 上面 §7.10 的 live 部分只对 junction 那份旧库有效（历史基线）；真机形状在 drift-check 里
+    // 对 app.asar 实读钉住，这里钉「runtime.js 的同步声明口确实是 executor 挂载」（双向夹住）。
+    check('新宿主形状的判据接线仍在：declareMemberMode 经 executorModules 同步挂 executor', () => {
       const src = realFs.readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
-      const at = src.indexOf('function presentationModeSupported');
-      if (at < 0) return 'runtime.js 里没有 presentationModeSupported';
-      const body = src.slice(at, at + 900);
-      if (!/schema\(\{ mode \}\)/.test(body)) return '探测没有把候选值喂给 Config schema（判据失效）';
-      if (!/constructor\?\.Config/.test(body)) return '没有从构造函数取 Config（实例上没有这个字段）';
-      if (!/return undefined;/.test(body)) return '取不到 schema 时必须返回 undefined（不知道），不能当成不支持';
+      if (!src.includes('export async function warmExecutorModules')) return 'runtime.js 里没有 warmExecutorModules（executor 预热口）';
+      if (!/loader\.import\(/.test(src)) return '预热没有走宿主 loader.import（executor 包只在 asar 闭包里，磁盘解析不到）';
+      const at = src.indexOf('function declareMemberMode');
+      if (at < 0) return 'runtime.js 里没有 declareMemberMode';
+      const body = src.slice(at, at + 3000);
+      if (!/scoped\.plugin\(executor\)/.test(body)) return '声明口没有同步挂 executor（0.2.2 呈现档机制）';
+      const execAt = body.indexOf('scoped.plugin(executor)');
+      const legacyAt = body.indexOf('tools.presentAs(mode)');
+      if (legacyAt < 0 || legacyAt < execAt) return '旧宿主 presentAs 回落必须在 executor 分支之后（双路声明口，peerDependencies 覆盖 0.2.0/0.2.1）';
       return true;
     });
     // 2026-10-21 真机体检：detailOf 的失败分支只给 note、不给 error，而所有消费方都读 error

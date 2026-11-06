@@ -249,6 +249,10 @@ export async function listModelCatalog(ctx);     // -> {groups:[{id,name,models:
 export async function listTeammatePresets(ctx);  // 2026-10-15：-> {presets:[{id,name,available,reason,detail?}], notes:string[]}
                                                  //    白名单三个 id 乘 注册表现状：现读 agentPresets.list() 并筛掉 broken（与官方选择器同源），
                                                  //    只发事实（reason = not-registered / broken / 空），句子由页面拼；永不抛错。
+export async function warmExecutorModules(ctx);  // 2026-11-07：-> Promise<void>；激活期（lib/index.js apply 第 0 步）经宿主
+                                                 //    loader.import 预热 @deepseek-ai/dsh-tool-executor-{native,ptc} 两个模块
+                                                 //    （0.2.2-rc.1 呈现档=按作用域挂 executor，两包只在 asar 闭包里）。
+                                                 //    永不抛错：失败只记诊断并留空槽位，declareMemberMode 走诚实降级路。
 export async function preflightRoute(ctx, route);// -> {ok:boolean, route, diagnostics:string[]}
                                                  //    有 reasoningEffort 但该模型未广告 / 不在列表里 => 丢掉该字段并记 diagnostics，
                                                  //    route 仍可用（ok 保持 true）。provider/model 无法解析 => ok:false。
