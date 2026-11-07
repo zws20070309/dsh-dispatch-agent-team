@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2733）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2781）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -1831,6 +1831,88 @@ function functionBodyOf(source, needle) {
     // Lead 节点的 name 必须是 'lead'：官方 ownerName 对 Lead 自己的条目就是翻成 'lead'
     // （task-view.js），两边不同口径时 Lead 名下条目会一条都匹配不上。
     assert.ok(call[0].includes("leadName: 'lead'"), 'Lead 节点名字不再是 lead：与官方 ownerName 口径分叉，归属会匹配不上');
+  });
+
+  console.log('');
+  console.log('lib/graph.js（两账对账：reconcileTasks，2026-11-07 T10 双向对账）');
+
+  await check('reconcileTasks：证据按 taskId 归堆（count + 最近一份），畸形输入退化不抛错', () => {
+    const tasks = [
+      { id: 't1', status: 'in_progress', ownerName: 'a', revision: 3, subject: '调研' },
+      { id: 't2', status: 'completed', ownerName: 'b', revision: 5 },
+    ];
+    const reports = [
+      { at: '2026-11-07T01:00:00Z', name: 'a', taskId: 't1', status: 'blocked', delivered: true, summary: '缺权限' },
+      { at: '2026-11-07T02:00:00Z', name: 'a', taskId: 't1', status: 'completed', delivered: true, summary: '交付' },
+      { at: '2026-11-07T03:00:00Z', name: 'c', taskId: 't9', status: 'completed', delivered: false, summary: '孤儿' },
+    ];
+    const recon = graph.reconcileTasks(tasks, reports);
+    const e1 = recon.evidenceById.get('t1');
+    assert.equal(e1.count, 2, 't1 有两份绑定报告');
+    assert.equal(e1.last.status, 'completed', 'last 取时间序末位（最近一份）');
+    assert.equal(e1.last.delivered, true, 'delivered 透传（投递失败的面板要能标出来）');
+    assert.equal(recon.evidenceById.get('t2'), undefined, '没有报告绑定的任务没有证据行');
+    assert.equal(recon.evidenceById.get('t9').count, 1, '孤儿报告同样有证据可查');
+    // 畸形输入：一切非数组 → 没账可对，不抛错（挂在秒级轮询路径上）。
+    assert.deepEqual(graph.reconcileTasks(undefined, undefined).gaps, []);
+    assert.equal(graph.reconcileTasks('x', 42).evidenceById.size, 0);
+  });
+
+  await check('reconcileTasks：三向欠账各就各位（noEvidence / openClaim / orphanReport）', () => {
+    const tasks = [
+      { id: 't1', status: 'completed', ownerName: 'a', revision: 7 },  // 无证据完成
+      { id: 't2', status: 'in_progress', ownerName: 'b', revision: 2 }, // 报了 completed 却没收尾
+      { id: 't3', status: 'completed', ownerName: 'c', revision: 9 },  // 有证据：不该报
+      { id: 't4', status: 'deleted', ownerName: 'a', revision: 4 },    // 已删：证据可查但不报孤儿
+    ];
+    const reports = [
+      { at: '2026-11-07T01:00:00Z', name: 'b', taskId: 't2', status: 'completed', delivered: true, summary: '' },
+      { at: '2026-11-07T02:00:00Z', name: 'c', taskId: 't3', status: 'completed', delivered: true, summary: '' },
+      { at: '2026-11-07T03:00:00Z', name: 'a', taskId: 't4', status: 'completed', delivered: true, summary: '' },
+      { at: '2026-11-07T04:00:00Z', name: 'd', taskId: 'ghost', status: 'completed', delivered: true, summary: '' },
+    ];
+    const kinds = new Map(graph.reconcileTasks(tasks, reports).gaps.map((gap) => [gap.taskId, gap.kind]));
+    assert.equal(kinds.get('t1'), 'noEvidence', 'completed 但没有任何 completed 报告绑它 → 无证据完成');
+    assert.equal(kinds.get('t2'), 'openClaim', '报告 completed 而任务还 in_progress → 欠 team_task_update');
+    assert.equal(kinds.get('t3'), undefined, '有证据的完成不该报缺口');
+    assert.equal(kinds.get('ghost'), 'orphanReport', '报告绑的 id 板上查无 → 孤儿');
+    assert.equal(kinds.get('t4'), undefined, '已删任务不报孤儿（证据仍从 evidence 读）');
+    // blocked 报告不能当完成证据：t1 只有 blocked 报告时依旧 noEvidence。
+    const blockedOnly = graph.reconcileTasks(
+      [{ id: 't1', status: 'completed', ownerName: 'a', revision: 7 }],
+      [{ at: 'x', name: 'a', taskId: 't1', status: 'blocked', delivered: true, summary: '' }],
+    );
+    assert.equal(blockedOnly.gaps[0].kind, 'noEvidence', 'blocked 报告不算完成证据');
+  });
+
+  await check('两账对账进画布：collectGraph 挂 taskRecon（evidence + gaps + checkedAt）', () => {
+    const gsrc = readFileSync(path.join(PLUGIN_DIR, 'lib', 'graph.js'), 'utf8');
+    assert.ok(gsrc.includes('graph.taskRecon = {'), 'collectGraph 没把对账结果挂上画布（看板拿不到欠账清单）');
+    assert.ok(gsrc.includes('reconcileTasks(graph.tasks, reports)'), '对账输入必须是画布上的同一份 tasks（口径分叉=对白账）');
+    const rsrc = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    assert.ok(/collectGraph\(\{[\s\S]*?reports: recentReports\(\)\.items,[\s\S]*?\}\);/.test(rsrc),
+      'teamGraph 没把插件记录交给 collectGraph（对账永远空转）');
+  });
+
+  await check('任务悬停浮窗接上两账数据：委托常驻、悬停中随刷新重画、句子全走双语字典', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    assert.ok(src.includes('taskFly, taskFlyOn: false'), '浮窗元素没登记进工作区状态（渲染函数拿不到引用）');
+    assert.ok(src.includes("event.target.closest('.taskbar') === null"),
+      '悬停委托没绑在常驻 statusEl 上（绑分段条会随每轮 textContent 清空丢悬停）');
+    assert.ok(src.includes('if (state.taskFlyOn === true) wsRenderTaskFly(state)'),
+      '悬停开着时不随轮询重画 → 浮窗内容停在打开那一刻（「实时」闸门，同抽屉对话的教训）');
+    assert.ok(src.includes('bar.appendChild(state.taskFly)'),
+      'textContent 清空后不把浮窗挂回 statusEl → 渲染更新到一个已脱离 DOM 的元素（必现死浮窗）');
+    assert.ok(src.includes('pointer-events:none') === false || src.includes('ws-taskfly{'),
+      '浮窗 CSS 丢了：悬停没有可见层');
+    // 双语字典模式：每个新键 zh + en 各一份（两表缺一 = 另一语言界面吐键名）。
+    for (const key of ['wsReconTitle', 'wsReconEvidence', 'wsReconNoEvidence',
+      'wsReconOpenClaim', 'wsReconOrphan', 'wsReconGapsHead', 'wsReconUndelivered', 'wsReconMore']) {
+      const count = src.split(key + ':').length - 1;
+      assert.equal(count, 2, `${key} 应在 zh/en 两张表各出现一次，实际 ${count} 次`);
+    }
+    // 摘要截断按码点（Array.from）：裸 slice 劈代理对的教训在 tools.js clipText 记着。
+    assert.ok(src.includes("Array.from(ev.last.summary).slice(0, 60)"), '报告摘要截断没有按码点（会劈碎 emoji）');
   });
 
   console.log('');
