@@ -193,6 +193,7 @@ const PACKAGE_FILES = [
   'lib/graph.js',
   'lib/client.js',
   'lib/self-heal.js',
+  'lib/status-pump.js',
   'lib/ops-adapter.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',

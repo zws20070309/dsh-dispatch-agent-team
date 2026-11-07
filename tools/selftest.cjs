@@ -1833,6 +1833,64 @@ function functionBodyOf(source, needle) {
     assert.ok(call[0].includes("leadName: 'lead'"), 'Lead 节点名字不再是 lead：与官方 ownerName 口径分叉，归属会匹配不上');
   });
 
+  console.log('');
+  console.log('lib/status-pump.js（状态文件落盘的串行 pass 泵，deepseek Passes.pump 语义）');
+
+  await check('statusPump：同一时刻至多一个 write 在跑，串行不交错', async () => {
+    const pumpMod = await load('status-pump.js');
+    let running = 0;
+    let maxRunning = 0;
+    let writes = 0;
+    const pump = pumpMod.createStatusPump(async () => {
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      running -= 1;
+      writes += 1;
+    }, () => {});
+    // 同帧连发 5 个请求：合并后至多「当前一次 + follow-up 一次」。
+    for (let i = 0; i < 5; i += 1) pump.request();
+    await pump.idle();
+    assert.equal(maxRunning, 1, `出现并发 write（maxRunning=${maxRunning}）：泵没串行化`);
+    assert.equal(writes, 2, `5 个同帧请求应被合并成 2 次落盘（当前+follow-up），实际 ${writes}`);
+  });
+
+  await check('statusPump：合并窗口里的请求共享同一个排队位（N 次只补一次），busy 翻转如实', async () => {
+    const pumpMod = await load('status-pump.js');
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    let writes = 0;
+    const pump = pumpMod.createStatusPump(async () => { writes += 1; await gate; }, () => {});
+    const first = pump.request();
+    await Promise.resolve();
+    assert.equal(pump.busy(), true, 'write 在跑时 busy() 应为 true');
+    const followUps = [pump.request(), pump.request(), pump.request()];
+    // 三个并发请求必须拿到**同一个** follow-up promise（合并语义的核心）。
+    assert.ok(followUps[0] === followUps[1] && followUps[1] === followUps[2],
+      '并发 request 没有共享同一个 follow-up 排队位');
+    release();
+    await first;
+    await pump.idle();
+    assert.equal(writes, 2, `2 次落盘（1 当前 + 1 follow-up），实际 ${writes}`);
+    assert.equal(pump.busy(), false, 'idle 之后 busy() 应为 false');
+  });
+
+  await check('statusPump：write 抛错走 onError、泵不死；后续请求照常跑', async () => {
+    const pumpMod = await load('status-pump.js');
+    const errors = [];
+    let calls = 0;
+    const pump = pumpMod.createStatusPump(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('磁盘满（演练）');
+    }, (error) => errors.push(error));
+    await pump.request();
+    assert.equal(errors.length, 1, '第一次失败必须进 onError（不许无声）');
+    await pump.request();
+    assert.equal(calls, 2, '失败后泵必须还能接新请求');
+    assert.equal(errors.length, 1, '第二次成功不该误报失败');
+    await pump.idle();
+  });
+
   await check('仓库内的行号指针必须仍指得到它声称的东西（2026-10-15 清掉一批失效后加的闸门）', () => {
     // 起因：我先在文档里写了一句**假指针**（「见 §6」，而 §6 通篇没提那个字段），自查时
     // 意识到这是本仓库最容易复发的一类错 —— **行号会被别人的编辑挪走**。全仓按本闸门
