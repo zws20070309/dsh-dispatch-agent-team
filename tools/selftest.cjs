@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2833）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2855）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -1965,6 +1965,44 @@ function functionBodyOf(source, needle) {
     // 双语字典：新键 zh + en 各一份。
     const count = src.split('wsSkelBoard:').length - 1;
     assert.equal(count, 2, `wsSkelBoard 应在 zh/en 两张表各出现一次，实际 ${count} 次`);
+  });
+
+  await check('DAG 聚焦：链闭包环安全、行可点钉住、链外淡出、Esc 撤销次序（T12 ③）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    // 链闭包：双向遍历 + 两个方向分开记（菱形依赖不剪枝）+ 环安全（已访集合）。
+    assert.ok(/function wsRelatedTaskIds\(taskId, tasks\)/.test(src), '缺 wsRelatedTaskIds（依赖链没有唯一算法）');
+    // 帮手函数排在 wsRenderTaskFly 之后（JSDoc 相邻闸门的要求），切片到下一个函数为止。
+    const fn = src.slice(src.indexOf('function wsRelatedTaskIds'), src.indexOf('function wsLegend'));
+    assert.ok(fn.includes('upSeen') && fn.includes('downSeen'), '上下游必须各用各的已访集合（合用会漏菱形依赖）');
+    // 悬停委托的接收者必须是每工作区 state——T10 遗留 bug：开关与调用都写在外层 ws 单例上
+    // （它没有 taskFly 字段），浮窗从未渲染过。只切悬停委托两个监听器本体检查，
+    // 注释里的旧写法引用不算（selftest 不许逼人把「修了什么」从注释里删掉）。
+    const hover = src.slice(
+      src.indexOf("statusEl.addEventListener('mouseover'"),
+      src.indexOf("statusEl.appendChild(wsSkeleton"),
+    );
+    assert.ok(hover.length > 100, '悬停委托的两个监听器找不到了（结构变了，同步这条闸门）');
+    assert.ok(!hover.includes('ws.taskFlyOn'), '悬停委托还在写外层 ws 单例的开关（浮窗会空转）');
+    assert.ok(hover.includes('state.taskFlyOn = true') && hover.includes('wsRenderTaskFly(state)'),
+      '悬停委托必须落在每工作区 state 上（否则浮窗不渲染）');
+    // 行是 button（可点、键盘可达）；点击钉/取钉走 state.taskFocus 并立即重画。
+    assert.ok(/document\.createElement\('button'\); row\.type = 'button'; row\.className = 'row'/.test(src),
+      '任务行必须是 button（不可点就没有 DAG 聚焦）');
+    assert.ok(src.includes("state.taskFocus = state.taskFocus === taskId ? undefined : taskId"),
+      '点击必须做「再点一次取消」的切换');
+    // 焦点行必须在省略区时被提到可见区（用户点了它，它必须可见）。
+    assert.ok(src.includes('shown = [focusRow, ...tasks.slice(0, ROW_LIMIT - 1)]'),
+      '聚焦行落在 8 条截断区里时没有被前置（焦点可能不可见）');
+    // Esc 撤销次序：放大面板 → 抽屉 → 任务聚焦 → 关工作区。
+    const onKey = src.slice(src.indexOf('const onKey = (event)'), src.indexOf('document.addEventListener(\'keydown\', onKey)'));
+    const drawerAt = onKey.indexOf('wsCloseDrawer(state)')
+    const focusAt = onKey.indexOf('state.taskFocus = undefined')
+    assert.ok(drawerAt > 0 && focusAt > drawerAt, 'Esc 次序错了：聚焦的撤除必须排在抽屉之后、关工作区之前');
+    // 双语字典：新键 zh + en 各一份。
+    for (const key of ['wsReconFocus', 'wsReconDepsTip']) {
+      const dup = src.split(key + ':').length - 1;
+      assert.equal(dup, 2, `${key} 应在 zh/en 两张表各出现一次，实际 ${dup} 次`);
+    }
   });
 
   console.log('');
