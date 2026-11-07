@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2813）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2833）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -1938,6 +1938,33 @@ function functionBodyOf(source, needle) {
       const count = src.split(key + ':').length - 1;
       assert.equal(count, 2, `${key} 应在 zh/en 两张表各出现一次，实际 ${count} 次`);
     }
+  });
+
+  await check('空态骨架三件套：三处加载空窗有骨架占位，加载与「确认空」是两种态（T12 ②）', () => {
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    // 构件必须只有一个来源（三处各画各的 = 下次改动画要改三遍）。
+    assert.ok(/function wsSkeleton\(count, label, row\)/.test(src), '缺 wsSkeleton 构件（骨架没有唯一来源）');
+    // ① 队员列表（画布）：首帧前 wsLoading 从静态文字升级为骨架。
+    assert.ok(src.includes("state.noteEl.appendChild(wsSkeleton(3, wsText('wsLoading')))"),
+      '画布首帧没有骨架占位（还是一片空白或静态文字）');
+    // ② 任务板（底栏槽位）：openWorkspace 就挂骨架，首帧 wsStatusbar 的 textContent='' 自然清掉。
+    assert.ok(src.includes("statusEl.appendChild(wsSkeleton(2, wsText('wsSkelBoard'), true))"),
+      '底栏任务板槽位没有骨架占位');
+    // 首轮读取失败时必须显式清掉底栏骨架（数据没来，骨架不能一直假装在加载）。
+    const cleanup = src.split("state.noteEl.style.display = ''; state.statusEl.textContent = ''").length - 1;
+    assert.equal(cleanup, 2, `wsLoad 两条失败分支都要清底栏骨架，实际 ${cleanup} 处`);
+    // ③ 报告流（抽屉对话）：初始与 renderConvo 的「还在读」分支都是骨架；确认空走空态文案。
+    const convoSkel = src.split("wsSkeleton(3, wsText('wsDrawerConvoLoading'))").length - 1;
+    assert.equal(convoSkel, 2, `抽屉对话骨架应在初始+轮询两处各一份，实际 ${convoSkel}`);
+    assert.ok(src.includes("convoBox.textContent = durableNote !== '' ? durableNote : wsText('wsDrawerConvoEmpty')"),
+      '「确认空」的空态文案丢了（骨架不能吞掉 durableNote）');
+    // 可达性：role=status + aria-label + prefers-reduced-motion 收动画（标杆同款语义）。
+    assert.ok(src.includes("box.setAttribute('role', 'status')"), '骨架缺 role=status（读屏不知道在加载）');
+    assert.ok(/@media \(prefers-reduced-motion: reduce\)\{\.ws-skel i\{animation:none\}\}/.test(src),
+      '骨架动画没有 reduced-motion 退路');
+    // 双语字典：新键 zh + en 各一份。
+    const count = src.split('wsSkelBoard:').length - 1;
+    assert.equal(count, 2, `wsSkelBoard 应在 zh/en 两张表各出现一次，实际 ${count} 次`);
   });
 
   console.log('');
