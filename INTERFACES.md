@@ -156,6 +156,12 @@ export function roleBatchOn(config, role); // -> boolean（**默认 true**：只
                                            //    （原生工具照常直调 + 另加 run_code 程序内批量调用）。声明口
                                            //    ctx.tools.presentAs(mode)（dsh-tools/lib/index.js:2810）；解析口 modeFor
                                            //    :2767-2774「最近的一层赢」；守卫：没有 ptcRuntime 就不声明（:2863-2865 装配期会抛）。
+                                           //    ⚠️ 勘误表第 45 条：0.2.2-rc.1 起 both 档被官方删除，本开关改为直接
+                                           //    决定呈现档——开=挂 ptc executor / 关=挂 native executor。
+export function memberProfile(config, name); // -> {preset, mode:'ptc'|'native'}（T12 ① 节点档分段条的数据源）。
+                                           //    当前配置对 deriveRole(name) 角色的档位组合：preset=undefined 即
+                                           //    「跟随 Lead」；mode 与 applyMemberBatch 的 wantRunCode 同真值来源
+                                           //    （发「配置意图」，实际挂载失败走诊断通道，不设第二份真值）。
 export function resolveMemberRoute(explicitRoute, roleRoute, explicitEffort);
     // -> {provider,model,reasoningEffort?}|undefined；2026-10-01 修复的优先级：显式参数 >
     //    角色配置 > 两者都无(=undefined=跟随 Lead)。钉子**只**由显式参数产生（lib/runtime.js），
@@ -225,7 +231,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2781`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2813`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
@@ -314,6 +320,11 @@ export async function teamGraph(ctx, sessionId);      // 工作区画布数据�
                                             //    服务端拼中文等于把界面语言焊死在宿主半，而知道 active 的只有浏览器。
                                             //    同一理由用在折叠工具组（只发 `count`）与回合结局（只发
                                             //    `reason/message/code`）。判据见 §6:1023「服务端发事实，浏览器拼句子」那条。
+                                            //    每个**队员**节点另带 `profile = {preset, mode}`（T12 ① 节点档分段条；
+                                            //    Lead 不带）。口径 = **当前配置**对 deriveRole(name) 角色的解析
+                                            //    （roster.memberProfile）：preset=undefined 即「跟随 Lead」；
+                                            //    mode ∈ 'ptc'|'native'，与 applyMemberBatch 的 wantRunCode 同真值来源。
+                                            //    发「配置意图」不发「实际挂载结果」：挂载失败走诊断通道，不设第二份真值。
                                             //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
                                             //    返回另带两个**结构化**字段（2026-10-14/15 加的）：
                                             //    `historyRecovered` —— 成员名单是否来自历史恢复。浏览器半原来靠

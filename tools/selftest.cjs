@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2781）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2813）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -1913,6 +1913,31 @@ function functionBodyOf(source, needle) {
     }
     // 摘要截断按码点（Array.from）：裸 slice 劈代理对的教训在 tools.js clipText 记着。
     assert.ok(src.includes("Array.from(ev.last.summary).slice(0, 60)"), '报告摘要截断没有按码点（会劈碎 emoji）');
+  });
+
+  await check('节点档分段条：profile 从配置解析、随画布下发、建卡与就地刷新同一份映射（T12 ①）', () => {
+    const rosterSrc = readFileSync(path.join(PLUGIN_DIR, 'lib', 'roster.js'), 'utf8');
+    // 服务端口径：预设/呈现档都从 roster 的既有真值函数出（roleBatchOn 与 applyMemberBatch
+    // 的 wantRunCode 同源），不许在 runtime/graph 里另写一份解析。
+    assert.ok(/export function memberProfile\(/.test(rosterSrc), 'roster.js 缺 memberProfile（档位组合没有服务端真值）');
+    const gsrc = readFileSync(path.join(PLUGIN_DIR, 'lib', 'graph.js'), 'utf8');
+    assert.ok(gsrc.includes('profileOf'), 'collectGraph/buildGraph 没接 profileOf（节点永远不带 profile）');
+    assert.ok(gsrc.includes('profile: meta?.profile'), 'nodeOf 没把 profile 放进节点（画布拿不到档位）');
+    const rsrc = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    assert.ok(rsrc.includes('memberProfile(config, name)'), 'teamGraph 没把配置解析成 profileOf（分段条恒缺省）');
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    // 建卡与刷新必须共用同一份色类映射与说明（抄两份迟早漂移——wsRing 的教训）。
+    assert.ok(/function wsProfPresetClass\(/.test(src), '缺 wsProfPresetClass（色类映射没有唯一来源）');
+    assert.ok(/function wsProfTip\(/.test(src), '缺 wsProfTip（说明没有唯一来源）');
+    const uses = (src.match(/wsProfPresetClass\(/gu) ?? []).length;
+    assert.ok(uses >= 2, `wsProfPresetClass 只被引用 ${uses} 次：建卡与就地刷新必须都走它`);
+    // 指纹要含 profile：配置热改后即使图数据零变化也要重绘（不然色段停在旧配置）。
+    assert.ok(/n\.profile\?\.preset/.test(src), 'wsFingerprint 没算 profile：配置热改后分段条不刷新');
+    // 双语字典：新键 zh + en 各一份。
+    for (const key of ['wsProfLabel', 'wsProfTip', 'wsProfInherit', 'wsProfModePtc', 'wsProfModeNative']) {
+      const count = src.split(key + ':').length - 1;
+      assert.equal(count, 2, `${key} 应在 zh/en 两张表各出现一次，实际 ${count} 次`);
+    }
   });
 
   console.log('');
