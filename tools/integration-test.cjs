@@ -4406,6 +4406,29 @@ async function main() {
       return true;
     });
 
+    // 2026-11-07 T9-5 实机（Lead 建议）：TEAM_PROVISIONING_CONFLICT 的官方文案
+    // （"initial prompt was not durably accepted"）字面意思误导排查——真实根因是
+    // 显式 reasoning_effort 与步进准备固定档冲突。插件必须把它翻译成带具体档位的
+    // 可执行提示，否则下一个会话还会为它浪费一轮。
+    const effortConflictError = new Error('agent/request proposed reasoning effort "low" after step preparation fixed "max"; initial prompt was not durably accepted');
+    effortConflictError.code = 'TEAM_PROVISIONING_CONFLICT';
+    try {
+      await spawnWithFailure(effortConflictError, []).execute(
+        { role: 'builder', name: 'builder-2', description: 'x', prompt: 'y', reasoning_effort: 'low' },
+        { agent: caller },
+      );
+      check('spawn_teammate：思考强度冲突被翻译成可执行提示（TEAM_PROVISIONING_CONFLICT）', () => '显式 low 冲突竟然派出去了');
+    } catch (error) {
+      check('spawn_teammate：思考强度冲突被翻译成可执行提示（TEAM_PROVISIONING_CONFLICT）', () => {
+        if (error instanceof ReferenceError) return `翻译路径抛了 ReferenceError：${error.message}`;
+        if (!error.message.includes('思考强度冲突')) return `没翻译：${error.message}`;
+        if (!error.message.includes('"low"') || !error.message.includes('"max"')) return `没提取具体档位：${error.message}`;
+        if (!error.message.includes('误导性文案')) return '没说明官方报错的误导性';
+        if (!error.message.includes('改成 "max"') || !error.message.includes('继承 Lead 当前档')) return `没给出两个修法：${error.message}`;
+        return true;
+      });
+    }
+
     // 用户实测的两个报错：name "scout-core" / name "scout-validate" 不是合法的队员名。
     // 这里走**真工具**执行路径，证明它们现在能一路走到 spawnTeammate（旧实现全在插件层被拒）。
     const accepted = [];
