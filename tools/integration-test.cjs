@@ -4190,6 +4190,80 @@ async function main() {
     ));
   })();
 
+  // ── 8.3b) wake_teammate 催办守卫（2026-11-07 T10 ③）：防催办刷屏 ──────────────────
+  // 场景（session-00001000 的变体）：Lead 对同一个停更队员连发 wake，队员邮箱被同一条
+  // 续写指令刷屏、每个 wake 都可能烧一轮新 turn。守卫两闸：冷却内拒绝重复（带 note 的
+  // 指令变更放行）+ 前查报告（刚交付的队员提醒 Lead「它可能在等你验收」，不拦）。
+  // 冷却账本挂在 teamToolDefinitions 闭包里（= 每个工具面实例一份），所以这里的
+  // 替身实例与上面 8.3 的互不污染，测试顺序无关。
+  await (async () => {
+    const sent = [];
+    const guardTeams = {
+      listMembers: () => [
+        { id: 'scout-agent', name: 'scout', role: 'teammate', status: 'inactive' },
+        { id: 'lead-agent', name: 'lead', role: 'lead', status: 'inactive' },
+      ],
+      sendMessage: async (caller, request) => {
+        sent.push(request);
+        return { messageId: `g-${sent.length}`, status: 'accepted' };
+      },
+    };
+    const guardRuntime = {
+      recentReports: () => ({
+        items: [
+          { at: new Date(Date.now() - 30_000).toISOString(), name: 'scout', taskId: 't1', status: 'completed', delivered: true, summary: '交付完成' },
+        ],
+        dropped: 0,
+        cap: 20,
+      }),
+    };
+    const guardDefs = toolsModule.teamToolDefinitions({ runtime: guardRuntime, agentTeams: guardTeams, include: roster.LEAD_TEAM_TOOL_NAMES });
+    const guardWake = new Map(guardDefs.map((definition) => [definition.name, definition])).get(roster.WAKE_TOOL_NAME);
+    const caller = { id: 'lead-agent', name: 'lead' };
+
+    const first = await guardWake.execute({ target: 'scout' }, { agent: caller });
+    check('催办守卫：wake 前查报告——刚交付的队员被提醒（只提醒不拦，wake 是 Lead 的决定）', () => {
+      if (first?.status !== 'accepted') return JSON.stringify(first);
+      if (!Array.isArray(first.diagnostics) || first.diagnostics.length !== 1) return `缺前查提醒：${JSON.stringify(first)}`;
+      const reminder = first.diagnostics[0];
+      for (const marker of ['30 秒前', 'completed', '验收']) {
+        if (!reminder.includes(marker)) return `提醒缺「${marker}」：${reminder}`;
+      }
+      return true;
+    });
+
+    let blocked = '';
+    try {
+      await guardWake.execute({ target: 'scout' }, { agent: caller });
+    } catch (error) {
+      blocked = String(error?.message ?? error);
+    }
+    check('催办守卫：冷却期内无新增指令的重复 wake 不投递（拒绝带可执行指引）', () => {
+      if (!blocked.includes('防刷屏守卫')) return `没被守卫拦住：${blocked || '(没有报错)'}`;
+      if (sent.length !== 1) return `守卫拒绝后竟又投了 ${sent.length - 1} 条`;
+      for (const marker of ['list_agents', 'note', 'send_message']) {
+        if (!blocked.includes(marker)) return `指引缺「${marker}」：${blocked}`;
+      }
+      return true;
+    });
+
+    const withNote = await guardWake.execute({ target: 'scout', note: '改指令：只补 §3' }, { agent: caller });
+    check('催办守卫：带 note 的 wake 是指令变更，不受冷却限制（deepseek enqueue 替换载荷语义）', () => {
+      if (withNote?.status !== 'accepted') return JSON.stringify(withNote);
+      if (sent.length !== 2) return `note wake 没有真投递（sent=${sent.length}）`;
+      if (sent[1].content[0].text.includes('只补 §3') === false) return 'note 没进投递正文';
+      return true;
+    });
+
+    const clean = await guardWake.execute({ target: 'lead' }, { agent: caller });
+    check('催办守卫：目标没有近期报告时不给提醒（不编造提醒）', () => {
+      if (clean?.status !== 'accepted') return JSON.stringify(clean);
+      if (clean.diagnostics !== undefined) return `不该有提醒：${JSON.stringify(clean.diagnostics)}`;
+      return true;
+    });
+  })();
+
+  // ── 8.4) 队员模型：**只有显式 spawn 参数**才钉住；角色配置留给运行期实时读 ──────────────────
   // ── 8.4) 队员模型：**只有显式 spawn 参数**才钉住；角色配置留给运行期实时读 ──────────────────
   // 2026-10-01 用户报的 bug：把角色改回「跟随 Lead」后，已经在跑的队员仍然用旧模型。
   // 根因：spawn_teammate 把**角色配置解析出来的路由**也钉进了 runtime 的 spawnRoutes，
