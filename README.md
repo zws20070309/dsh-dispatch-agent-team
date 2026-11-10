@@ -315,7 +315,13 @@ node tools/session-probe.cjs --tools --session <会话子串>   # 会话里团�
 node tools/asar-probe.cjs --grep "<字符串>" --list "dsh-llm/lib"  # 官方安装包里到底有没有这个东西
 node tools/cache-prefix-audit.cjs                          # 缓存命中率：实读 + 前缀复用模型
 node tools/cache-prefix-audit.cjs --all --tail 200          # 连非本插件的会话一起看
+node tools/ops-mount-check.mjs                             # dsh-ops 四组件挂载（不用重启）
 ```
+
+**要用真实会话验收？** 上面这些是"机器能自己跑的体检"，证明"代码没坏"；
+它们**不能**证明"换个真实会话还能用"。后者看 [`VERIFY.md`](./VERIFY.md)：
+它写了必须重启什么、两档工具面各是什么、一段覆盖全部关键路径的验收提示词、
+以及每条通过/失败分别意味着什么。
 
 ### 改动后的生效方式
 
@@ -378,11 +384,11 @@ node tools/install.cjs --uninstall          # 推荐：走官方 CLI（先退出
 
 ## 开发者文档
 
-实现契约、精确的 API 签名与官方行为实测记录（`agent/request` waterfall 形状、
-`ctx.webServer.register`、`plugins.bundle.config` 槽位契约、以及一份逐条标注
-「原文哪里错了」的勘误表）都在 [`INTERFACES.md`](./INTERFACES.md)。
-
-**改这个插件之前先读它。**
+| 文件 | 什么时候读 |
+|---|---|
+| [`INTERFACES.md`](./INTERFACES.md) | **改代码之前必读**。实现契约、精确 API 签名、官方行为实测记录（`agent/request` waterfall 形状、`ctx.webServer.register`、`plugins.bundle.config` 槽位契约），以及一份逐条标注「原文哪里错了」的勘误表 |
+| [`VERIFY.md`](./VERIFY.md) | **改完之后怎么证明它真的能用**。先决条件（含"必须重启"）、两档工具面、验收提示词、判过标准 |
+| [`INCIDENT-2026-10-09-managed-block.md`](./INCIDENT-2026-10-09-managed-block.md) | 遇到「Team 暂不可用」或 `tool "x" is already registered` 时读。一次真实事故的完整因果链与修法 |
 
 ---
 

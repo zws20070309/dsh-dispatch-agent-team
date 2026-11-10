@@ -113,6 +113,7 @@ const FILES = [
   'README.md',
   'INTERFACES.md',
   'INCIDENT-2026-10-09-managed-block.md',
+  'VERIFY.md',
 ];
 
 function main() {

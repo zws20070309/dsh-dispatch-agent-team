@@ -45,3 +45,6 @@ MAINTAINER-NOTES.md
 # 本地调试/回放用的临时副本（profile 内容是**用户本机数据 + 真实路径**，绝不能进仓库）
 /tmp-*.yml
 /tmp-*.yaml
+
+# zcode 工作流运行缓存（本地工具产生，含一次性 run id，不属于源码）
+/.zcode/
