@@ -1283,32 +1283,66 @@ function functionBodyOf(source, needle) {
   // 「工具本身坏了」。
   //
   // 静态 grep 抓不到这种错（schema 与 execute 都是"看起来对"的）。这里做**行为级**校验：
-  // 拿真的工具定义，喂一个**只回 { messageId } 的官方形状替身**，再把返回值按
-  // output.schema 逐键核对 required / additionalProperties。官方回包形状将来再变，
-  // 这条会先红。
-  await check('工具返回值与自己声明的 output.schema 相容（send_message / wake_teammate / broadcast 的 P0 闸门）', async () => {
+  // 拿真的工具定义，喂**官方真实形状**的替身，再把返回值按 output.schema 逐键核对
+  // required / additionalProperties / enum。官方回包形状将来再变，这条会先红。
+  //
+  // ⚠️ 覆盖范围是**全部 15 个工具**，不是只测出过事的那三个：同一类错在
+  // team_task_get / team_task_list（官方 task-view 视图）上同样可能发生 ——
+  // 只盯着"已经坏过的"就等于等下一次事故。
+  await check('全部工具返回值与自己声明的 output.schema 相容（schema 漂移的永久闸门）', async () => {
     const toolsMod = await load('tools.js');
-    // 最小官方替身：形状照抄装机 dsh-experimental-agent-team 的 sendAdmitted —— **只有 messageId**。
-    const minimal = { messageId: 'team-message-xyz' };
-    const agentTeams = {
-      listMembers: () => [
-        { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
-        { id: 'scout-1', name: 'scout', role: 'teammate', status: 'running', diagnostics: [] },
-      ],
-      listTasks: () => [],
-      sendMessage: async () => minimal,
-      waitForChange: async () => ({ timedOut: true }),
-      listMembersForWait: () => [],
+    // 官方真实形状（逐字抄装机源码，不是我们希望的形状）：
+    //   · sendAdmitted  -> { messageId }（**没有 status**）
+    //   · task-view     -> projectTaskView 的 10 个键，writeScopeWarnings 恒为数组
+    //   · listTasks     -> projectTaskView 数组
+    //   · interrupt     -> { previousStatus }（不是裸字符串 —— 我第一版替身就写错了）
+    //   · waitForChange -> { timedOut: boolean }（noProgress 只在快捷路径出现）
+    const taskView = {
+      id: 'task-1', revision: 1, subject: 's', description: 'd', status: 'pending',
+      blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [],
     };
-    const defs = toolsMod.teamToolDefinitions({ runtime: undefined, agentTeams, config: undefined });
+    const members = [
+      { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'scout-1', name: 'scout', role: 'teammate', status: 'running', diagnostics: [] },
+    ];
+    const agentTeams = {
+      listMembers: () => members,
+      listTasks: () => [taskView],
+      getTask: async () => taskView,
+      createTask: async () => taskView,
+      updateTask: async () => taskView,
+      sendMessage: async () => ({ messageId: 'team-message-xyz' }),
+      waitForChange: async () => ({ timedOut: true }),
+      // 官方 roster.interrupt 返回 { previousStatus }（装机 roster.js:7336-7350 逐字核对：
+      // 活体 -> {previousStatus: availability(live)}，已死 -> {previousStatus:'inactive'}）。
+      interrupt: () => ({ previousStatus: 'running' }),
+    };
+    const runtime = {
+      enable: async () => ({ ok: true, diagnostics: [] }),
+      disable: async () => ({ ok: true, diagnostics: [], wasEnabled: true }),
+    };
+    const defs = toolsMod.teamToolDefinitions({ runtime, agentTeams, config: undefined });
     const byName = new Map(defs.map((d) => [d.name, d]));
     const exec = { agent: { id: 'lead-1' }, signal: new AbortController().signal };
-    // 按 output.schema 校验：required 必须在、additionalProperties:false 时不许有多余键。
     const conform = (schema, value, path) => {
       if (schema === null || typeof schema !== 'object') return;
       if (schema.type === 'object') {
         if (value === null || typeof value !== 'object') throw new Error(path + ' 不是对象');
         const props = schema.properties ?? {};
+        // ⚠️ **必须读 JSON-Schema 规范的 `required` 数组**，不能读每个属性上的
+        // `required: true`。
+        // 本项目的源码里写的是后者（{type:'string', required:true}），但 `defineTool`
+        // 在注册时会把 int 规范成 `required: ['accepted', ...]` 放在对象上、并从属性上删掉它
+        // （实测：send_message 规范化后 properties.accepted 里已经没有 required 字段，
+        //  对象上多了一个 required:['accepted']）。
+        // 我第一版闸门读的是属性上的布尔值 → **所有工具都读到 0 个 required**
+        // → 变异测试（给 schema 加一个官方永远不返回的 required 键）竟然 PASS。
+        // 宿主校验读的是**规范化后**的这份，所以闸门也必须读它，否则测的不是同一件事。
+        const requiredList = Array.isArray(schema.required) ? schema.required : [];
+        for (const key of requiredList) {
+          if (!(key in value)) throw new Error(path + ' 缺 required 键 ' + key);
+        }
+        // 兼容源码形态（属性上 required:true）——两份都认，任何一份声明了就必须在。
         for (const key of Object.keys(props)) {
           if (props[key].required === true && !(key in value)) throw new Error(path + ' 缺 required 键 ' + key);
         }
@@ -1327,19 +1361,39 @@ function functionBodyOf(source, needle) {
       }
       if (Array.isArray(schema.enum) && !schema.enum.includes(value)) throw new Error(path + ' 不在 enum 内：' + String(value));
     };
-    const run = async (name, args) => {
+    // 每个工具都给一份**最小合法参数**，真跑它的 execute 再校验返回值。
+    const calls = [
+      ['send_message', { target: 'scout', message: 'x' }],
+      // 带 note = 指令变更，不受防刷屏冷却限制（上面刚投过一次，不带 note 会被正确拒绝）。
+      ['wake_teammate', { target: 'scout', note: '只补 §3' }],
+      ['broadcast_message', { message: 'x', targets: ['scout'] }],
+      ['list_agents', {}],
+      ['wait_agent', {}],
+      ['interrupt_agent', { target: 'scout' }],
+      ['team_task_create', { subject: 's', description: 'd' }],
+      ['team_task_list', {}],
+      ['team_task_get', { task_id: 'task-1' }],
+      ['team_task_update', { task_id: 'task-1', expected_revision: 1, action: 'claim' }],
+    ];
+    // 契约断言先跑：wake_teammate 有「90 秒内重复 wake 无 note 就拒绝」的防刷屏守卫，
+    // 放在 calls 循环之后会被自己刚投递的那一次挡住（守卫是对的，是测试顺序错了）。
+    const sentFirst = await byName.get('send_message').execute({ target: 'scout', message: 'x' }, exec);
+    assert.equal(sentFirst.accepted, true, 'send_message 必须回报 accepted=true（官方只给 messageId，不能因此判失败）');
+    assert.equal(sentFirst.messageId, 'team-message-xyz', 'send_message 应带上官方回执 id');
+    const wokeFirst = await byName.get('wake_teammate').execute({ target: 'scout' }, exec);
+    assert.equal(wokeFirst.accepted, true, 'wake_teammate 同样要 accepted=true');
+    const problems = [];
+    for (const [name, args] of calls) {
       const def = byName.get(name);
-      assert.ok(def !== undefined, '找不到工具 ' + name);
-      const value = await def.execute(args, exec);
-      conform(def.output.schema, value, name);
-      return value;
-    };
-    const sent = await run('send_message', { target: 'scout', message: 'x' });
-    assert.equal(sent.accepted, true, 'send_message 必须回报 accepted=true（官方只给 messageId，不能因此判失败）');
-    assert.equal(sent.messageId, 'team-message-xyz', 'send_message 应带上官方回执 id');
-    const woke = await run('wake_teammate', { target: 'scout' }, exec);
-    assert.equal(woke.accepted, true, 'wake_teammate 同样要 accepted=true');
-    await run('broadcast_message', { message: 'x', targets: ['scout'] });
+      if (def === undefined) { problems.push(name + ' 不存在'); continue; }
+      try {
+        const value = await def.execute(args, exec);
+        conform(def.output.schema, value, name);
+      } catch (error) {
+        problems.push(name + '：' + String(error?.message ?? error).slice(0, 160));
+      }
+    }
+    assert.equal(problems.length, 0, '返回值与声明的 schema 不相容：' + problems.join('；'));
   });
 
   await check('队员/Lead 提示词的**关键细节**不许再被压缩删掉（2026-10-09 压缩事故的永久闸门）', () => {
