@@ -1322,7 +1322,7 @@ function functionBodyOf(source, needle) {
         name + ' 的报错泄漏了内部 TypeError（模型会拿它当"插件坏了"）：' + msg);
       // 断言「有没有候选名」这件事，不钉措辞：措辞会随文案调整（本轮就从「例如」改成了「：」），
       // 钉死字面会把"改文案"这种无害改动判成回归。真正要保住的是"必须有候选名可照着改"。
-      assert.ok(/可以用的名字/.test(msg), name + ' 的报错没给出可用候选名：' + msg);
+      assert.ok(/就能用的名字/.test(msg), name + ' 的报错没给出可用候选名：' + msg);
       messages.push(msg);
     }
     // 候选名必须来自**真实在册名单**：builder 与 builder-2 都已被占，所以应给出 builder-3。
@@ -1333,7 +1333,10 @@ function functionBodyOf(source, needle) {
     // 同一句话里两个一模一样的候选，模型会以为有两个选择 —— 纯误导）。
     // 根因：nextTeammateName 在 role 空闲时**本来就返回 role 本身**，
     // 我却又在"role 没被占用"的分支上补了一个 、"role"，同一值出现两次。
-    const candidateLine = messages[0].split('\n').find((line) => line.includes('可以用的名字')) || '';
+    // 只取「现在就能用的名字**之后**」的那一段：前面 `role 是 "builder"` 里的 builder
+    // 是角色名本身、不是候选（把整行拿去解析会把角色名误当候选）。
+    const candidateSource = messages[0].split('\n').find((line) => line.includes('就能用的名字')) || '';
+    const candidateLine = candidateSource.slice(candidateSource.indexOf('就能用的名字'));
     const quoted = [...candidateLine.matchAll(/"([^"]+)"/gu)].map((match) => match[1]);
     assert.ok(quoted.length >= 1, '候选名行里一个名字都没有：' + candidateLine);
     assert.equal(new Set(quoted).size, quoted.length, '候选名有重复（模型会以为有两个不同选择）：' + candidateLine);
@@ -1365,13 +1368,23 @@ function functionBodyOf(source, needle) {
     } catch (error) {
       histMsg = String(error && error.message ? error.message : error);
     }
-        const histLine = histMsg.split('\n').find((line) => line.includes('可以用的名字')) || '';
+        const histLine = histMsg.split('\n').find((line) => line.includes('就能用的名字')) || '';
     // 只看**候选段**（"可以用的名字"之后的部分）：前面 `role 是 "builder"` 里的 builder
     // 是角色名本身，不是候选 —— 把整行拿去匹配会把正确输出判成错误（我第一版就是这么错的）。
-    const histCandidates = histLine.slice(histLine.indexOf('可以用的名字'));
-    assert.ok(!/"builder"/.test(histCandidates),
-      '候选名撞上了**历史**占用名 builder（活体名单里没有，但官方永不复用）：' + histCandidates);
-    assert.ok(histCandidates.includes('builder-3'), '历史感知后应给出 builder-3：' + histCandidates);
+    const histCandidates = histLine.slice(histLine.indexOf('就能用的名字'));
+    // ⚠️ 断言必须逐个检查「每个候选都真的空闲」，不能只检查"包含 builder-3"。
+    // 变异测试抓到过：把 firstChoice 硬写成 `role + '-2'`（= builder-2，已在册），
+    // 候选变成 ['builder-2','builder-3'] —— 'builder-3' 仍在里面，旧断言照样绿。
+    // 但那个输出会让模型照着 builder-2 改，然后必然再被官方拒一次（真机 seq=405 就是这种自相矛盾）。
+    const histQuoted = [...histCandidates.matchAll(/"([^"]+)"/gu)].map((match) => match[1]);
+    const histTaken = ['builder', 'builder-2'];
+    assert.ok(histQuoted.length > 0, '候选段里一个名字都没有：' + histCandidates);
+    const histBlocked = histQuoted.filter((item) => histTaken.includes(item));
+    assert.equal(histBlocked.length, 0,
+      '候选里出现了**已被占用**的名字（模型照做会再失败一次）：' + histBlocked.join('、') + ' / 全部候选 ' + JSON.stringify(histQuoted));
+    // 同时要求它给出的是**下一个真正空闲的**名字（builder 与 builder-2 都被占 -> builder-3）。
+    assert.ok(histQuoted.includes('builder-3'), '历史感知后应给出 builder-3：' + JSON.stringify(histQuoted));
+    assert.equal(new Set(histQuoted).size, histQuoted.length, '候选名有重复：' + JSON.stringify(histQuoted));
   });
 
   await check('写域护栏：目录级写域与真撞车分别给出正确提醒（用户截图 141818 的红字来源）', async () => {
