@@ -37,3 +37,6 @@ DSH 的 host 进程非提升运行 → restore **恒失败**（exit 1300，与 S
   `execFile("icacls.exe", [target, "/inheritance:r", "/grant:r", ...plan.grant], {stdio:"pipe", windowsHide:true})`
   （target = resolve(path)，即 spine 目录本身；不再需要临时 acl 文件）。
 - 已同步向上游报告的建议：非提升环境应探测特权可用性后降级到 grant 路径。
+  上报正文见同目录 [`dsh-live-compact-issue-body.md`](./dsh-live-compact-issue-body.md)：
+  环境版本、完整 crash log、三种 SDDL 变体全部 exit 1300 的排除实验、以及本机已验证的修法。
+  那份是**可直接提交给上游**的独立文本，不含本仓库信息。
