@@ -1274,6 +1274,74 @@ function functionBodyOf(source, needle) {
     assert.ok(safeTasksBlock.includes("return Array.isArray(rows) ? rows : []"), 'listTasks 返回非数组时也要退化成空表');
   });
 
+  // ── 工具返回值必须与自己声明的 output.schema 相容（2026-11-10 P0 的永久闸门）──────────
+  //
+  // 事故：官方 sendAdmitted 只回 { messageId }（没有 status），而 SEND_VALUE_SCHEMA 把
+  // status 声明成 required 并原样透传官方回包 → 宿主按 schema 校验 → **每一次成功投递
+  // 都被判成失败**，模型看到 "missing required property \"value.status\""。
+  // 真机会话 session-00933fdf 里这条报错出现 12 次，Lead 被迫改用 broadcast 并误判
+  // 「工具本身坏了」。
+  //
+  // 静态 grep 抓不到这种错（schema 与 execute 都是"看起来对"的）。这里做**行为级**校验：
+  // 拿真的工具定义，喂一个**只回 { messageId } 的官方形状替身**，再把返回值按
+  // output.schema 逐键核对 required / additionalProperties。官方回包形状将来再变，
+  // 这条会先红。
+  await check('工具返回值与自己声明的 output.schema 相容（send_message / wake_teammate / broadcast 的 P0 闸门）', async () => {
+    const toolsMod = await load('tools.js');
+    // 最小官方替身：形状照抄装机 dsh-experimental-agent-team 的 sendAdmitted —— **只有 messageId**。
+    const minimal = { messageId: 'team-message-xyz' };
+    const agentTeams = {
+      listMembers: () => [
+        { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+        { id: 'scout-1', name: 'scout', role: 'teammate', status: 'running', diagnostics: [] },
+      ],
+      listTasks: () => [],
+      sendMessage: async () => minimal,
+      waitForChange: async () => ({ timedOut: true }),
+      listMembersForWait: () => [],
+    };
+    const defs = toolsMod.teamToolDefinitions({ runtime: undefined, agentTeams, config: undefined });
+    const byName = new Map(defs.map((d) => [d.name, d]));
+    const exec = { agent: { id: 'lead-1' }, signal: new AbortController().signal };
+    // 按 output.schema 校验：required 必须在、additionalProperties:false 时不许有多余键。
+    const conform = (schema, value, path) => {
+      if (schema === null || typeof schema !== 'object') return;
+      if (schema.type === 'object') {
+        if (value === null || typeof value !== 'object') throw new Error(path + ' 不是对象');
+        const props = schema.properties ?? {};
+        for (const key of Object.keys(props)) {
+          if (props[key].required === true && !(key in value)) throw new Error(path + ' 缺 required 键 ' + key);
+        }
+        if (schema.additionalProperties === false) {
+          for (const key of Object.keys(value)) {
+            if (!(key in props)) throw new Error(path + ' 出现 schema 未声明的键 ' + key);
+          }
+        }
+        for (const key of Object.keys(value)) if (key in props) conform(props[key], value[key], path + '.' + key);
+        return;
+      }
+      if (schema.type === 'array') {
+        if (!Array.isArray(value)) throw new Error(path + ' 不是数组');
+        value.forEach((item, i) => conform(schema.items, item, path + '[' + i + ']'));
+        return;
+      }
+      if (Array.isArray(schema.enum) && !schema.enum.includes(value)) throw new Error(path + ' 不在 enum 内：' + String(value));
+    };
+    const run = async (name, args) => {
+      const def = byName.get(name);
+      assert.ok(def !== undefined, '找不到工具 ' + name);
+      const value = await def.execute(args, exec);
+      conform(def.output.schema, value, name);
+      return value;
+    };
+    const sent = await run('send_message', { target: 'scout', message: 'x' });
+    assert.equal(sent.accepted, true, 'send_message 必须回报 accepted=true（官方只给 messageId，不能因此判失败）');
+    assert.equal(sent.messageId, 'team-message-xyz', 'send_message 应带上官方回执 id');
+    const woke = await run('wake_teammate', { target: 'scout' }, exec);
+    assert.equal(woke.accepted, true, 'wake_teammate 同样要 accepted=true');
+    await run('broadcast_message', { message: 'x', targets: ['scout'] });
+  });
+
   await check('队员/Lead 提示词的**关键细节**不许再被压缩删掉（2026-10-09 压缩事故的永久闸门）', () => {
     // 事故经过：为把 TEAMMATE_CARD 压回 1150，我删掉了一批**信息**（不是冗余），
     // 事后逐字 diff 才发现。这些点各自都有真实用途，逐条钉住：
@@ -1807,9 +1875,12 @@ function functionBodyOf(source, needle) {
     // 2026-10-14 契约变更：服务端发**结构化**归属清单，句子由客户端拼（语言在浏览器）。
     // 所以这里钉的是「两处都调 wsTaskTip(…) 且都带上 node.name」——
     // 名字不传，标题行就成了「任务板：2 条归 」（官方 ownerName 只到服务端那一层）。
-    assert.ok(src.includes('el.title = wsTaskTip(node.taskTip, node.name)'),
+    // 2026-11-10：调用从两参变三参（第三个是角色 id —— 角色从标题行挪进了 tooltip）。
+    // 断言写成「以 wsTaskTip(node.taskTip, node.name 开头」而不是钉死整行：
+    // 钉死整行会让「多传一个有意义的参数」这种改动撞红闸门（本轮就撞了一次）。
+    assert.ok(/el\.title = wsTaskTip\(node\.taskTip, node\.name/.test(src),
       'wsNodeCard 不再把任务归属挂到卡片 tooltip（新卡片悬停看不到）');
-    assert.ok(src.includes('const tip = wsTaskTip(node.taskTip, node.name)')
+    assert.ok(/const tip = wsTaskTip\(node\.taskTip, node\.name/.test(src)
       && src.includes('if (el.title !== tip) el.title = tip'),
       'wsUpdateCard 不刷新 tooltip（claim / complete 之后要重开卡片才更新）');
     const tipFn = src.slice(src.indexOf('function wsTaskTip('), src.indexOf('function wsNodeCard('));
@@ -1961,8 +2032,12 @@ function functionBodyOf(source, needle) {
     assert.equal(cleanup, 2, `wsLoad 两条失败分支都要清底栏骨架，实际 ${cleanup} 处`);
     // 首轮失败还必须给出自助出路（2026-11-10 用户截图「读取失败：请求超时」后无处可点）。
     assert.ok(src.includes('function wsErrorBlock('), '首轮失败没有可点的重试块');
-    assert.equal(src.split('state.noteEl.appendChild(wsErrorBlock(state))').length - 1, 2,
-      'wsLoad 两条失败分支都要挂重试块');
+    // 至少两条失败分支要挂（现在有三处：请求失败、形状漂移、看门狗判卡死）。
+    // 用 >= 而不是 ==：这里断言的是「每条首轮失败路径都有出路」，
+    // 钉死具体条数会让「多加一条更完备的失败分支」这种正确改动撞红闸门
+    // （2026-11-10 加看门狗时就撞了一次）。
+    assert.ok(src.split('state.noteEl.appendChild(wsErrorBlock(state))').length - 1 >= 2,
+      'wsLoad 的失败分支必须挂重试块');
     // ③ 报告流（抽屉对话）：初始与 renderConvo 的「还在读」分支都是骨架；确认空走空态文案。
     const convoSkel = src.split("wsSkeleton(3, wsText('wsDrawerConvoLoading'))").length - 1;
     assert.equal(convoSkel, 2, `抽屉对话骨架应在初始+轮询两处各一份，实际 ${convoSkel}`);

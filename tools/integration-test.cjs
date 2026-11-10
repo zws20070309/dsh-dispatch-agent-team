@@ -2718,7 +2718,7 @@ async function main() {
     );
     check('broadcast_message：显式目标生效，找不到的如实报原因（不静默丢）', () => {
       if (res2.sent.length !== 1 || res2.sent[0].target !== 'scout') return JSON.stringify(res2.sent);
-      if (res2.sent[0].status !== 'accepted') return JSON.stringify(res2.sent[0]);
+      if (res2.sent[0].accepted !== true) return JSON.stringify(res2.sent[0]);
       if (!res2.skipped.some((item) => item.target === 'ghost-404')) return JSON.stringify(res2.skipped);
       if (sentMessages.length !== 1) return `sendMessage 次数=${sentMessages.length}`;
       if (sentMessages[0].request.target !== 'scout') return `target=${sentMessages[0].request.target}`;
@@ -4153,7 +4153,7 @@ async function main() {
     const caller = { id: 'lead-agent', name: 'lead' };
     const wakeResult = await wakeDefinition.execute({ agent_id: 'scout-agent' }, { agent: caller });
     check('wake_teammate：agent_id 写法被翻成队员名，正文是固定的续写指令（不许重头再来）', () => {
-      if (wakeResult?.status !== 'accepted') return JSON.stringify(wakeResult);
+      if (wakeResult?.accepted !== true) return JSON.stringify(wakeResult);
       const request = aliasSent[aliasSent.length - 1];
       if (request.target !== 'scout') return `target=${String(request.target)}（应把 agent id 翻译成队员名）`;
       const text = request.content[0].text;
@@ -4223,7 +4223,7 @@ async function main() {
 
     const first = await guardWake.execute({ target: 'scout' }, { agent: caller });
     check('催办守卫：wake 前查报告——刚交付的队员被提醒（只提醒不拦，wake 是 Lead 的决定）', () => {
-      if (first?.status !== 'accepted') return JSON.stringify(first);
+      if (first?.accepted !== true) return JSON.stringify(first);
       if (!Array.isArray(first.diagnostics) || first.diagnostics.length !== 1) return `缺前查提醒：${JSON.stringify(first)}`;
       const reminder = first.diagnostics[0];
       for (const marker of ['30 秒前', 'completed', '验收']) {
@@ -4249,7 +4249,7 @@ async function main() {
 
     const withNote = await guardWake.execute({ target: 'scout', note: '改指令：只补 §3' }, { agent: caller });
     check('催办守卫：带 note 的 wake 是指令变更，不受冷却限制（deepseek enqueue 替换载荷语义）', () => {
-      if (withNote?.status !== 'accepted') return JSON.stringify(withNote);
+      if (withNote?.accepted !== true) return JSON.stringify(withNote);
       if (sent.length !== 2) return `note wake 没有真投递（sent=${sent.length}）`;
       if (sent[1].content[0].text.includes('只补 §3') === false) return 'note 没进投递正文';
       return true;
@@ -4257,7 +4257,7 @@ async function main() {
 
     const clean = await guardWake.execute({ target: 'lead' }, { agent: caller });
     check('催办守卫：目标没有近期报告时不给提醒（不编造提醒）', () => {
-      if (clean?.status !== 'accepted') return JSON.stringify(clean);
+      if (clean?.accepted !== true) return JSON.stringify(clean);
       if (clean.diagnostics !== undefined) return `不该有提醒：${JSON.stringify(clean.diagnostics)}`;
       return true;
     });
