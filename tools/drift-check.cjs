@@ -765,6 +765,96 @@ function resolveOpsNameList(root, name) {
   return null;
 }
 
+/**
+ * 在 dsh-ops 的整棵 lib/ 里找出**每一个**「呈现档判定点」。
+ *
+ * 为什么按内容找而不是按路径读：0.5.2 把实现从 lib/ptc/index.js 搬到了
+ * lib/publication/presentation.js，旧判据（读固定路径）当场假红。内容在哪，判据就在哪。
+ *
+ * 为什么返回**每一处**而不是每个文件：0.5.2 里同一个判定有 4 份拷贝
+ * （publication/presentation.js、publication/ptc.js、publication/result-admission.js、
+ * integration/diagnostics.js）。只核一处等于没核 —— 改掉其中一处，其余三处照样让判据变绿。
+ * 变异测试（把 === 1 改成 >= 1 / 把 run_code 改名 / 去掉段非空）三发三中全绿，
+ * 就是被「任意一处合规即 PASS」这个写法打穿的。
+ */
+function findPtcGateSites(opsRoot) {
+  const libDir = path.join(opsRoot, 'lib');
+  if (!fs.existsSync(libDir)) return [];
+  const sites = [];
+  const walk = (dir) => {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+        walk(abs);
+        continue;
+      }
+      if (!/\.(?:js|mjs|cjs)$/u.test(entry.name)) continue;
+      let text;
+      try {
+        if (fs.statSync(abs).size > 2 * 1024 * 1024) continue;
+        text = fs.readFileSync(abs, 'utf8');
+      } catch { continue; }
+      // 不做任何**文件级字符串过滤**。这是两轮变异测试换来的教训：
+      //   · 拿 run_code 当过滤器 → M2（执行器改名）让整文件消失，静默放行；
+      //   · 改拿 tools:ptc-only 当过滤器 → M4（段改名）同样让整文件消失，静默放行。
+      // 「改掉锚点 ⇒ 锚点消失 ⇒ 文件跳过 ⇒ 报绿」是这类判据的通用死法。
+      // 现在按**结构**识别（见下），没有锚点可被打掉。
+      const rel = path.relative(opsRoot, abs).split(path.sep).join('/');
+      // 每个 `.tools.length <op> N` 比较点就是一个独立的判定点，逐个取上下文窗口核验。
+      const siteRe = /\.tools\.length\s*(?:[!=]==|>=|<=|>|<)\s*\d+/gu;
+      let match;
+      while ((match = siteRe.exec(text)) !== null) {
+        const line = text.slice(0, match.index).split('\n').length;
+        // 只向前取：这些判定都是单条 `return A && B && C` 表达式，要件全在同一句里。
+        // 取反向窗口会把同文件里**相邻的另一个判定**（如 isNativePresentation 只看段落）
+        // 一起圈进来，于是 M4（把 ptc-only 段改名）被邻居的字面量救活 —— 变异测试抓到过。
+        const from = match.index;
+        const to = Math.min(text.length, match.index + 400);
+        const window = text.slice(from, to);
+        // 「呈现档判定」的结构特征：既看工具数组长度，又看 system prompt 的 sections。
+        // 仅单独查段落的地方（如 official-tool-hiding.js:226 判断 collapsed 态）没有
+        // .tools.length 比较点，天然不入选 —— 不需要靠某个字面量来排除。
+        if (!window.includes('.sections')) continue;
+        sites.push({ rel: rel + ':' + line, text: window });
+      }
+    }
+  };
+  walk(libDir);
+  return sites;
+}
+
+/** 给人工重核时一个「上次它长在哪」的提示，不参与判定。 */
+function relativeGateHint(opsRoot) {
+  const likely = ['lib/publication/presentation.js', 'lib/ptc/index.js', 'lib/publication/ptc.js'];
+  const hit = likely.find((rel) => fs.existsSync(path.join(opsRoot, rel)));
+  return hit ?? 'lib/ 下同时提到 run_code 与 tools:ptc-only 的文件';
+}
+
+/**
+ * 呈现档判定的**语义三要件**（缺一个，「预设 ptc + 关批量 = 拿到 ops_batch」就不成立）。
+ *
+ * 只看语义、不看排版：0.5.0 把同一句拆成多行、`Array.isArray()` 换成裸比较、
+ * `section.text.trim() !== ''` 换成 `Boolean(section.text.trim())` —— 这些都不该红。
+ */
+function checkPtcGateShape(text) {
+  const compact = text.replace(/\s+/gu, ' ');
+  const hasExactlyOne = /\.tools\.length\s*[!=]==\s*1\b/u.test(compact);
+  // 比较必须**连到 run_code 这个操作数上**：只查「窗口里出现过 run_code 字样」不够。
+  const hasRunCodeName = /\.name\s*[!=]==\s*['"]run_code['"]/u.test(compact);
+  const hasPtcOnlySection = /['"]tools:ptc-only['"]/u.test(compact);
+  const hasNonEmptyText = /\btext\.trim\(\)/u.test(compact);
+  const missing = [];
+  if (!hasExactlyOne) missing.push('工具数组不要求恰好 1 个（.tools.length === 1）');
+  if (!hasRunCodeName) missing.push('那一个不要求叫 run_code（.name === \'run_code\'）');
+  if (!hasPtcOnlySection) missing.push('不再判定 tools:ptc-only 段');
+  if (!hasNonEmptyText) missing.push('不再要求该段文本非空（text.trim()）');
+  if (missing.length === 0) return { ok: true };
+  return { ok: false, reason: '缺 ' + missing.join('、') };
+}
+
 // 10g) 装机 dsh-ops 的实现事实：工具前缀与注册点没改名 + PTC 门已放宽到 ptc+both。
 // 这一条把「别人下载本插件后能不能用 ops」的前提钉住：ops 一旦升级，判据可能变化。
 check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖面）', () => {
@@ -818,22 +908,35 @@ check('装机 dsh-ops 的 ops_* 口径与 PTC 呈现档门（适配层的依赖�
   // ① 装机那份的注册门仍是原版形状（只认纯 ptc）—— 若哪天它变了，本包的
   //    「预设 ptc + 关批量档 = 拿到 ops_batch/ops_result」这条杠杆的说明就要重核；
   // ② 宿主侧的装配段名没漂（本包判断呈现档只用这两个公开段名）。
-  const ptcIndex = fs.readFileSync(path.join(root, 'lib', 'ptc', 'index.js'), 'utf8');
-  // 2026-10-29：判据从「逐字包含一整行」改成**语义三要件**。
-  // 0.5.0 把同一句拆成了多行，并把 `assembly.tools[0].name` 写成 `assembly.tools[0]?.name`
-  // （可选链）—— 逐字比对因此红了一天，而门的语义一个字都没变。
-  // 三要件就是这条杠杆成立的全部前提：① 工具数组恰好 1 个；② 那一个叫 run_code；
-  // ③ 还要求 tools:ptc-only 段非空。缺任何一条，「预设 ptc + 关批量 = 拿到 ops_batch」就不成立。
-  const ptcCompact = ptcIndex.replace(/\s+/gu, ' ');
-  const ptcGate = /Array\.isArray\(assembly\.tools\)/u.test(ptcCompact)
-    && /assembly\.tools\.length === 1/u.test(ptcCompact)
-    && /assembly\.tools\[0\]\??\.name === ['"]run_code['"]/u.test(ptcCompact)
-    && /name === ['"]tools:ptc-only['"]/u.test(ptcCompact)
-    && /section\.text\.trim\(\) !== ['"]['"]/u.test(ptcCompact);
-  if (!ptcGate) {
-    return 'dsh-ops ' + version + ' 的 PTC 注册门不再是原版形状（「恰好一个 run_code + 非空 tools:ptc-only」'
-      + '这三要件没找齐）：本包 INTERFACES §3.8 与 lib/ops-adapter.js 里'
-      + '「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
+  // 2026-11-10：判据不再**钉死文件路径**。
+  // 0.5.2 把 lib/ptc/index.js 改成了两行 re-export 空壳（`export * from '../publication/ptc.js'`），
+  // 实现在 lib/publication/presentation.js 的 activationIsPtc()。门的语义一个字没变，
+  // 但按路径读文件的判据当场红 —— 这是**假红**，比不报还坏：真漂移来了没人信。
+  //
+  // 改成按**结构**在整棵 lib/ 里识别判定点（看 .tools.length 比较 + 同句看 .sections），
+  // 再逐个核语义要件。路径随便搬，语义跑不掉。
+  // 注意：不能用任何字符串当文件级过滤器 —— 详见图 findPtcGateSites 的注释。
+  //
+  // 三要件是这条杠杆成立的全部前提，缺一个「预设 ptc + 关批量 = 拿到 ops_batch」就不成立：
+  //   ① 工具数组恰好 1 个         ② 那一个叫 run_code         ③ tools:ptc-only 段非空
+  const gateSites = findPtcGateSites(root);
+  if (gateSites.length === 0) {
+    return 'dsh-ops ' + version + ' 的 lib/ 里没有任何文件同时提到 run_code 与 tools:ptc-only：'
+      + '呈现档判定可能被整体重写或改名了。本包 INTERFACES §3.8 与 lib/ops-adapter.js 里'
+      + '「纯 PTC 档才给 ops_batch/ops_result」的说明需要人工重核（盯 '
+      + (relativeGateHint(root)) + '）。';
+  }
+  // 第一版写成「找到一处合规即 PASS」，变异测试三发三中全绿（4 份拷贝里改的不是被检那份）。
+  // 现在要求**每一处都合规** —— 任一处语义漂了，这条杠杆就可能在某条路径上不成立。
+  const broken = [];
+  for (const site of gateSites) {
+    const verdict = checkPtcGateShape(site.text);
+    if (verdict.ok !== true) broken.push(site.rel + ' → ' + verdict.reason);
+  }
+  if (broken.length > 0) {
+    return 'dsh-ops ' + version + ' 的 PTC 呈现档判定有 ' + broken.length + '/' + gateSites.length
+      + ' 处不再是「恰好一个 run_code + 非空 tools:ptc-only」：' + broken.join('；')
+      + '。本包 INTERFACES §3.8 与 lib/ops-adapter.js 里「纯 PTC 档才给 ops_batch/ops_result」的说明需要重核。';
   }
   // 2026-11-07：0.2.2-rc.1 把装配段名从 dsh-tools 挪进了 ptc executor（PtcExecutor.sections：
   // tools:ptc-only / tools:sdk，经 setExecutor 的 effect 注册）—— 判据跟着搬，语义不变。
