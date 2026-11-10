@@ -1289,6 +1289,35 @@ function functionBodyOf(source, needle) {
   // ⚠️ 覆盖范围是**全部 15 个工具**，不是只测出过事的那三个：同一类错在
   // team_task_get / team_task_list（官方 task-view 视图）上同样可能发生 ——
   // 只盯着"已经坏过的"就等于等下一次事故。
+  await check('写域护栏：目录级写域与真撞车分别给出正确提醒（用户截图 141818 的红字来源）', async () => {
+    // 官方面板按**路径前缀**判重叠（task-view.js 的 scopesOverlap：
+    // a === b || a.startsWith(b+'/') || b.startsWith(a+'/')），所以写域写成目录
+    // 必然与同目录下的每个并行任务互相告警 —— 那是"写域填太粗"的正确反馈。
+    // 插件不擅自改写用户给的写域，只在创建时当场说明；这条钉住"说明得对"。
+    const toolsMod = await load('tools.js');
+    const mk = (id, status, ws) => ({ id, revision: 1, subject: 's' + id, description: 'd', status, blockedBy: [], writeScopes: ws, ready: status === 'pending', writeScopeWarnings: [] });
+    const agentTeams = {
+      listMembers: () => [{ id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] }],
+      listTasks: () => [mk('task-1', 'in_progress', ['out/a.mjs'])],
+      createTask: async (_caller, req) => mk('task-2', 'pending', req.writeScopes || []),
+    };
+    const defs = toolsMod.teamToolDefinitions({ runtime: undefined, agentTeams, config: undefined });
+    const create = defs.find((d) => d.name === 'team_task_create');
+    const exec = { agent: { id: 'lead-1' }, signal: new AbortController().signal };
+    // ① 目录级写域：必须点出"目录"这条原因，并给出具体文件的正确写法。
+    const dir = await create.execute({ subject: 's', description: 'd', write_scopes: ['out'] }, exec);
+    assert.ok(Array.isArray(dir.advice) && dir.advice.length > 0, '目录级写域没有给出提醒：' + JSON.stringify(dir.advice));
+    assert.ok(dir.advice[0].includes('目录'), '提醒没说明是目录的问题：' + dir.advice[0]);
+    assert.ok(dir.advice[0].includes('具体文件'), '提醒没给出正确写法：' + dir.advice[0]);
+    // ② 与在办任务共享**同一个具体文件**：这是真撞车，必须点名任务 id。
+    const clash = await create.execute({ subject: 's', description: 'd', write_scopes: ['out/a.mjs'] }, exec);
+    assert.ok(Array.isArray(clash.advice) && clash.advice.some((line) => line.includes('task-1')),
+      '真撞车没点名对方任务：' + JSON.stringify(clash.advice));
+    // ③ 干净的具体文件：不许无中生有地提醒（噪声会让 Lead 学会忽略这个字段）。
+    const clean = await create.execute({ subject: 's', description: 'd', write_scopes: ['out/b.mjs'] }, exec);
+    assert.equal(clean.advice, undefined, '干净写域不该有提醒：' + JSON.stringify(clean.advice));
+  });
+
   await check('广播的定向指令护栏：文案点名 + "其他人忽略" 但没写 targets → 提醒（真机 seq=1611）', async () => {
     const roster = await load('roster.js');
     const names = ['builder-chain-c', 'verify-b1', 'scout-conv'];
