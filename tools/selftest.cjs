@@ -1289,6 +1289,46 @@ function functionBodyOf(source, needle) {
   // ⚠️ 覆盖范围是**全部 15 个工具**，不是只测出过事的那三个：同一类错在
   // team_task_get / team_task_list（官方 task-view 视图）上同样可能发生 ——
   // 只盯着"已经坏过的"就等于等下一次事故。
+  await check('队员名被拒时给出可用候选名，且不许泄漏内部 TypeError（真机 session-7cb008a5 seq=84/89）', async () => {
+    // 真机事故：我第一版在 spawnNameError 里写了 `taken.includes(role)`，而 taken 是 **Set**
+    // （takenNames 返回 Set）→ 抛 "taken.includes is not a function"。
+    // 后果比"文案不好"严重：**本该给出的候选名提示变成了我们的内部异常**，
+    // 模型看到 TypeError 而不是"该怎么改名"，于是同一个错误被连着踩两次（seq=84、seq=89）。
+    // 这条闸门跑真工具定义，钉住两个非法名字都必须给出候选，且消息里不许出现 TypeError 痕迹。
+    const toolsMod = await load('tools.js');
+    const rows = [
+      { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'b1', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: [] },
+      { id: 'b2', name: 'builder-2', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    const agentTeams = {
+      listMembers: () => rows,
+      spawnTeammate: async () => { throw new Error('REACHED-SPAWN（名字校验没拦住）'); },
+    };
+    const runtime = { loadConfig: async () => {}, pinSpawnRoute: () => {} };
+    const defs = toolsMod.teamToolDefinitions({ runtime, agentTeams, config: undefined });
+    const spawn = defs.find((d) => d.name === 'spawn_teammate');
+    const exec = { agent: { id: 'lead-1' }, signal: new AbortController().signal };
+    const messages = [];
+    for (const name of ['builder-1', 'chain-a']) {
+      let msg = '';
+      try {
+        await spawn.execute({ role: 'builder', name, description: 'd', prompt: 'p' }, exec);
+      } catch (error) {
+        msg = String(error && error.message ? error.message : error);
+      }
+      assert.ok(msg !== '', name + ' 本该被拒但没有报错');
+      assert.ok(!/is not a function|Cannot read|undefined is not/.test(msg),
+        name + ' 的报错泄漏了内部 TypeError（模型会拿它当"插件坏了"）：' + msg);
+      assert.ok(msg.includes('可以用的名字例如'), name + ' 的报错没给出可用候选名：' + msg);
+      messages.push(msg);
+    }
+    // 候选名必须来自**真实在册名单**：builder 与 builder-2 都已被占，所以应给出 builder-3。
+    assert.ok(messages[0].includes('builder-3'), '候选名没跳过已占用的 builder / builder-2：' + messages[0]);
+    // -1 那条还要额外点出"纯数字后缀从 2 起"。
+    assert.ok(messages[0].includes('从 **2** 起'), '没解释 -1 为什么不行：' + messages[0]);
+  });
+
   await check('写域护栏：目录级写域与真撞车分别给出正确提醒（用户截图 141818 的红字来源）', async () => {
     // 官方面板按**路径前缀**判重叠（task-view.js 的 scopesOverlap：
     // a === b || a.startsWith(b+'/') || b.startsWith(a+'/')），所以写域写成目录
