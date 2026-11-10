@@ -4382,7 +4382,10 @@ async function main() {
       if (!error.message.includes('已经用过')) return error.message;
       // 建议的名字必须是**真的可用**的：从报错里抠出来再验一遍（断言比写死 builder-3 更强——
       // 这条名单里 builder 本来就空着，写死具体值会把「算法变了」误判成失败）。
-      const suggested = /改成 "([a-z0-9-]+)"/u.exec(error.message)?.[1];
+      // 措辞在 2026-11-10 统一成「现在就能用的名字："X"」（与 spawnNameError 那条对齐：
+      // 两条报错给同一套口径，模型才不会把它们当成两种机制）。
+      // 正则同时认新旧两种写法，避免以后再改文案就把这条基础断言撞红。
+      const suggested = /(?:改成|现在就能用的名字：)\s*"([a-z0-9-]+)"/u.exec(error.message)?.[1];
       if (suggested === undefined) return `没给出下一个可用名：${error.message}`;
       if (suggested === 'builder-2') return '建议了一个已被占用的名字';
       if (!roster.isValidTeammateName(suggested)) return `建议的名字本身不合法：${suggested}`;

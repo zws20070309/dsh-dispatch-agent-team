@@ -1385,6 +1385,49 @@ function functionBodyOf(source, needle) {
     // 同时要求它给出的是**下一个真正空闲的**名字（builder 与 builder-2 都被占 -> builder-3）。
     assert.ok(histQuoted.includes('builder-3'), '历史感知后应给出 builder-3：' + JSON.stringify(histQuoted));
     assert.equal(new Set(histQuoted).size, histQuoted.length, '候选名有重复：' + JSON.stringify(histQuoted));
+
+    // ⚠️ 另一条路径：名字**形状合法**但已被历史用过（真机 session-7cb008a5 seq=102）。
+    // 它走的是 `taken.has(trimmed)` 分支，不是 spawnNameError —— 两处必须给同一套口径，
+    // 否则模型会把它们当成两种不同机制。这里钉住：建议名必须真的空闲、且措辞与另一条一致。
+    let takenMsg = '';
+    try {
+      // builder 在 histTaken 里（历史用过），但形状完全合法，所以不会被 spawnNameError 拦。
+      await histSpawn.execute({ role: 'builder', name: 'builder', description: 'd', prompt: 'p' }, exec);
+    } catch (error) {
+      takenMsg = String(error && error.message ? error.message : error);
+    }
+    assert.ok(takenMsg.includes('历史记录'), '合法但已占用的名字没被历史判重拦住：' + takenMsg);
+    const takenSuggestion = /现在就能用的名字："([^"]+)"/u.exec(takenMsg);
+    assert.ok(takenSuggestion !== null, '这条报错没给出建议名（措辞应与另一条统一）：' + takenMsg);
+    assert.ok(!['builder', 'builder-2'].includes(takenSuggestion[1]),
+      '建议名撞上了已占用/历史名：' + takenSuggestion[1]);
+  });
+
+  await check('开关工具的 enabled 不许与 ok 自相矛盾（模型会据此误判"开了但没开"）', async () => {
+    // 2026-11-10 自查发现：enable_agent_team 原来直接抄 runtime 的内部字段 `result.enabled`。
+    // 那不是契约的一部分 —— 只要某次返回漏了它（测试替身、旧宿主半、将来重构），
+    // 模型就会看到 `{ok:true, enabled:false}`："成功了但没开"。
+    // 实测（本仓 .probe-tmp/probe-control.cjs）第一次跑就撞上了这种组合。
+    // 现在以 ok 为准：ok=true ⇒ enabled 必须为 true。
+    const toolsMod = await load('tools.js');
+    const stub = (impl) => ({ enable: impl, disable: impl });
+    const run = async (impl) => {
+      const defs = toolsMod.controlToolDefinitions({ runtime: stub(impl) });
+      const def = defs.find((item) => item.name === 'enable_agent_team');
+      return await def.execute({}, { agent: { id: 'a' }, signal: new AbortController().signal });
+    };
+    // ① ok:true 但返回里**没有** enabled 字段 —— 曾经的 bug 源。
+    const omitted = await run(async () => ({ ok: true, diagnostics: [] }));
+    assert.equal(omitted.ok, true);
+    assert.equal(omitted.enabled, true, 'ok:true 却没把 enabled 报成 true（模型会以为没开成功）：' + JSON.stringify(omitted));
+    // ② ok:false 但 enabled:true（例如"你已经是一名队员"）—— 两个字段各自保留真值，不许抹平。
+    const teammate = await run(async () => ({ ok: false, enabled: true, diagnostics: ['x'] }));
+    assert.equal(teammate.ok, false);
+    assert.equal(teammate.enabled, true, '这种情形 enabled 本来就该是 true，不许被 ok 抹成 false');
+    // ③ 彻底失败。
+    const failed = await run(async () => ({ ok: false, enabled: false, diagnostics: ['y'] }));
+    assert.equal(failed.ok, false);
+    assert.equal(failed.enabled, false);
   });
 
   await check('写域护栏：目录级写域与真撞车分别给出正确提醒（用户截图 141818 的红字来源）', async () => {
