@@ -319,6 +319,14 @@ export function noteAppliedRoute(agentId, route); // 路由账本的唯一写入
                                             //   全空则整条不记（宁缺毋滥：记了就是把没用上的报成用过）
 export function clearAppliedRoute(agentId);      // 作废该队员的记账（卸载时调用）
 export function sessionMemory();           // -> 会话级团队记忆快照（含 restoredThisProcess）
+export async function historicalMemberNames(ctx, sessionId);
+                                            // -> string[]：该团队**历史累计**的队员名（不含 lead），来源先投影缓存、
+                                            //    后 Lead 日志里的 team/member 事件。spawn 判重必须用它 ——
+                                            //    官方队员名**永不复用**（roster 历史累计，phase 只转 active/failed、
+                                            //    从不移除），而 listMembers 只返回当前在册的行。两套口径不一致时，
+                                            //    插件给出的"改成 X"会被官方以"历史记录里已经用过"再拒一次
+                                            //    （2026-11-10 真机 session-7cb008a5 seq=102）。
+                                            //    拿不到返回 []（调用方退化成活体名单，不阻断创建）。
 export async function teamGraph(ctx, sessionId);      // 工作区画布数据源：从任一成员会话回到 Lead，
                                             //    折叠出 {nodes, edges, tasks, totals}（lib/graph.js）。
                                             //    每个节点带 `taskTip` = **结构化**归属清单

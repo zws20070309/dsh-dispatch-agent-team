@@ -1320,13 +1320,58 @@ function functionBodyOf(source, needle) {
       assert.ok(msg !== '', name + ' 本该被拒但没有报错');
       assert.ok(!/is not a function|Cannot read|undefined is not/.test(msg),
         name + ' 的报错泄漏了内部 TypeError（模型会拿它当"插件坏了"）：' + msg);
-      assert.ok(msg.includes('可以用的名字例如'), name + ' 的报错没给出可用候选名：' + msg);
+      // 断言「有没有候选名」这件事，不钉措辞：措辞会随文案调整（本轮就从「例如」改成了「：」），
+      // 钉死字面会把"改文案"这种无害改动判成回归。真正要保住的是"必须有候选名可照着改"。
+      assert.ok(/可以用的名字/.test(msg), name + ' 的报错没给出可用候选名：' + msg);
       messages.push(msg);
     }
     // 候选名必须来自**真实在册名单**：builder 与 builder-2 都已被占，所以应给出 builder-3。
     assert.ok(messages[0].includes('builder-3'), '候选名没跳过已占用的 builder / builder-2：' + messages[0]);
     // -1 那条还要额外点出"纯数字后缀从 2 起"。
     assert.ok(messages[0].includes('从 **2** 起'), '没解释 -1 为什么不行：' + messages[0]);
+    // ⚠️ 候选名不许重复（2026-11-10 真机 seq=275/294：提示印成了「"builder"、"builder"」，
+    // 同一句话里两个一模一样的候选，模型会以为有两个选择 —— 纯误导）。
+    // 根因：nextTeammateName 在 role 空闲时**本来就返回 role 本身**，
+    // 我却又在"role 没被占用"的分支上补了一个 、"role"，同一值出现两次。
+    const candidateLine = messages[0].split('\n').find((line) => line.includes('可以用的名字')) || '';
+    const quoted = [...candidateLine.matchAll(/"([^"]+)"/gu)].map((match) => match[1]);
+    assert.ok(quoted.length >= 1, '候选名行里一个名字都没有：' + candidateLine);
+    assert.equal(new Set(quoted).size, quoted.length, '候选名有重复（模型会以为有两个不同选择）：' + candidateLine);
+    // ⚠️ 判重必须用**历史累计**名单，不能只用活体名单（真机 seq=102）：
+    // 当时活体在册的是 builder-alpha / builder-2 / verify-r2（没有裸 builder），
+    // 我按活体名单建议「改成 builder」；Lead 照做后官方仍以
+    // 「name "builder-alpha" 在本团队的历史记录里已经用过」拒掉 —— 两套口径不一致时，
+    // 插件给的"下一步"方向就是错的。
+    // 这里注入一个**只在历史里存在**的名字，候选名必须避开它。
+    const historicalRows = [
+      { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'b2', name: 'builder-2', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    const historicalTeam = {
+      listMembers: () => historicalRows,
+      spawnTeammate: async () => { throw new Error('REACHED-SPAWN'); },
+    };
+    const historicalRuntime = {
+      loadConfig: async () => {},
+      pinSpawnRoute: () => {},
+      // 历史上用过 builder（现在已结束，所以活体名单里没有）
+      historicalMemberNames: async () => ['builder', 'builder-2'],
+    };
+    const histDefs = toolsMod.teamToolDefinitions({ runtime: historicalRuntime, agentTeams: historicalTeam, config: undefined });
+    const histSpawn = histDefs.find((d) => d.name === 'spawn_teammate');
+    let histMsg = '';
+    try {
+      await histSpawn.execute({ role: 'builder', name: 'builder-1', description: 'd', prompt: 'p' }, exec);
+    } catch (error) {
+      histMsg = String(error && error.message ? error.message : error);
+    }
+        const histLine = histMsg.split('\n').find((line) => line.includes('可以用的名字')) || '';
+    // 只看**候选段**（"可以用的名字"之后的部分）：前面 `role 是 "builder"` 里的 builder
+    // 是角色名本身，不是候选 —— 把整行拿去匹配会把正确输出判成错误（我第一版就是这么错的）。
+    const histCandidates = histLine.slice(histLine.indexOf('可以用的名字'));
+    assert.ok(!/"builder"/.test(histCandidates),
+      '候选名撞上了**历史**占用名 builder（活体名单里没有，但官方永不复用）：' + histCandidates);
+    assert.ok(histCandidates.includes('builder-3'), '历史感知后应给出 builder-3：' + histCandidates);
   });
 
   await check('写域护栏：目录级写域与真撞车分别给出正确提醒（用户截图 141818 的红字来源）', async () => {
