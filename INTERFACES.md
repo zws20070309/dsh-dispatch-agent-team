@@ -123,6 +123,13 @@ export const ASK_LEAD_TOOL_NAME;          // 'ask_lead'（队员专用）
 export const TRUNCATED_DIAGNOSTIC;        // 截断标志的固定文案（进成员行 diagnostics）
 export function planBroadcastTargets(members, {targets?, includeInactive?, callerName?});
                                     // -> {targets[], skipped[{target,reason}]}；纯函数，selftest 直测
+export function broadcastTargetingHint(message, memberNames);
+                                    // -> string（空串 = 不像定向指令）；文案点名了某几个队员 + 写着
+                                    //    「其他人忽略」却没给 targets 时，返回一句"改用 send_message"的提醒。
+                                    //    2026-11-10 真机 seq=1611：本该只给 builder-chain-c 的指令被广播给了
+                                    //    7 个在跑的队员（还带 include_inactive），其中 verify-b1 正确判定
+                                    //    "这不是我的活" 报 blocked，Lead 只好再发一条"撤销·误唤醒"——一来一回
+                                    //    烧掉几轮。纯函数，selftest 直测；只提醒不拦（Lead 可能确实要告全体）。
 export function annotateTruncatedMembers(rows, truncatedIds);
                                     // -> 新数组；被记账户里的队员行追加 TRUNCATED_DIAGNOSTIC，不改入参
 export const RETRY_DIAGNOSTIC_PREFIX;     // '最近一次请求被宿主自动重试：'（同样进成员行 diagnostics）
@@ -505,7 +512,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:705`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:737`）。
    注意 `lib/tools.js:942-946` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条

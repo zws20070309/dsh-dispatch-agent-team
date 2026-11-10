@@ -1289,6 +1289,24 @@ function functionBodyOf(source, needle) {
   // ⚠️ 覆盖范围是**全部 15 个工具**，不是只测出过事的那三个：同一类错在
   // team_task_get / team_task_list（官方 task-view 视图）上同样可能发生 ——
   // 只盯着"已经坏过的"就等于等下一次事故。
+  await check('广播的定向指令护栏：文案点名 + "其他人忽略" 但没写 targets → 提醒（真机 seq=1611）', async () => {
+    const roster = await load('roster.js');
+    const names = ['builder-chain-c', 'verify-b1', 'scout-conv'];
+    // 真机原样文案（session-00933fdf seq=1611 的开头）
+    const directed = '【builder-chain-c 请执行·其他人忽略】你上次运行被中断，没有交出 report_result';
+    const hint = roster.broadcastTargetingHint(directed, names);
+    assert.ok(hint.includes('builder-chain-c'), '提醒必须点名被误广播的目标：' + hint);
+    assert.ok(hint.includes('send_message'), '提醒必须给出正确做法：' + hint);
+    // 真正要告全体的文案不该被提醒
+    assert.equal(roster.broadcastTargetingHint('【契约修正】所有人重读 CONTRACT §4', names), '',
+      '全员通知不该触发定向提醒');
+    // 点名但没写"其他人忽略"（例如只是在正文里提到某人）也不该提醒
+    assert.equal(roster.broadcastTargetingHint('builder-chain-c 已交付，大家按新契约继续', names), '',
+      '提到名字但非定向措辞不该触发');
+    // 没有任何队员名 → 不提醒
+    assert.equal(roster.broadcastTargetingHint('其他人忽略这条', names), '', '没点名就不提醒');
+  });
+
   await check('全部工具返回值与自己声明的 output.schema 相容（schema 漂移的永久闸门）', async () => {
     const toolsMod = await load('tools.js');
     // 官方真实形状（逐字抄装机源码，不是我们希望的形状）：
