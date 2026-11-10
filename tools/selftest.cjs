@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2855）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2879）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -1951,8 +1951,18 @@ function functionBodyOf(source, needle) {
     assert.ok(src.includes("statusEl.appendChild(wsSkeleton(2, wsText('wsSkelBoard'), true))"),
       '底栏任务板槽位没有骨架占位');
     // 首轮读取失败时必须显式清掉底栏骨架（数据没来，骨架不能一直假装在加载）。
-    const cleanup = src.split("state.noteEl.style.display = ''; state.statusEl.textContent = ''").length - 1;
+    //
+    // 断言只认「清掉底栏」这一件事，不绑死同一行还写了什么：原来的写法把
+    // `noteEl.style.display = ''` 与 `statusEl.textContent = ''` 当成一个连写子串，
+    // 于是「首轮失败改成挂重试块」这种**行为更正确**的改动反而把闸门撞红
+    // （2026-11-10：那条分支现在先 textContent='' 再 appendChild(wsErrorBlock)，
+    //  比原来的一行赋值多了一步，但「清掉底栏骨架」的语义没变）。
+    const cleanup = src.split("state.statusEl.textContent = ''").length - 1;
     assert.equal(cleanup, 2, `wsLoad 两条失败分支都要清底栏骨架，实际 ${cleanup} 处`);
+    // 首轮失败还必须给出自助出路（2026-11-10 用户截图「读取失败：请求超时」后无处可点）。
+    assert.ok(src.includes('function wsErrorBlock('), '首轮失败没有可点的重试块');
+    assert.equal(src.split('state.noteEl.appendChild(wsErrorBlock(state))').length - 1, 2,
+      'wsLoad 两条失败分支都要挂重试块');
     // ③ 报告流（抽屉对话）：初始与 renderConvo 的「还在读」分支都是骨架；确认空走空态文案。
     const convoSkel = src.split("wsSkeleton(3, wsText('wsDrawerConvoLoading'))").length - 1;
     assert.equal(convoSkel, 2, `抽屉对话骨架应在初始+轮询两处各一份，实际 ${convoSkel}`);
