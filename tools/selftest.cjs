@@ -490,7 +490,7 @@ function functionBodyOf(source, needle) {
     //     的英文侧全是 … Auditor / Critic / Verifier，中文侧才是各自的分工说明；
     //   * 字节：每个队员省 8~19 字符（平均 12），12 个角色合计 143 字符；
     //     这条前缀每个队员每一轮都要重付（缓存未命中时）。
-    // labelEn **不删**：配置页（lib/client.js:2897）与 ROLES 契约（INTERFACES §1）
+    // labelEn **不删**：配置页（lib/client.js:2974）与 ROLES 契约（INTERFACES §1）
     // 仍在用它给人看英文名。这里断的是「不许进模型读的那半」。
     const leadText = playbook.PLAYBOOK + playbook.TEAM_POLICY + playbook.TEAMMATE_CARD;
     for (const role of roster.ROLES) {
@@ -993,7 +993,7 @@ function functionBodyOf(source, needle) {
     // 背景：脚本第一版只有「前缀是否逐字节相同」的推算模型，我据此在会话里对用户说过「会话日志里
     // 没有 usage 字段，拿不到实测命中率，只能做理论分析」—— 那是**假话**：assistant/message.data.usage
     // 一直带 cacheReadTokens（本机 143 个队员会话 8603 条 assistant/message 全部带 usage、8041 条带
-    // cacheReadTokens），本包 lib/graph.js:265 与 lib/cache.js:240 也一直在读它。
+    // cacheReadTokens），本包 lib/graph.js:305 与 lib/cache.js:240 也一直在读它。
     const audit = require(path.join(PLUGIN_DIR, 'tools', 'cache-prefix-audit.cjs'));
     assert.equal(typeof audit.usageOf, 'function', '脚本不再导出 usageOf：实测口径又变成不可断言的了');
     assert.equal(typeof audit.summarizeSession, 'function', '脚本不再导出 summarizeSession');
@@ -2112,6 +2112,180 @@ function functionBodyOf(source, needle) {
     assert.equal(nodeLead.taskTip.total, 0, 'Lead 名下没有条目时不该有假提示');
   });
 
+  await check('活动角标与名字争宽度时，降级顺序必须是「名字先缩、角标不缩」（实测口径）', () => {
+    // 一行只有 196px 宽，长名字 + 角标必然争地。两种退化都不一样贵：
+    //   * 名字被截成「plan-cr…」→ 仍然认得出是谁（前面那段就是角色+编号）；
+    //   * 角标被截成「调用 …」→ 那一格**彻底没有信息**（用户要看的就是在调什么）。
+    // 所以角标 flex:none、名字 flex:1 1 auto 且带 min-width 下限。
+    // 这条闸门就是钉住那个方向 —— 反过来写（角标可缩）在 e2e 里实测过，工具名会整个丢掉。
+    const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
+    const nmAt = src.indexOf("'.ws-node .nm{");
+    assert.ok(nmAt >= 0, '找不到 .ws-node .nm 的样式规则');
+    const nmRule = src.slice(nmAt, src.indexOf("' +", nmAt) + 600);
+    assert.ok(nmRule.includes('min-width:44px'), '.nm 没有 min-width 下限（长名字会被角标挤成一个省略号）');
+    // ⚠️ 必须正向核「就是 flex:1 1 auto」而不是只 includes：变异测试暴露过 ——
+    // 把 .nm 改成 flex:none 时 `includes('flex:1 1 auto')` 依然为真（那条串在别处出现过），
+    // 闸门会假绿。这里先切出 .nm 这条规则本体，再核它的 flex 键。
+    const nmFlex = /flex:([^;}']+)/.exec(nmRule.slice(nmRule.indexOf('min-width:44px')));
+    assert.ok(nmFlex !== null && nmFlex[1].trim() === '1 1 auto',
+      '.nm 的 flex 不是 1 1 auto（拿到 ' + (nmFlex === null ? 'null' : nmFlex[1]) + '）——名字不会主动让位，会把角标挤出卡片');
+    const actAt = src.indexOf("'.ws-act{");
+    assert.ok(actAt >= 0, '找不到 .ws-act 的样式规则');
+    const actRule = src.slice(actAt, actAt + 300);
+    assert.ok(actRule.includes('flex:none'), '.ws-act 不是 flex:none（角标会被压窄，工具名整个丢掉）');
+    assert.ok(actRule.includes('max-width:106px'), '.ws-act 没有宽度上限（超长工具名会把名字挤没）');
+    // 工具名走短形式：mcp__arxiv__search_papers → search_papers（角标里放全名会撑爆 106px）。
+    const shortFn = src.slice(src.indexOf('function wsToolShort('), src.indexOf('function wsToolShort(') + 500);
+    assert.ok(shortFn.includes("split('__')"), 'wsToolShort 不再按 __ 取末段（超长 MCP 工具名会撑爆角标）');
+  });
+  await check('会话活动状态：宿主折的五种状态与客户端认识的那份逐个对齐（2026-11-12 右上角角标）', () => {
+    // 用户在卡片右上角要看到「模型在思考 / 在回复 / 在调工具…」。
+    // 这条闸门钉的是**两侧集合的一致性**：宿主（lib/graph.js 的 touchActivity）写五个字符串，
+    // 客户端（lib/client.js 的 ACTIVITY_KINDS）认这五个。任何一侧多一个/少一个，
+    // 症状都是「某张卡片的角标凭空消失」或者更好一点的「卡片上印出一个翻不出来的键名」
+    // —— 两者都不会抛错，肉眼也难发现，所以必须靠闸门。
+    const gsrc = readFileSync(path.join(LIB, 'graph.js'), 'utf8');
+    const csrc = readFileSync(path.join(LIB, 'client.js'), 'utf8');
+    // ① 宿主侧：**从导出的常量读**（lib/graph.js 的 ACTIVITY_KINDS 是唯一真值，
+    // touchActivity 用它校验；不数调用点 —— 调用点会随分支增减变化，常量才是契约）。
+    const hostKinds = new Set(graph.ACTIVITY_KINDS);
+    assert.equal(hostKinds.size, 5, '宿主的活动状态常量不是 5 个：' + [...hostKinds].join(','));
+    // 而且常量与调用点必须**互相对得上**：调用点里出现了常量外的名字 = 运行时必抛错，
+    // 常量里有从没被写过的名字 = 客户端认得一个永远不会来的状态（同样是漂移）。
+    const called = new Set();
+    const callRe = /touchActivity\(stats, '([a-z]+)'/g;
+    let m;
+    while ((m = callRe.exec(gsrc)) !== null) called.add(m[1]);
+    for (const kind of called) {
+      assert.ok(hostKinds.has(kind), '调用点写了常量外的状态 ' + kind + '（运行时 touchActivity 会抛错）');
+    }
+    for (const kind of hostKinds) {
+      assert.ok(called.has(kind), '常量里的 ' + kind + ' 没有任何事件会写它（那是个永远不会出现的角标）');
+    }
+    // ② 客户端侧：ACTIVITY_KINDS 的字面量。
+    const clientAt = csrc.indexOf('const ACTIVITY_KINDS = new Set([');
+    assert.ok(clientAt >= 0, '客户端没有 ACTIVITY_KINDS（角标会画不出来）');
+    const clientLine = csrc.slice(clientAt, csrc.indexOf(')', clientAt));
+    const clientKinds = new Set((clientLine.match(/'([a-z]+)'/g) ?? []).map((s) => s.slice(1, -1)));
+    assert.deepEqual([...clientKinds].sort(), [...hostKinds].sort(),
+      '宿主与客户端的活动状态集合不一致（多出的角标画不出来、少写的永久不显示）');
+    // ③ 五种状态各有字典键（zh + en 都要，缺一边英文界面就吐键名）。
+    const dictKeys = ['wsActThinking', 'wsActReplying', 'wsActTool', 'wsActToolGeneric', 'wsActRetry', 'wsActCompaction'];
+    for (const key of dictKeys) {
+      const hits = csrc.split(key + ':').length - 1;
+      assert.ok(hits >= 2, '字典键 ' + key + ' 没有 zh + en 两份（当前 ' + hits + ' 份）');
+    }
+    // ④ 三处动画必须都在（用户要「能展示状态的动画」；只有字没有动效 = 没做到）。
+    for (const css of ['.ws-act .dots i{', '@keyframes ws-act-bounce{', '.ws-act .pulse::after{',
+      '@keyframes ws-act-ring{', '.ws-act .spin{', '@keyframes ws-act-spin{']) {
+      assert.ok(csrc.includes(css), '缺少角标动画样式 ' + css);
+    }
+    // ⑤ 系统开了「减少动态效果」时三种动画都要收（无障碍）。
+    assert.ok(csrc.includes('@media (prefers-reduced-motion: reduce){.ws-act .dots i,'),
+      '角标动画没有 prefers-reduced-motion 兜底（前庭敏感用户会难受）');
+  });
+
+  await check('会话活动状态：折出来的 activity 必须能被「已经不再活着的会话」抹掉（角标不许撒谎）', async () => {
+    // 持久快照是会话**死掉那一刻**的折叠结果，里面很可能还留着 activity='tool'
+    // （队员被宿主回收时 tool/result 还没落盘）。不抹掉的话卡片会永远显示「调用 pwsh」
+    // 而会话早就结束了 —— 那是比不显示更糟的谎。
+    const events = [
+      { type: 'turn/start', seq: 1, time: 1000, data: { turn: 1 } },
+      { type: 'tool/call', seq: 2, time: 2000, data: { turn: 1, step: 1, callId: 'c1', name: 'pwsh', arguments: '{}' } },
+    ];
+    const stats = graph.foldSession(events);
+    assert.equal(stats.activity, 'tool', '前提：折叠后确实停在「调用工具」');
+    // ① 没有活体续期（liveAt 缺失）→ 对外暴露必须被抹掉。
+    assert.equal(graph.activityOf(stats), undefined, '死会话的残留动作没被抹掉（卡片会永远显示「调用 pwsh」）');
+    // ② 活体续期（liveAt = 现在）→ 如实暴露，且工具名跟着出来。
+    const live = graph.emptyStats();
+    graph.foldEvents(live, events);
+    live.liveAt = Date.now();
+    assert.equal(graph.activityOf(live), 'tool', '活体会话的活动状态被误抹');
+    assert.equal(graph.activityToolOf(live), 'pwsh', '正在跑的工具名没暴露（卡片只能显示「调用工具」）');
+    // ③ buildGraph 必须把这三个字段挂到节点上（否则客户端拿不到）。
+    const g = graph.buildGraph({
+      leadId: 'L', leadName: 'lead', members: [], tasks: [],
+      statsBySession: new Map([['L', live]]),
+    });
+    const node = g.nodes.find((n) => n.role === 'lead');
+    assert.equal(node.activity, 'tool', 'buildGraph 没把 activity 挂到节点上');
+    assert.equal(node.activityTool, 'pwsh', 'buildGraph 没把 activityTool 挂到节点上');
+    const dead = graph.buildGraph({
+      leadId: 'L', leadName: 'lead', members: [], tasks: [],
+      statsBySession: new Map([['L', stats]]),
+    });
+    assert.equal(dead.nodes.find((n) => n.role === 'lead').activity, undefined,
+      'buildGraph 把死会话的残留动作画出去了');
+  });
+
+  await check('会话活动状态：六种事件的定性都对得上事实（同状态不刷新计时、回合结束清空）', () => {
+    // 每一条都是真日志里见过的事件形状（.probe 的 dump-types 统计：step/start 943 条、
+    // tool/call 1007 条、assistant/message 937 条、llm/retry 37 条、compaction/start 4 条）。
+    // ① step/start → thinking；连续两条 step/start **不许**刷新起点。
+    const s1 = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'step/start', seq: 2, time: 200, data: { turn: 1, step: 1 } },
+      { type: 'step/start', seq: 3, time: 900, data: { turn: 1, step: 2 } },
+    ]);
+    assert.equal(s1.activity, 'thinking');
+    assert.equal(s1.activitySince, 100, '同状态连续出现时不许刷新起点（否则「思考中」永远显示 0s）');
+    // ② assistant/message 的**最后一块**定性：reasoning=思考、text=写正文。
+    const think = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 2, time: 300, data: { turn: 1, step: 1, message: { content: [{ type: 'reasoning', text: 'x' }] } } },
+    ]);
+    assert.equal(think.activity, 'thinking');
+    const reply = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'assistant/message', seq: 2, time: 300, data: { turn: 1, step: 1, message: { content: [{ type: 'reasoning', text: 'x' }, { type: 'text', text: 'y' }] } } },
+    ]);
+    assert.equal(reply.activity, 'replying', '最后一块是正文时必须判成「回复中」');
+    // ③ tool/call → tool 并记名字；并行未回来时仍是 tool。
+    const two = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'tool/call', seq: 2, time: 200, data: { turn: 1, step: 1, callId: 'a', name: 'read', arguments: '{}' } },
+      { type: 'tool/call', seq: 3, time: 210, data: { turn: 1, step: 1, callId: 'b', name: 'grep', arguments: '{}' } },
+      { type: 'tool/result', seq: 4, time: 300, data: { message: { toolCallId: 'a' } } },
+    ]);
+    assert.equal(two.activity, 'tool', '还有一个工具没回来时不许判成「思考中」');
+    assert.equal(two.openToolNames.size, 1, 'tool/result 必须清掉对应的名字');
+    // ④ 全部工具都回来 → thinking（模型接着往下想）。
+    const done = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'tool/call', seq: 2, time: 200, data: { turn: 1, step: 1, callId: 'a', name: 'read', arguments: '{}' } },
+      { type: 'tool/result', seq: 3, time: 300, data: { message: { toolCallId: 'a' } } },
+    ]);
+    assert.equal(done.activity, 'thinking');
+    // ⑤ llm/retry → retry，并带上失败码（真日志：RATE_LIMIT / 429）。
+    const retry = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'llm/retry', seq: 2, time: 400, data: { turn: 1, step: 31, retry: 1, failure: { code: 'RATE_LIMIT', message: 'x' } } },
+    ]);
+    assert.equal(retry.activity, 'retry');
+    assert.equal(retry.retryCode, 'RATE_LIMIT');
+    // ⑥ compaction/start → compaction（压缩期间模型不生成，与「思考中」必须分开）。
+    const compact = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'compaction/start', seq: 2, time: 500, data: {} },
+    ]);
+    assert.equal(compact.activity, 'compaction');
+    // ⑦ turn/end → 清空（不清的话卡片会停在上一轮最后那个动作上，可能挂一整晚）。
+    const ended = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'tool/call', seq: 2, time: 200, data: { turn: 1, step: 1, callId: 'a', name: 'read', arguments: '{}' } },
+      { type: 'turn/end', seq: 3, time: 900, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    assert.equal(ended.activity, undefined, '回合结束后 activity 必须清空');
+    assert.equal(ended.activitySince, undefined, '回合结束后起点也必须清空');
+    // ⑧ 坏时间不许把计时污染成 NaN。
+    const badTime = graph.foldSession([
+      { type: 'turn/start', seq: 1, time: 100, data: { turn: 1 } },
+      { type: 'llm/retry', seq: 2, data: { failure: { code: 'X' } } },
+    ]);
+    assert.equal(badTime.activity, 'retry');
+    assert.ok(Number.isFinite(badTime.activitySince), 'time 缺失时不该写 NaN（计时会永远显示 NaN）');
+  });
   await check('画布把任务归属画出来：tooltip 在 wsNodeCard 与 wsUpdateCard 两处都接上', () => {
     const src = readFileSync(path.join(PLUGIN_DIR, 'lib', 'client.js'), 'utf8');
     // 2026-10-14 契约变更：服务端发**结构化**归属清单，句子由客户端拼（语言在浏览器）。
@@ -2120,11 +2294,19 @@ function functionBodyOf(source, needle) {
     // 2026-11-10：调用从两参变三参（第三个是角色 id —— 角色从标题行挪进了 tooltip）。
     // 断言写成「以 wsTaskTip(node.taskTip, node.name 开头」而不是钉死整行：
     // 钉死整行会让「多传一个有意义的参数」这种改动撞红闸门（本轮就撞了一次）。
-    assert.ok(/el\.title = wsTaskTip\(node\.taskTip, node\.name/.test(src),
-      'wsNodeCard 不再把任务归属挂到卡片 tooltip（新卡片悬停看不到）');
-    assert.ok(/const tip = wsTaskTip\(node\.taskTip, node\.name/.test(src)
+    // 2026-11-12：两处都收敛到 wsCardTip(node) —— 活动行与任务归属共用同一个拼装点
+    // （两处各拼一次必然漂移，症状是「刚建出来有活动行、刷一轮就没了」）。
+    // 所以这里同时钉两件事：① 两处都走 wsCardTip；② wsCardTip 内部确实调 wsTaskTip + wsActivityOf。
+    assert.ok(src.includes('el.title = wsCardTip(node)'),
+      'wsNodeCard 不再把卡片 tooltip 挂上（新卡片悬停看不到任务归属与活动状态）');
+    assert.ok(src.includes('const tip = wsCardTip(node)')
       && src.includes('if (el.title !== tip) el.title = tip'),
-      'wsUpdateCard 不刷新 tooltip（claim / complete 之后要重开卡片才更新）');
+      'wsUpdateCard 不刷新 tooltip（claim / complete 之后、或状态变了之后要重开卡片才更新）');
+    const cardTipFn = src.slice(src.indexOf('function wsCardTip('), src.indexOf('function wsCardTip(') + 900);
+    assert.ok(/wsTaskTip\(node\.taskTip, node\.name/.test(cardTipFn),
+      'wsCardTip 没带 node.name 调 wsTaskTip（标题行会变成「任务板：2 条归 」）');
+    assert.ok(cardTipFn.includes('wsActivityOf(node)'),
+      'wsCardTip 没拼活动状态那一行（悬停时看不到「此刻在干嘛」）');
     const tipFn = src.slice(src.indexOf('function wsTaskTip('), src.indexOf('function wsNodeCard('));
     assert.ok(tipFn.length > 60, '抓不到 wsTaskTip 函数体');
     assert.ok(/wsTaskTipHead/.test(tipFn) && /wsTaskTipMore/.test(tipFn),

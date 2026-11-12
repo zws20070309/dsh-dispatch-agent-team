@@ -239,7 +239,7 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 > 每个队员省 8~19 字符（scout 8、frontier-auditor 19，平均 12），12 个角色合计 143 字符。
 > 这是**补完一次迁移**，不是新方向：勘误表 §0.1 第 11 条记着「identity prefix 照抄官方英文」
 > 早被整体替换成中文 `teammateBrief`，那个 ` / labelEn` 尾巴是那次留下的化石。
-> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2897`），字段契约见 §1 的 ROLES 行；
+> `labelEn` **字段保留**：配置页角色行仍用它给人显示英文名（`lib/client.js:2974`），字段契约见 §1 的 ROLES 行；
 > 删的只是「进模型读的那半」。
 > selftest 有一条专项闸门钉住「简报里不许出现任何 labelEn」并同时兜住角色区分
 > （12 份简报必须互不相同 + 中文 label 不许重名），删错一侧会当场红。
@@ -342,6 +342,24 @@ export async function teamGraph(ctx, sessionId);      // 工作区画布数据�
                                             //    mode ∈ 'ptc'|'native'，与 applyMemberBatch 的 wantRunCode 同真值来源。
                                             //    发「配置意图」不发「实际挂载结果」：挂载失败走诊断通道，不设第二份真值。
                                             //    未开团队 → {ok:false, notEnabled:true}，页面据此提示先 /team。
+                                            //    ── 卡片右上角的「此刻在干嘛」角标（2026-11-12 用户要求）──
+                                            //    每个节点另带活动状态四件套，全部来自**事件事实**（不猜）：
+                                            //      `activity`     ∈ 'thinking' | 'replying' | 'tool' | 'retry'
+                                            //                      | 'compaction'，**回合结束后是 undefined**
+                                            //                      （那一格描述「正在发生的事」，不是死活）
+                                            //      `activitySince`  该状态的起始事件时刻（ms）
+                                            //      `activityTool`   activity==='tool' 时正在跑的工具名
+                                            //      `activityCode`   activity==='retry' 时最近一次失败的 code
+                                            //    折叠判据（lib/graph.js 的 touchActivity）：turn/start 与 step/start → thinking；
+                                            //    assistant/message 按 content **最后一块**定性（reasoning=thinking、text=replying）；
+                                            //    tool/call → tool（带名字）；tool/result → 还有并行调用就仍是 tool、否则 thinking；
+                                            //    llm/retry → retry（带 failure.code）；compaction/start → compaction；
+                                            //    turn/end → 全部清空（不清会让卡片停在上一轮最后一个动作上）。
+                                            //    同一状态连续出现**不刷新起点**（否则「思考中」永远显示 0s）。
+                                            //    ⚠️ 死会话的残留动作**一律抹掉**（activityOf 用 liveNowOf 判活）：持久快照
+                                            //    很可能停在「调用 pwsh」，而那个会话早就结束了 —— 那是比不显示更糟的谎。
+                                            //    两侧状态集合由 selftest 闸门钉死一致（lib/graph.js 的 ACTIVITY_KINDS ↔
+                                            //    lib/client.js 的 ACTIVITY_KINDS）。
                                             //    返回另带两个**结构化**字段（2026-10-14/15 加的）：
                                             //    `historyRecovered` —— 成员名单是否来自历史恢复。浏览器半原来靠
                                             //    `notes.some(n => n.includes('团队可能已结束'))` 判断，那是把**界面
