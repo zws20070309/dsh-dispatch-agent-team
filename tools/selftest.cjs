@@ -3456,6 +3456,157 @@ function functionBodyOf(source, needle) {
       'runtime.js 的反向同步没有读防回环闸 —— 会与自己写入的事件打架');
     return true;
   });
+  await check('每个工具的返回值都必须过它自己声明的 schema（2026-11-15 真机 P0 的闸门）', async () => {
+    // ── 为什么必须有这一条（session-987dedcf 实测）──────────────────────────────
+    // 那一场真实测试里，**每一次** list_agents 都是 ToolOutputError：
+    //   missing required property "value[1].diagnostics";
+    //   "value[1].path" is not a declared property (additionalProperties: false)
+    // spawn_teammate 是 "missing required property value.member.role"，
+    // interrupt_agent 是 "missing required property value.previousStatus"。
+    // 共同点：**动作其实都成功了**，只是返回值与声明不符 → 宿主判失败 →
+    // 模型以为没成功并重试（实测同一角色被派了两遍）。
+    //
+    // 而此前 153 条闸门全绿：因为它们测的是"函数返回了什么"，
+    // 从没测过"返回的东西符不符合自己声明的 output schema"。
+    // 这一条补上那个缺口：**用真实形状的宿主替身跑一遍每个工具，逐字段校验**。
+    const tools = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'tools.js')).href);
+
+    // 严格校验器：required 缺失、additionalProperties:false 越界、类型、enum 全查。
+    const validate = (schema, value) => {
+      const errs = [];
+      const walk = (s, v, p) => {
+        if (s === undefined) return;
+        if (s.type === 'array') {
+          if (!Array.isArray(v)) { errs.push(p + ' 不是数组'); return }
+          v.forEach((item, i) => walk(s.items, item, p + '[' + i + ']'));
+          return;
+        }
+        if (s.type === 'object') {
+          if (v === null || typeof v !== 'object') { errs.push(p + ' 不是对象'); return }
+          for (const [k, ps] of Object.entries(s.properties ?? {})) {
+            if (ps.required === true && v[k] === undefined) errs.push(p + ' 缺 required 字段 ' + k);
+          }
+          if (s.additionalProperties === false) {
+            for (const k of Object.keys(v)) {
+              if (!(k in (s.properties ?? {}))) errs.push(p + '.' + k + ' 未在 schema 里声明（additionalProperties:false）');
+            }
+          }
+          for (const [k, ps] of Object.entries(s.properties ?? {})) if (v[k] !== undefined) walk(ps, v[k], p + '.' + k);
+          return;
+        }
+        if (s.type === 'string' && typeof v !== 'string') errs.push(p + ' 不是字符串');
+        if (s.type === 'boolean' && typeof v !== 'boolean') errs.push(p + ' 不是布尔');
+        if (s.type === 'integer' && !Number.isInteger(v)) errs.push(p + ' 不是整数');
+        if (Array.isArray(s.enum) && !s.enum.includes(v)) errs.push(p + ' 不在 enum 里：' + String(v));
+      };
+      walk(schema, value, 'value');
+      return errs;
+    };
+
+    // rc.3 形状的宿主替身：成员行**带 path/depth、不带 diagnostics**（这正是踩雷的形状）。
+    const members = [
+      { kind: 'child', id: 'c1', name: 'researcher-alpha', activity: 'running', depth: 1, parentId: 'lead', path: 'researcher-alpha', hasChildren: false },
+      { kind: 'diagnostic', id: 'd1', reason: 'corrupt', depth: 1, parentId: 'lead' },
+    ];
+    const subagents = {
+      rootOf: (a) => (a.id === 'lead' ? a : { id: 'lead', session: { id: 'lead' } }),
+      namesOf: (a) => (a.id === 'lead' ? { self: 'lead' } : { self: 'researcher-alpha', parent: 'lead' }),
+      listDescendants: async () => members,
+      resolveName: async (_c, n) => (n === 'lead' ? 'lead' : 'c1'),
+      sendMessage: async () => 'msg-1',
+      interrupt: () => {},
+      startActivation: async (s) => ({ childId: 'n1', name: s.name }),
+    };
+    const ctx = { get: (n) => (n === 'subagents' ? subagents : undefined), on: () => () => {} };
+    const task = { id: 'task-1', revision: 1, subject: 's', description: 'd', status: 'pending', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [], ownerName: 'researcher-alpha' };
+    const agentTeams = {
+      ctx,
+      listTasks: () => [task], getTask: () => task,
+      createTask: async () => task, updateTask: async () => ({ ...task, revision: 2 }),
+      isEnabled: () => true, setEnabled: async () => {}, config: {},
+      // rc.2 形状的 interrupt：回 previousStatus（没有 accepted）
+      interrupt: () => ({ previousStatus: 'running' }),
+    };
+    const lead = { id: 'lead', session: { id: 'lead' }, ctx };
+    const memberAgent = { id: 'c1', session: { id: 'c1' }, ctx };
+    const runtimeStub = {
+      truncatedMemberIds: () => [], retriedMemberIds: () => new Map(),
+      appliedMemberRoutes: () => new Map(), loadConfig: async () => ({}),
+      preflightRoute: async () => ({ ok: true }), historicalMemberNames: async () => [],
+      pinSpawnRoute: () => {}, recordReport: () => ({ ok: true }),
+    };
+
+    const leadDefs = tools.teamToolDefinitions({ runtime: runtimeStub, agentTeams, config: {} });
+    const byL = new Map(leadDefs.map((d) => [d.name, d]));
+    const execL = { agent: lead, ctx, signal: new AbortController().signal, rootCallId: 'c1' };
+    const execM = { agent: memberAgent, ctx, signal: new AbortController().signal, rootCallId: 'c2' };
+
+    const cases = [
+      ['spawn_teammate', { role: 'researcher', description: 'd', prompt: 'p' }],
+      ['send_message', { target: 'researcher-alpha', message: 'hi' }],
+      ['list_agents', {}],
+      ['wait_agent', { timeout_ms: 10000 }],
+      ['interrupt_agent', { target: 'researcher-alpha' }],
+      ['wake_teammate', { target: 'researcher-alpha' }],
+      ['broadcast_message', { message: 'all' }],
+      ['team_task_create', { subject: 's', description: 'd' }],
+      ['team_task_list', {}],
+      ['team_task_get', { task_id: 'task-1' }],
+      ['team_task_update', { task_id: 'task-1', action: 'claim', expected_revision: 1 }],
+    ];
+    const problems = [];
+    for (const [name, args] of cases) {
+      const def = byL.get(name);
+      if (def === undefined) { problems.push(name + '：工具不存在（名单变了？）'); continue }
+      let out;
+      try { out = await def.execute(args, execL) } catch (error) {
+        problems.push(name + '：执行抛错 -> ' + (error instanceof Error ? error.message : String(error)).slice(0, 160));
+        continue;
+      }
+      const schema = def.output?.schema ?? def.output;
+      const errs = validate(schema, out);
+      if (errs.length > 0) problems.push(name + '：' + errs.join('；'));
+    }
+    // enable/disable_agent_team 出自**另一个** builder（controlToolDefinitions），
+    // 之前漏掉了它们 —— 而它们同样会因返回值不合 schema 而报错（实测 disable 是 OK 的，
+    // 但闸门必须覆盖全部工具，不能只覆盖"我恰好想到的"）。
+    const controlDefs = tools.controlToolDefinitions({ runtime: runtimeStub });
+    for (const def of controlDefs) {
+      if (typeof def?.execute !== 'function') continue;
+      let out;
+      try { out = await def.execute({}, execL) } catch (error) {
+        // 控制面依赖 runtime.enable/disable；替身没接上时它会回 {ok:false,...} 而不是抛错，
+        // 真抛了说明形状坏了，照样记。
+        problems.push(def.name + '：执行抛错 -> ' + (error instanceof Error ? error.message : String(error)).slice(0, 160));
+        continue;
+      }
+      const errs = validate(def.output?.schema ?? def.output, out);
+      if (errs.length > 0) problems.push(def.name + '：' + errs.join('；'));
+    }
+    // 队员侧两个工具
+    const memberDefs = tools.teamToolDefinitions({
+      runtime: runtimeStub, agentTeams, config: {}, include: ['report_result', 'ask_lead', 'send_message', 'list_agents'],
+    });
+    const byM = new Map(memberDefs.map((d) => [d.name, d]));
+    for (const [name, args] of [
+      ['report_result', { status: 'completed', summary: 'done', evidence: ['x'], acceptance: 'y', unresolved: [] }],
+      ['ask_lead', { question: 'which?' }],
+    ]) {
+      const def = byM.get(name);
+      if (def === undefined) { problems.push('member:' + name + '：工具不存在'); continue }
+      let out;
+      try { out = await def.execute(args, execM) } catch (error) {
+        problems.push('member:' + name + '：执行抛错 -> ' + (error instanceof Error ? error.message : String(error)).slice(0, 160));
+        continue;
+      }
+      const errs = validate(def.output?.schema ?? def.output, out);
+      if (errs.length > 0) problems.push('member:' + name + '：' + errs.join('；'));
+    }
+    assert.deepEqual(problems, [],
+      '这些工具的返回值与它自己声明的 schema 不符（宿主会判 ToolOutputError，'
+      + '而动作其实已经成功 —— 模型会以为失败并重试）：' + problems.join(' | '));
+  });
+
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
     // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
     // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方
