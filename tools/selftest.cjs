@@ -3649,6 +3649,12 @@ function functionBodyOf(source, needle) {
       assert.ok(text.includes(name), '关团提示没有提到 ' + name + '：模型会按团队的字段名继续调官方那份');
     }
     assert.ok(/没有 target|不叫 target/.test(text), '关团提示必须点明字段名差异（官方 list_agents 无 target、send_message 目标参数叫 agent）');
+    // ── 这是一条**约定闸门**，不是缺陷探测（2026-11-15 用户拍板「保持现状」）──────
+    // 本插件**故意**在关团时卸载这四个工具，让官方那份露出来（关团就断干净）。
+    // 若将来有人把 disable 改成「保留降级版」，这条闸门的语义就变了 ——
+    // 那时应当改掉本闸门与 lib/tools.js 里那段注释，而不是让两边各说各话。
+    // 这里额外钉一句：关团后**不应**再有「本插件的团队工具还在」的说法。
+    assert.ok(!/团队工具仍然可用|团队工具仍可用/.test(text), '关团提示不得声称团队工具仍然可用（与「关团即卸载」的约定矛盾）');
   });
 
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {

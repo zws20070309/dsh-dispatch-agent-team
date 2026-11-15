@@ -216,6 +216,32 @@ rc.2 及更早的宿主没有这个方法，插件会跳过同步（那边本来
 preset 作用域里注册了一个**同名空段**把它盖掉（官方语义：scoped section shadows
 global，`dsh-system-prompt/src/index.ts:477-483`）。
 
+#### 关团之后，那四个名字会变回官方版本（**已决定的取舍**）
+
+调度模式的 preset 里还启用着官方 `@deepseek-ai/dsh-tool-subagent-control`
+（`presets/dispatch-mode.patch.yml:208`），它注册了四个与本插件**同名**的工具：
+
+`list_agents` / `wait_agent` / `send_message` / `interrupt_agent`
+
+团队开着时，本插件在更深的 agent 作用域遮蔽它们。**一旦关团卸载，官方那四个就露出来**，
+而它们**同名不同义**：
+
+| | 本插件（团队开着） | 官方（团队关闭后） |
+|---|---|---|
+| `list_agents` 返回 | JSON 数组，每行带 `target` | `name [status] — description` 文本行，**没有 `target`** |
+| `send_message` 目标参数 | `target`（队员名） | `agent` |
+| `wait_agent` 等待对象 | 团队成员的邮箱/状态 | 调用者自己的 inbox |
+
+**这是刻意的设计，不是缺陷**：关团就断干净，不该再留着团队的四个工具，
+否则「团队已关闭」和「还能用团队工具」在工具面上自相矛盾。
+
+代价是模型可能按团队时期的字段名继续调官方那份然后失败 —— 所以
+`disable_agent_team` 的返回值里会明确写出这件事，让模型知道字段变了。
+
+> 如果你更希望「关团后仍保留本插件的四个降级版」以消除歧义，那需要改
+> `lib/tools.js` 的 disable 分支与 selftest 里那条约定闸门（代码里都写了位置）。
+> 当前选择是**保持断干净**。
+
 ### 典型的协作节奏
 
 ```
