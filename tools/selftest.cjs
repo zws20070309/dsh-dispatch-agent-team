@@ -3657,6 +3657,83 @@ function functionBodyOf(source, needle) {
     assert.ok(!/团队工具仍然可用|团队工具仍可用/.test(text), '关团提示不得声称团队工具仍然可用（与「关团即卸载」的约定矛盾）');
   });
 
+  await check('队员必须真的装上团队工具面（2026-11-15 真机第四轮的根因闸门）', async () => {
+    // ── 为什么必须有这一条（session-987dedcf 第四轮，队员自己汇报的原文）──────────
+    // 那一轮**每一个**队员都在说同一件事：
+    //   · team_task_list / team_task_get → Error: unknown tool
+    //   · report_result → 工具面里根本没有
+    //   · list_agents 返回官方格式（name/status/description，没有 target）
+    //   · 拿到的是完整通用工具集（blender / diagram / grep …）
+    // 根因：队员安装原来只靠 agent/created → syncAgent，而 rc.3 的
+    //   rootOf(child) 在那一刻还查不到 resident 里的 activation，会抛 UNAUTHORIZED
+    //   （dsh-subagent/lib/index.js:1643-1651），于是 syncAgent 判「不是队员」直接返回。
+    // 之前 155 条闸门全绿，是因为**没有一条测过队员侧到底装上了什么** ——
+    // 它们都在测 Lead 侧，或者测 installMember 的纯函数部分。
+    // 这条闸门补上：拿一个真实的 rc.3 形状替身，走 forceSyncMember，
+    // 断言队员的工具面**恰好**是 MEMBER_TEAM_TOOL_NAMES，一个不多一个不少。
+    const runtime = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'runtime.js')).href);
+    const roster = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'roster.js')).href);
+    const installed = [];
+    const mkCtx = () => ({
+      tools: {
+        register: (def) => { installed.push(def.name); return () => {}; },
+        restrict: () => () => {},
+        guard: () => () => {},
+      },
+      systemPrompt: { section: () => () => {}, getSectionOrder: () => 100 },
+    });
+    const root = { id: 'g-root', session: { id: 'g-root' }, ctx: mkCtx() };
+    const child = { id: 'g-child', session: { id: 'g-child', header: { origin: 'subagent' } }, ctx: mkCtx() };
+    // rc.3 形状：rootOf(child) 认得出根，namesOf 给 self 名字。
+    const subagents = {
+      rootOf: (a) => (a.id === 'g-child' ? root : a),
+      namesOf: (a) => (a.id === 'g-child' ? { self: 'researcher-g', parent: 'lead' } : { self: 'lead' }),
+      listDescendants: async () => [],
+      resolveName: async (_c, n) => n,
+      sendMessage: async () => 'm',
+      interrupt: () => {},
+    };
+    const agentTeams = {
+      ctx: null, listTasks: () => [], isEnabled: () => true, setEnabled: async () => {},
+      getTask: () => null, createTask: async () => null, updateTask: async () => null, config: {},
+    };
+    const hostCtx = {
+      get: (n) => (n === 'subagents' ? subagents : n === 'agentTeams' ? agentTeams : undefined),
+      on: () => () => {},
+    };
+    hostCtx.root = hostCtx;
+    agentTeams.ctx = hostCtx;
+    runtime.watchAgents(hostCtx);
+    const enabled = await runtime.enable(hostCtx, root, { source: 'selftest' });
+    assert.equal(enabled.ok, true, '替身里 enable 应当成功，否则本闸门测不到东西');
+    const beforeChild = installed.length;
+    const synced = runtime.forceSyncMember(hostCtx, child);
+    assert.equal(synced.ok, true, 'forceSyncMember 应当成功：' + JSON.stringify(synced));
+    const childTools = installed.slice(beforeChild);
+    // 队员必须拿到 report_result（结构化汇报）与四个任务板工具。
+    for (const name of ['report_result', 'team_task_create', 'team_task_list', 'team_task_get', 'team_task_update']) {
+      assert.ok(childTools.includes(name), '队员工具面缺 ' + name + ' —— 真机上表现为 unknown tool，队员只能改用自由文本汇报');
+    }
+    // 也必须拿到通信三件套。
+    for (const name of ['send_message', 'list_agents', 'wait_agent']) {
+      assert.ok(childTools.includes(name), '队员工具面缺 ' + name);
+    }
+    // 不许拿到 Lead 专属的两个（派人与打断）。
+    for (const name of ['spawn_teammate', 'interrupt_agent']) {
+      assert.ok(!childTools.includes(name), '队员不该拿到 Lead 专属工具 ' + name);
+    }
+    // 与真值表逐项一致（不多不少）：多了就是越权，少了就是功能缺失。
+    const expected = new Set(roster.MEMBER_TEAM_TOOL_NAMES);
+    const got = new Set(childTools);
+    const extra = [...got].filter((n) => !expected.has(n));
+    const missing = [...expected].filter((n) => !got.has(n));
+    assert.deepEqual(extra, [], '队员工具面多出了不该有的工具：' + extra.join(', '));
+    assert.deepEqual(missing, [], '队员工具面缺少应有的工具：' + missing.join(', '));
+    // 未开团的会话（树根不在 state.roots）不许装 —— 否则团队会泄漏到普通会话。
+    const strayChild = { id: 'g-stray', session: { id: 'g-stray', header: { origin: 'subagent' } }, ctx: mkCtx() };
+    const stray = runtime.forceSyncMember(hostCtx, strayChild);
+    assert.equal(stray.ok, false, '树根不在已开团名单里时 forceSyncMember 必须拒绝（防团队泄漏到别处）');
+  });
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
     // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
     // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方

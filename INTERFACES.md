@@ -293,6 +293,8 @@ export function inject(agent, text, attachments?); // 把 text（+ 可选的宿�
 export function pinSpawnRoute(name, route);// 给某个队员钉路由；**只**由 spawn 的显式参数产生（§0.1 第 41 条）
 export function watchAgents(ctx);          // 幂等订阅 agent/created、agent/disposed、session/event（截断记账的入口）
 export function reconcileAgents(ctx);      // 给所有活体 agent 补齐安装：冷恢复 + 补装的统一入口
+export function forceSyncMember(ctx, agent); // 给**刚派出去**的队员立刻装工具面（rc.3 的 agent/created 早于 resident 登记，靠事件装不上）；
+                                            // 返回 {ok, reason?}。spawn_teammate 派完立刻调它，agent/created 再用微任务补一次。
 export async function watchConfigFile(ctx);// 盯配置文件所在目录（重装语义先收旧）：绕过配置页直接改盘 200ms 内刷新快照。
                                             //    T9-3 实机根因闸门之一；watch 目录而非文件 = 对 saveConfig 的 tmp+rename 免疫。
                                             //    永不抛错（失败只记诊断）；index.js apply 在 await loadConfig 首读之后调用
