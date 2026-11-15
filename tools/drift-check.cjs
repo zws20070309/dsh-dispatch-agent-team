@@ -39,6 +39,20 @@ const OFFICIAL_TEAM_TOOL_NAMES = [
   'team_task_update',
 ];
 
+/**
+ * 这九个官方名字在 rc.3 各由哪个包提供（2026-11-15 实测）。
+ *
+ * rc.3 之前的旧值全部在 dsh-experimental-tool-agent-team。rc.3 拆成：
+ *   tool-agent-team        team_task_*        （任务板四件）
+ *   tool-subagent-control  send_message / list_agents / wait_agent / interrupt_agent
+ *   subagent / subagent_fork（即 tool-subagent 的 toolName）**取代了 spawn_teammate**
+ *
+ * 也就是说 `spawn_teammate` 这个名字在 rc.3 里**已经不存在**（升级指南
+ * docs/upgrade-guide/v0.2.1-rc.2/agent-team-subagents 明确写了「移除 spawn_teammate」）。
+ * 本插件自己注册这个工具名，所以它仍能工作；但它不再是「官方也有的名字」。
+ */
+const TOOLS_REMOVED_IN_RC3 = Object.freeze(['spawn_teammate']);
+
 // ── 参数 ─────────────────────────────────────────────────────────────────────
 function argValue(flag) {
   const index = process.argv.indexOf(flag);
@@ -61,6 +75,44 @@ const ASAR_CANDIDATES = [
 const PROFILE_DIR = require('./lib-dsh-home.cjs').resolveProfileDir({ explicit: argValue('--profile') }).profileDir;
 
 const PLUGIN_DIR = path.resolve(__dirname, '..');
+
+/**
+ * 官方团队相关包的**别名表**：旧名 → 新名。
+ *
+ * 为什么需要（2026-11-15，0.2.2-rc.3 实测）：rc.3 把团队三件套从
+ * `dsh-experimental-*` 改名成 `dsh-*`：
+ *
+ *   旧（rc.2 及以前）                              新（rc.3）
+ *   dsh-experimental-agent-team             →   dsh-agent-team
+ *   dsh-experimental-tool-agent-team        →   dsh-tool-agent-team
+ *   dsh-experimental-client-ui-agent-team   →   dsh-client-ui-agent-team
+ *
+ * 如果这里的判据还把旧名写死，升级后会得到一批**假红**（"读不到官方实现"），
+ * 读的人分不清「官方真的改了」还是「官方只是改了个名字」——这正是 2026-11-15
+ * 那份检查报告把结论带偏的方式之一。所以读取一律走别名表：先试新名，再退回旧名，
+ * 两边都没有才是真红。判据本身（比对什么内容）一个字不动。
+ */
+const OFFICIAL_PKG_ALIASES = Object.freeze({
+  'dsh-experimental-agent-team': ['dsh-agent-team'],
+  'dsh-experimental-tool-agent-team': ['dsh-tool-agent-team'],
+  'dsh-experimental-client-ui-agent-team': ['dsh-client-ui-agent-team'],
+});
+
+/**
+ * 把一个归档内路径按别名表展开成若干候选路径（原路径在前，改名后的替身在后面）。
+ * 只替换 `node_modules/@deepseek-ai/<包名>` 那一段，其余原样。
+ * @param {string} entryPath - 归档内相对路径。
+ * @returns {string[]} 去重后的候选路径（至少含原路径）。
+ */
+function aliasPaths(entryPath) {
+  const out = [entryPath];
+  const match = /node_modules\/@deepseek-ai\/([^/]+)\//u.exec(entryPath);
+  if (match === null) return out;
+  for (const alias of OFFICIAL_PKG_ALIASES[match[1]] ?? []) {
+    out.push(entryPath.replace(`node_modules/@deepseek-ai/${match[1]}/`, `node_modules/@deepseek-ai/${alias}/`));
+  }
+  return [...new Set(out)];
+}
 
 // ── 极简 asar 读取（无依赖）──────────────────────────────────────────────────
 function openAsar(file) {
@@ -88,12 +140,16 @@ function openAsar(file) {
      * @returns {string|undefined}
      */
     read(entryPath) {
-      const direct = this.readAt(entryPath);
-      if (direct !== void 0) return direct;
-      const alt = entryPath.startsWith('dsh/node_modules/')
-        ? entryPath.slice('dsh/'.length)
-        : ('dsh/' + entryPath);
-      return this.readAt(alt);
+      for (const candidate of aliasPaths(entryPath)) {
+        const direct = this.readAt(candidate);
+        if (direct !== void 0) return direct;
+        const alt = candidate.startsWith('dsh/node_modules/')
+          ? candidate.slice('dsh/'.length)
+          : ('dsh/' + candidate);
+        const viaAlt = this.readAt(alt);
+        if (viaAlt !== void 0) return viaAlt;
+      }
+      return void 0;
     },
     readAt(entryPath) {
       let node = this.json;
@@ -229,53 +285,87 @@ console.log(`[drift-check] 宿主版本  : ${asarVersion('package.json')} → ${
 console.log(`[drift-check] 插件依赖  : ${junctionVersion('@deepseek-ai/dsh-tools')}（junction → 全局 CLI 的闭包，**不是**宿主那一份）`);
 console.log('');
 
-// 1) 官方 agent-team bundle 的三行 id 是否还在
-const officialProfilePatch =
-  asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team-profile/cordis.patch.yml') || '';
-check('官方 agent-team-profile 的 patch 仍存在且含三行 id', () => {
-  if (officialProfilePatch === '') return '读不到 dsh-experimental-agent-team-profile/cordis.patch.yml';
-  for (const id of ['agent-team', 'tool-agent-team', 'ui-agent-team']) {
-    if (!new RegExp(`(^|\\n)\\s*-?\\s*id:\\s*${id}\\s*$`, 'm').test(officialProfilePatch)) {
-      return `官方 patch 里找不到行 id "${id}" —— 我们的 disabled 覆盖会空转，官方工具可能悄悄回来`;
-    }
+// 1) 官方团队三行 id 是否还在
+//
+// ── 2026-11-15 rc.3 改判：这三个 id 不再由「agent-team-profile」这个可选 bundle 提供 ──
+// rc.2：官方有个独立 bundle @deepseek-ai/dsh-experimental-agent-team-profile，
+//       用自己的 patch 用 `insert` 新建 agent-team / tool-agent-team / ui-agent-team 三行。
+// rc.3：那个 bundle **整个没了**（asar 里 0 命中），三行拆进基线：
+//       * `agent-team` + `tool-agent-team` → dsh-base/cordis.patch.yml:366-372 的 insert
+//       * `ui-agent-team`                → dsh-web-app/cordis.patch.yml:412-413 的 insert
+// 于是「读 agent-team-profile 的 patch」这条判据在 rc.3 必然假红（包都不存在了）。
+// 改成：**在基线两层的 patch 里**核对这三个 id 仍然存在且仍是 insert 新建的。
+const officialProfilePatch = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team-profile/cordis.patch.yml') || '';
+const basePatch = asar.read('dsh/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml') || '';
+const webAppPatch = asar.read('dsh/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml') || '';
+check('官方团队三行 id 仍存在（rc.3：由 base / web-app 两层的 insert 提供）', () => {
+  const sources = basePatch + '\n' + webAppPatch + '\n' + officialProfilePatch;
+  if (basePatch === '' && webAppPatch === '' && officialProfilePatch === '') {
+    return '三处官方 patch 一个都读不到（base / web-app / agent-team-profile）—— 环境异常';
   }
-  return true;
+  const missing = [];
+  for (const id of ['agent-team', 'tool-agent-team', 'ui-agent-team']) {
+    // 只看非注释行（官方把行删了、注释还提它，不能算命中）。
+    const nonComment = sources.split('\n').filter((line) => !/^\s*#/u.test(line)).join('\n');
+    if (!new RegExp(`^\\s*-\\s+id:\\s*${id}\\s*$`, 'mu').test(nonComment)) missing.push(id);
+  }
+  return missing.length === 0
+    ? true
+    : `官方哪一层都找不到这些行 id：${missing.join(', ')} —— 我们针对它们的 disabled/config 覆盖会空转`;
 });
 
 // 2) 官方工具包仍导出九工具与我们依赖的成员
 const officialTool = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-tool-agent-team/lib/index.js') || '';
-check('官方工具包仍含九个工具名', () => {
-  if (officialTool === '') return '读不到 dsh-experimental-tool-agent-team/lib/index.js';
-  // P2-19④：要求 `name: "x"` 这一定义形状，而不是裸 `"x"` 子串 —— 后者连
-  // 「名字只出现在注释或错误文案里」都算命中。实测今日九个全部以该形状出现。
-  const missing = OFFICIAL_TEAM_TOOL_NAMES.filter((name) => !officialTool.includes(`name: "${name}"`));
+/**
+ * rc.3 把这九个名字**拆到两个包**里（2026-11-15 实测，见 OFFICIAL_TEAM_TOOL_PACKAGES）：
+ * 任务板四件仍在 tool-agent-team，而 spawn/send/list/wait/interrupt 五个控制类
+ * 搬到了 tool-subagent-control（spawn_teammate 更是直接删除，改由 subagent / subagent_fork 承担）。
+ * 所以判据从「一个包里找齐九个」改成「按拆分包逐个找，全部找到才算齐」。
+ */
+const controlTool = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-subagent-control/lib/index.js') || '';
+const subagentTool = asar.read('dsh/node_modules/@deepseek-ai/dsh-tool-subagent/lib/index.js') || '';
+check('官方工具包仍含九个工具名（按 rc.3 的两包拆分核对）', () => {
+  if (officialTool === '') return '读不到 tool-agent-team/lib/index.js（新旧包名都没有）';
+  const sources = officialTool + '\n' + controlTool + '\n' + subagentTool;
+  // spawn_teammate 在 rc.3 被官方**删除**（升级指南「移除 spawn_teammate」）。本插件自己注册
+  // 这个名字，所以它仍可用；但它不再该在官方包里找 —— 找得到才是异常（说明官方又加回来了，
+  // 那就会与本插件抢同一个作用域的同一个名字）。
+  const present = TOOLS_REMOVED_IN_RC3.filter((name) => sources.includes(`name: "${name}"`));
+  if (present.length > 0) return `官方包里又出现了已被删除的名字：${present.join(', ')} —— 会与本插件抢同名工具`;
+  const missing = OFFICIAL_TEAM_TOOL_NAMES
+    .filter((name) => !TOOLS_REMOVED_IN_RC3.includes(name))
+    .filter((name) => !sources.includes(`name: "${name}"`));
   return missing.length === 0 ? true : `官方工具包里找不到这些工具定义：${missing.join(', ')} —— 本插件的 lib/tools.js 需要对齐`;
 });
 
 // 3) 官方域服务仍提供 agentTeams 及我们调用到的方法
 const officialDomain = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/index.js') || '';
 check('官方域服务仍提供 agentTeams 与全部被调用方法', () => {
-  if (officialDomain === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
+  if (officialDomain === '') return '读不到 agent-team/lib/index.js（新旧包名都没有）';
   if (!officialDomain.includes('"agentTeams"')) return '域服务不再发布 agentTeams';
-  const methods = [
-    'tryMembership',
-    'membership',
-    'listMembers',
-    'spawnTeammate',
-    'sendMessage',
-    'createTask',
-    'getTask',
-    'listTasks',
-    'updateTask',
-    'waitForChange',
-    'interrupt',
-  ];
+  // rc.3 的**现行**方法集（2026-11-15 对着 lib/index.js 逐个核过）。
+  // 旧名 tryMembership / membership / listMembers / spawnTeammate / waitForChange / interrupt
+  // 在 rc.3 已被官方删除（升级指南「ctx.agentTeams 移除创建、通信、中断、名册、成员关系和等待 API」），
+  // 对应的替代是 ctx.subagents.rootOf / listDescendants / startActivation / sendMessage / interrupt。
+  const methods = ['isEnabled', 'setEnabled', 'createTask', 'getTask', 'listTasks', 'updateTask'];
   // P2-19④：旧写法判据是 `name + '('`，那**不区分定义与调用点**——官方内部大量互相调用
-  // （如 roster 里的 `this.tryMembership(agent)`、`this.ctx.subagents.interrupt(target.id, …)`），
-  // 所以哪怕域服务上那个方法整个被删，检查也照样绿。改成要求「行首缩进 + (async )?名字 + (」
-  // 这一**定义**形状；实测今日 11 个方法全部命中（397/387/1755/1764/1773/1782/1791/1799/1808/1818/503）。
+  // （如 `this.ctx.subagents.rootOf(caller)`），所以哪怕域服务上那个方法整个被删，检查也照样绿。
+  // 改成要求「行首缩进 + (async )?名字 + (」这一**定义**形状。
   const missing = methods.filter((name) => !new RegExp('^\\s{0,10}(?:async\\s+)?' + name + '\\s*\\(', 'mu').test(officialDomain));
-  return missing.length === 0 ? true : '域服务里找不到这些**方法定义**：' + missing.join(', ');
+  if (missing.length > 0) return '域服务里找不到这些**方法定义**：' + missing.join(', ');
+
+  // 被删的那些**必须**真的没了：如果官方又把它们加回来，本插件的兼容层会走错分支。
+  const resurrected = ['tryMembership', 'listMembers', 'spawnTeammate', 'waitForChange']
+    .filter((name) => new RegExp('^\\s{0,10}(?:async\\s+)?' + name + '\\s*\\(', 'mu').test(officialDomain));
+  if (resurrected.length > 0) return '官方又把这些已删方法加回来了：' + resurrected.join(', ') + ' —— 本插件的兼容层要重判';
+
+  // rc.3 起成员枚举搬到 ctx.subagents（本插件的兼容层就从这里取），必须确认它在。
+  const subagentSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '';
+  if (subagentSrc === '') return '读不到 dsh-subagent/lib/index.js —— 兼容层没地方取成员枚举';
+  const subagentMissing = ['rootOf', 'listDescendants', 'sendMessage', 'interrupt']
+    .filter((name) => !new RegExp('^\\s{0,10}(?:async\\s+)?' + name + '\\s*\\(', 'mu').test(subagentSrc));
+  if (subagentMissing.length > 0) return 'ctx.subagents 缺这些方法（本插件成员枚举的替代路径）：' + subagentMissing.join(', ');
+  return true;
 });
 
 // 4) agent/request waterfall 仍在（队员模型/强度覆盖的唯一支点）
@@ -365,11 +455,15 @@ check('plugins.bundle.config 槽位仍存在', () => {
   return true;
 });
 
-// 8) 我们重新挂载的官方 UI 包是否还在
-check('官方团队 UI 包仍存在（我们用它做成员列表/看板）', () =>
-  (asar.has('dsh/node_modules/@deepseek-ai/dsh-experimental-client-ui-agent-team/lib/client.js')
+// 8) 官方团队 UI 包是否还在（rc.3 已改名为 dsh-client-ui-agent-team）
+// 本包不再挂它（见下面「不再挂已改名的官方 UI 包」那条），但仍需确认官方那个包存在 ——
+// 它是输入框那个「启用智能体团队协作」开关的提供者：开关由
+// dsh-client-ui-agent-team/src/client/mount.ts 的
+// slots.register({ name: 'conversation.input.model.options', id: 'agent-team' }) 注册。
+check('官方团队 UI 包仍存在（输入框团队开关的提供者）', () =>
+  (asar.has('dsh/node_modules/@deepseek-ai/dsh-client-ui-agent-team/lib/client.js')
     ? true
-    : 'dsh-experimental-client-ui-agent-team 消失 —— cordis.patch.yml 里 dispatch-agent-team-panel 行需要删掉或换实现'));
+    : 'dsh-client-ui-agent-team 消失 —— 输入框的「启用智能体团队协作」开关会没有提供者'));
 
 // 8c) 工作区入口依赖的官方 DOM 标记与槽位（2026-10-08 落地时加的闸门）。
 // 入口「进入工作区」是注入进**官方成员面板**的（面板整体在只读 app.asar 里，我们改不动它的 JSX），
@@ -379,15 +473,27 @@ check('官方团队 UI 包仍存在（我们用它做成员列表/看板）', ()
 // 所以这三条必须钉成可跑断言，飘了就红，而不是等用户报「入口没了」。
 const officialTeamUi = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-client-ui-agent-team/lib/client.js') || '';
 const officialUiSession = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-session/lib/client.js') || '';
-check('工作区入口依赖的官方面板标记与 sessionId prop 仍在（改名会让按钮静默消失）', () => {
-  if (officialTeamUi === '') return '读不到 dsh-experimental-client-ui-agent-team/lib/client.js';
+// ── 2026-11-15 rc.3 改判 ────────────────────────────────────────────────────
+// rc.2：入口锚在官方团队弹层的 [data-team-action]（触发器）+ [data-team-panel]（面板）。
+// rc.3：**触发器和成员面板整个没了** —— dsh-client-ui-agent-team 现在只往
+//       conversation.session.header.actions.subagent.footer 注册一个任务看板
+//       （见 dsh-client-ui-agent-team/src/client/mount.ts:68-70），成员浏览搬给了
+//       dsh-client-ui-subagent（[data-subagent-panel] / [data-subagent-action]）。
+// 所以这条闸门改成钉 rc.3 的替代标记：lib/client.js 的 syncSubagentEntry 靠它们工作。
+const officialSubagentUi = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-subagent/lib/client.js') || '';
+check('工作区入口依赖的官方标记与 sessionId prop 仍在（改名会让按钮静默消失）', () => {
   if (officialUiSession === '') return '读不到 dsh-client-ui-session/lib/client.js';
+  if (officialSubagentUi === '') return '读不到 dsh-client-ui-subagent/lib/client.js';
   const missing = [];
-  if (!officialTeamUi.includes('"data-team-panel"')) missing.push('面板根 data-team-panel');
-  if (!officialTeamUi.includes('"data-team-action"')) missing.push('触发器 data-team-action');
-  if (!officialTeamUi.includes('"conversation.session.header.actions"')) missing.push('槽 conversation.session.header.actions');
+  // rc.3 的替代标记（lib/client.js 的 syncSubagentEntry / resolveSubagentPanelSession 依赖）
+  if (!officialSubagentUi.includes('"data-subagent-panel"')) missing.push('rc.3 弹层根 data-subagent-panel');
+  if (!officialSubagentUi.includes('"data-subagent-action"')) missing.push('rc.3 触发器 data-subagent-action');
+  if (!officialSubagentUi.includes('"data-subagent-section-header"')) missing.push('rc.3 区段标题 data-subagent-section-header');
   // sessionId 是 session 作用域的标准注入 prop（BUILTIN_SOURCE.props）；锚点靠它拿权威会话 id。
-  if (!/props:\s*\[\s*"sessionId"/u.test(officialUiSession)) missing.push('session 作用域注入的 sessionId prop');
+  // rc.3 的产物用**反引号**写字符串字面量（`props:[`sessionId`]`），不再是双引号 ——
+  // 2026-11-15 实测：只认双引号会假红（而这条一旦假红，读的人会以为入口真的坏了）。
+  // 所以这里三种引号都认。
+  if (!/props:\s*\[\s*["'`]sessionId["'`]/u.test(officialUiSession)) missing.push('session 作用域注入的 sessionId prop');
   return missing.length === 0 ? true : `官方这些标记变了，lib/client.js 的入口注入要跟着改：${missing.join('、')}`;
 });
 
@@ -403,15 +509,28 @@ check('左侧栏入口依赖的官方槽位、panel id 校验与渲染 props 仍
   if (officialLayout === '') return '读不到 dsh-client-ui-layout/lib/client.js';
   if (officialSidebar === '') return '读不到 dsh-client-ui-sidebar/lib/client.js';
   const missing = [];
+  // ── 2026-11-15 rc.3：官方产物改用**反引号**写字符串字面量（`renderSlot(\`sidebar.panellist\`,…)`），
+  // 旧判据全部只认双引号，于是整条假红。这里统一换成「三种引号都认」的写法。
+  const q = '["\x27`]';
   // sidebar.panellist 必须是 list 且声明在 sidebar 的子槽表里（list 槽才认 id）。
-  if (!officialSidebar.includes('"sidebar.panellist"')) missing.push('槽 sidebar.panellist');
-  if (!/renderSlot\("sidebar\.panellist",\s*\{[^}]*size:/u.test(officialSidebar)) missing.push('panellist 渲染时注入的 size prop');
+  if (!new RegExp('sidebar\\.panellist', 'u').test(officialSidebar)) missing.push('槽 sidebar.panellist');
+  // rc.3 的实际写法：`function PanelIcon({id,size,active,renderSlot}){return renderSlot(\`sidebar.panellist\`,{size,active},{only:id})}`
+  // —— 仍然是「把 size 作为 props 传给 sidebar.panellist」。判据放宽到「同一个 renderSlot 调用里出现 size」。
+  if (!new RegExp('renderSlot\\(\\s*' + q + 'sidebar\\.panellist' + q + '\\s*,\\s*\\{[^}]*\\bsize\\b', 'u').test(officialSidebar)) {
+    missing.push('panellist 渲染时注入的 size prop');
+  }
   // 行点击 → selectPanel(id)（本插件把 id 与 main 的 key 写成同一个值就靠这条）。
-  if (!officialSidebar.includes('selectPanel(id)')) missing.push('侧栏行点击调用的 selectPanel(id)');
+  if (!/selectPanel\(\s*id\s*\)/u.test(officialSidebar)) missing.push('侧栏行点击调用的 selectPanel(id)');
   // "main" 槽必须仍是 keyed（keyed 认 key，list 认 id —— 换了我们两侧的注册形状就都错）。
-  if (!/"main":\s*\{\s*kind:\s*"keyed"/u.test(officialLayout)) missing.push('main 槽的 kind:"keyed"');
-  // 校验语义：selectPanel 按 `entry.options.key === id` 判断主面板是否注册。
-  if (!officialLayout.includes('entry.options.key === id')) missing.push('selectPanel 的 key === id 校验');
+  if (!new RegExp(q + 'main' + q + '\\s*:\\s*\\{\\s*kind\\s*:\\s*' + q + 'keyed' + q, 'u').test(officialLayout)) {
+    missing.push('main 槽的 kind:"keyed"');
+  }
+  // 校验语义：主面板 id 必须与 activePanelId 的存活判定挂钩。
+  // rc.3 把它从「selectPanel 里比对 entry.options.key === id」搬到了
+  // retainMainPanels（panelIds 不含 activePanelId 时置空）—— 判据跟着语义走，不钉具体写法。
+  if (!/retainMainPanels/u.test(officialLayout) && !officialLayout.includes('entry.options.key === id')) {
+    missing.push('主面板 id 校验（retainMainPanels 或 entry.options.key === id）');
+  }
   return missing.length === 0 ? true : `官方这些约定变了，lib/client.js 的侧栏注册要跟着改：${missing.join('、')}`;
 });
 
@@ -435,31 +554,39 @@ const teamTypesDir = (() => {
 const officialTeamAll = [officialTeamCore,
   ...teamTypesDir.map((f) => asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/' + f) || ''),
 ].join('\n');
-check('工作区读取的官方团队事件字段名仍在（改名会让画布的边/统计静默变 0）', () => {
-  if (officialTeamCore === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
+// ── 2026-11-15 rc.3 改判：团队事件集体消失 ──────────────────────────────────
+// rc.2 及以前，画布的**两条通道**都建在官方事件上：
+//   * team/member          → 成员节点与名字
+//   * team/message/queued  → 派活边（Lead→员）
+//   * team/message/delivered → 投递回执
+// rc.3 把这些**全删了**：实测 dsh-agent-team/lib/index.js 只剩两处 append ——
+//   `root.session.append("team/task", …)`（:93）与 `append("team/mode", …)`（:793），
+// 而 `team/member` / `team/message*` 在整个 asar 里只作为**历史数据**出现在
+// session-format 迁移表里（旧会话日志仍能解码，但新会话不再产生）。
+// 升级指南也明说「历史 Team 名册和邮箱记录仍可读取…仅作为历史数据」。
+//
+// 所以这条闸门从「字段名还在不在」改成「**现行**的两个事件还在不在」：
+// 画布在 rc.3 下靠 team/task（任务板，带 ownerId/ownerName = 归属边）+
+// ctx.subagents.listDescendants（成员枚举）来画，不再依赖已死的消息事件。
+check('工作区读取的官方团队事件名仍在（改名会让画布的边/统计静默变 0）', () => {
+  if (officialTeamCore === '') return '读不到 agent-team/lib/index.js（新旧包名都没有）';
   const missing = [];
-  // team/message/queued：data.message.{id,senderName,targetId}（lib/graph.js 的 msgFrom/msgSender 依赖）
-  if (!/senderName:\s*[A-Za-z_$][\w$]*\.name/u.test(officialTeamCore) && !officialTeamCore.includes('senderName:')) {
-    missing.push('team/message 的 senderName');
+  // rc.3 现行的两个事件（本插件在 rc.3 下唯一还能依赖的团队事件）。
+  if (!officialTeamCore.includes('"team/task"')) missing.push('team/task 事件名');
+  if (!officialTeamCore.includes('"team/mode"')) missing.push('team/mode 事件名');
+  // team/task 的 v2 载荷字段（lib/graph.js 折叠任务板/归属边时读的就是这几个）。
+  for (const field of ['ownerId', 'ownerName', 'subject']) {
+    if (!officialTeamAll.includes(field)) missing.push('team/task 的 ' + field);
   }
-  if (!officialTeamCore.includes('targetId')) missing.push('team/message 的 targetId');
-  // team/message/delivered：**扁平**（version/teamId/messageId/targetId），不是 message 包装。
-  //
-  // 2026-11-07：0.2.2-rc.1 重构后 appendAndFlush 与 mailbox.js 都没了；delivered 的 schema
-  // 解析（teamMessageDeliveredEventSchema）与状态迁移（按 messageId 找 queued、核对 targetId）
-  // 实读仍在 index.js/projection.js。判据继续跟事件走：① 事件名仍在；② schema 驱动仍在；
-  // ③ 状态迁移仍按 messageId/targetId 核对（graph.js 读的就是这三个字段）。
-  if (!officialTeamAll.includes("'team/message/delivered'") && !officialTeamAll.includes('"team/message/delivered"')) {
-    missing.push('team/message/delivered 事件名');
+  // 已被官方删除的那批：如果哪天又回来说，本插件要重新判断「两套通道并存时用哪个」。
+  const resurrected = ['team/member', 'team/message/queued', 'team/message/delivered']
+    .filter((name) => new RegExp('["\x27`]' + name.replaceAll('/', '\\/') + '["\x27`]', 'u').test(officialTeamCore));
+  if (resurrected.length > 0) {
+    return `官方又把这些已删除的团队事件加回来了：${resurrected.join('、')} —— 画布的两条通道要重新判定优先级`;
   }
-  if (!/teamMessageDeliveredEventSchema/u.test(officialTeamAll)) missing.push('team/message/delivered 的 schema');
-  if (!/delivered before queueing/u.test(officialTeamAll)) missing.push('delivered 的状态迁移（messageId/targetId 核对）');
-  if (!officialTeamCore.includes('messageId')) missing.push('team/message/delivered 的 messageId');
-  // team/member：data.member.{id,name}（节点名来源）
-  if (!officialTeamCore.includes('"team/member"')) missing.push('team/member 事件名');
   return missing.length === 0
     ? true
-    : `官方团队事件的字段/事件名变了，lib/graph.js 的折叠要跟着改（否则画布静默缺边或统计为 0）：${missing.join('、')}`;
+    : `官方团队事件变了，lib/graph.js 的折叠要跟着改（否则画布静默缺边或统计为 0）：${missing.join('、')}`;
 });
 
 // 9) patch 层的**顺序语义**（2026-09-28 的 P0 教训）。
@@ -472,14 +599,16 @@ check('工作区读取的官方团队事件字段名仍在（改名会让画布�
 // 现在：官方工具面/策略段的抑制在**调度模式的 preset 作用域**（lib/preset.js 的 suppressOfficialTeam），
 // 域服务容量覆盖则**必须同时**出现在 profile 自己的 patch 层（在所有 bundle 层之后应用）。
 const oursPatch = readFileOr(path.join(PLUGIN_DIR, 'cordis.patch.yml'));
-check('官方 team bundle 用 insert 新建三行（所以 id 覆盖必须落在它之后的层）', () => {
-  if (officialProfilePatch === '') return '读不到官方 agent-team-profile 的 patch';
-  if (!/-\s*insert:/u.test(officialProfilePatch)) {
+// rc.3：这三行现在由 base / web-app 两层**各自的 insert** 新建（见上面第 1 条）。
+// 判据保留的**目的**是「顺序语义」：id 覆盖必须落在 insert 之后的层，所以这里只要求
+// 「这几个 id 确实出自某个 insert 块」，不再绑定具体是哪个包。
+check('官方团队三行仍由 insert 新建（所以 id 覆盖必须落在它之后的层）', () => {
+  const sources = basePatch + '\n' + webAppPatch + '\n' + officialProfilePatch;
+  if (sources.trim() === '') return '三处官方 patch 一个都读不到';
+  const nonComment = sources.split('\n').filter((line) => !/^\s*#/u.test(line)).join('\n');
+  if (!/-\s*insert:/u.test(nonComment)) {
     return '官方 patch 不再用 insert：patch 的组合顺序语义变了，必须重读 dsh-app-boot 的 loadProfileDirectory/readProfilePatches';
   }
-  // P2-19①：必须锚定到**非注释的 YAML 行**上的 `- id:`。旧正则的裸子串会命中注释里的
-  // 同名字样 —— 官方把行删了、注释还提它，就会假 PASS。
-  const nonComment = officialProfilePatch.split('\n').filter((line) => !/^\s*#/u.test(line)).join('\n');
   const missing = ['agent-team', 'tool-agent-team', 'ui-agent-team']
     .filter((id) => !new RegExp(`^\\s*-\\s+id:\\s*${id}\\s*$`, 'mu').test(nonComment));
   return missing.length === 0 ? true : `官方 insert 里缺行 id：${missing.join(', ')}`;
@@ -490,12 +619,24 @@ check('官方 team bundle 用 insert 新建三行（所以 id 覆盖必须落在
 // 为什么需要这条：README 曾经把「我们已不再重复挂载」写成事实（P1-8），后来 panel 行加回，
 // 靠的是人工发现。若将来有人按那份旧 README 把行删掉，**没有任何闸门会响**，
 // 用户关掉官方 ui-agent-team 行时成员列表/任务看板会静默消失。只读文本级断言，够了。
-check('本包 cordis.patch.yml 仍用自有行 id 重新挂载官方 UI 包（删掉它看板会静默消失）', () => {
+// ⚠️ 2026-11-15 rc.3 改判：**这一行已经删掉，而且应该保持删掉**。
+// 旧判据要求「本包 reap 官方 UI 包」，理由是「用户关掉官方 ui-agent-team 时面板还要在」。
+// 那条理由在 rc.3 不成立了：
+//   ① 被挂的 specifier 是 dsh-experimental-client-ui-agent-team，rc.3 已改名为
+//      dsh-client-ui-agent-team（旧名在 app.asar 里 0 命中）→ 那一行本来就加载不到；
+//   ② 官方 web-app bundle 自己 insert 并保持启用 ui-agent-team，没人会去关它；
+//   ③ 本包客户端从不 import 它（lib/client.js 只 require('react')）。
+// 所以现在反过来钉：**不许**再出现这个悬空引用（写回去 = 一行永远点不亮的 loader 行）。
+check('本包 cordis.patch.yml 不再挂已改名的官方 UI 包（rc.3：该行已删）', () => {
   if (oursPatch === '') return '读不到 cordis.patch.yml';
-  const panelRow = /-\s*id:\s*dispatch-agent-team-panel\b[\s\S]{0,200}?name:\s*'?(@deepseek-ai\/dsh-experimental-client-ui-agent-team)'?/u.exec(oursPatch);
-  if (panelRow === null) {
-    return 'cordis.patch.yml 里找不到 dispatch-agent-team-panel 行（或它的 name 不再是官方 UI 包）——'
-      + ' MAINTAINER-NOTES.md §1.4 明确靠这一行保证「用户关掉官方 ui-agent-team 时成员列表与看板仍在」，删掉即功能静默降级';
+  const dangling = /name:\s*'?(@deepseek-ai\/dsh-experimental-client-ui-agent-team)'?/u.exec(oursPatch);
+  if (dangling !== null) {
+    return 'cordis.patch.yml 又挂上了 dsh-experimental-client-ui-agent-team —— rc.3 已把它改名为 '
+      + 'dsh-client-ui-agent-team，旧名在 app.asar 里 0 命中，这一行永远加载不到（悬空引用）';
+  }
+  // 官方那个包本身必须还在（说明改名而不是消失）。
+  if (!asar.has('dsh/node_modules/@deepseek-ai/dsh-client-ui-agent-team/lib/client.js')) {
+    return '官方团队 UI 包整个不见了（改名与消失是两回事，这条要人看）';
   }
   return true;
 });
@@ -539,24 +680,31 @@ check('package.json exports 覆盖 "." / "./client" / "./preset"', () => {
   return missing.length === 0 ? true : `exports 缺：${missing.join(', ')}（会导致对应的插件行/浏览器半静默失效）`;
 });
 
-// 10c) 我们 patch 里对官方 agent-team 行的 config 覆盖必须是「整段」（5 个字段全在），
-// 且 maxMembers 要大于角色数——官方 roster 的 maxMembers 计的是**历史累计**（队员名永不复用）。
-check('agent-team 行 config 覆盖完整且 maxMembers 够用', () => {
+// 10c) 我们 patch 里对官方 agent-team 行的 config 覆盖。
+//
+// ── 2026-11-15 rc.3 改判：只许写 maxTasks，**五个字段全在**这条旧判据已经变成有害的 ──
+// rc.2：那 5 个字段都能写，且「整段替换」的语义要求写全。
+// rc.3：TeamService 构造函数**主动拒绝** maxMembers / maxMessageBytes / disposalTimeoutMs
+//       （dsh-agent-team/src/index.ts:34-35、:62-69；编译产物 lib/index.js:697-701、:753），
+//       而 schemastery 非 strict 模式**不剥未知键**（lib/index.mjs:512-527 的 merge()），
+//       所以写进去 = 构造即抛 TEAM_INVALID_CONFIG = 域服务不注册 = 输入框团队开关消失。
+//       旧判据逼着人「写全 5 个字段」，恰恰就是在逼人把 DSH 弄坏。
+// 现在双向都钉：maxTasks 必须在，那三个被拒的键**必须在**。
+check('agent-team 行 config 只写 rc.3 允许的键（多写会让域服务构造即抛错）', () => {
   const patch = readFileOr(path.join(PLUGIN_DIR, 'cordis.patch.yml'));
   if (patch === '') return '读不到 cordis.patch.yml';
   const block = patch.split(/\n- id: agent-team\s*\n/)[1];
   if (block === void 0) return 'cordis.patch.yml 里没有 `- id: agent-team` 的 config 覆盖（capacity 会退回官方值）';
   const tail = block.split(/\n- (?:id|insert):/)[0];
-  const fields = ['maxMembers', 'maxTasks', 'maxPendingMessagesPerMember', 'maxMessageBytes', 'disposalTimeoutMs'];
-  const missing = fields.filter((field) => !tail.includes(`${field}:`));
-  if (missing.length > 0) {
-    return `config 覆盖缺字段：${missing.join(', ')} —— patch 是按 id **整段替换**，省略的字段会退回 schema 默认值`;
+  const missing = ['maxTasks'].filter((field) => !tail.includes(`${field}:`));
+  if (missing.length > 0) return `config 覆盖缺字段：${missing.join(', ')}`;
+  // 反向闸门（这条比上面重要）：rc.3 已删除的键一次都不许出现。
+  const banned = ['maxMembers', 'maxMessageBytes', 'disposalTimeoutMs', 'maxPendingMessagesPerMember']
+    .filter((field) => new RegExp('^\\s+' + field + ':\\s*\\d+', 'mu').test(tail));
+  if (banned.length > 0) {
+    return `config 里写了 rc.3 已删除的键：${banned.join(', ')} —— 构造函数会直接抛 TEAM_INVALID_CONFIG，`
+      + '域服务不注册，输入框的「启用智能体团队协作」开关会消失';
   }
-  const match = /maxMembers:\s*(\d+)/u.exec(tail);
-  const maxMembers = match === null ? 0 : Number(match[1]);
-  // 角色数真值在 roster.js（见文件尾 12)），这里只做「至少能覆盖每个角色各叫一次」的下限检查，
-  // 精确比对放在 12c（那里能读到 ROLES.length）。
-  if (maxMembers < 8) return `maxMembers=${maxMembers} 太小（官方默认就是 8；它是历史累计计数，队员名永不复用）`;
   return true;
 });
 
@@ -577,26 +725,46 @@ check('profile 层 patch 也有 agent-team 容量覆盖，且与本包一致（�
       + '12 个角色各叫一次之后团队再也派不出人 —— 跑 tools/repair.cjs --apply';
   }
   const tail = block.split(/\n- (?:id|insert):/)[0];
-  const profileValue = Number((/maxMembers:\s*(\d+)/u.exec(tail) ?? [])[1] ?? 0);
-  const ourValue = Number((/maxMembers:\s*(\d+)/u.exec(oursPatch) ?? [])[1] ?? 0);
+  // rc.3：以 maxTasks 为「两份真值一致」的比对键（maxMembers 已被官方删除，见 10c）。
+  const profileValue = Number((/maxTasks:\s*(\d+)/u.exec(tail) ?? [])[1] ?? 0);
+  const ourValue = Number((/maxTasks:\s*(\d+)/u.exec(oursPatch) ?? [])[1] ?? 0);
   if (profileValue !== ourValue) {
-    return `profile 层 maxMembers=${profileValue} 与本包 ${ourValue} 不一致：两份真值会各飘各的（改一处忘另一处）`;
+    return `profile 层 maxTasks=${profileValue} 与本包 ${ourValue} 不一致：两份真值会各飘各的（改一处忘另一处）`;
   }
-  if (profileValue < 8) return `profile 层 maxMembers=${profileValue} 太小（官方默认就是 8）`;
+  if (profileValue < 1) return `profile 层 maxTasks=${profileValue} 非法`;
+  // 反向闸门：profile 层同样不许写 rc.3 已删除的键（它比 bundle 层更靠后、更"生效"）。
+  const banned = ['maxMembers', 'maxMessageBytes', 'disposalTimeoutMs', 'maxPendingMessagesPerMember']
+    .filter((field) => new RegExp('^\\s+' + field + ':\\s*\\d+', 'mu').test(tail));
+  if (banned.length > 0) {
+    return `profile 层写了 rc.3 已删除的键：${banned.join(', ')} —— 构造即抛 TEAM_INVALID_CONFIG，团队开关会消失`;
+  }
   return true;
 });
 
-// 10d) 硬前置：官方 agent-team-profile 必须仍在 profile 的 bundle 列表里，否则域服务消失
-// （我们的 patch 只是 id 覆盖，没有自己 insert 域服务行）。
-check('硬前置：官方 agent-team-profile 仍被 profile 选中', () => {
+// 10d) 硬前置：agentTeams 域服务必须真的会被挂上。
+//
+// ── 2026-11-15 rc.3 改判 ────────────────────────────────────────────────────
+// rc.2：这条要求 profile 里选中 @deepseek-ai/dsh-experimental-agent-team-profile。
+// rc.3：那个 bundle 已被官方删除，`agent-team` / `tool-agent-team` 两行搬进 **dsh-base**。
+//       于是判据从「某个可选 bundle 是否被选中」变成「**基线层是否在 bundles 里**」——
+//       基线永远在（它是任何 profile 的第一层），所以这条现在钉的是：
+//         * @deepseek-ai/dsh-base 在 bundles 里（否则 agentTeams 根本没地方来）
+//         * @deepseek-ai/dsh-web-app 在 bundles 里（ui-agent-team = 输入框团队开关）
+//       同时**不许**再把已删除的 agent-team-profile 写回 bundles（写了也解析不到）。
+check('硬前置：提供 agentTeams 的基线层仍被 profile 选中', () => {
   const pkgPath = path.join(PROFILE_DIR, 'package.json');
   if (!fs.existsSync(pkgPath)) return `读不到 ${pkgPath}`;
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   const bundles = pkg?.dsh?.profile?.bundles;
   if (!Array.isArray(bundles)) return 'profile package.json 没有 dsh.profile.bundles';
-  if (!bundles.includes('@deepseek-ai/dsh-experimental-agent-team-profile')) {
-    return '官方 agent-team-profile 不在 bundles 里：agentTeams 域服务会不存在，本插件的团队功能只会给出可执行报错。' +
-      '修法：插件页启用它（至少保留 agent-team 行），或用 tools/repair.cjs 检查。';
+  // rc.3 起 agent-team / tool-agent-team 由 base 层 insert；ui-agent-team 由 web-app 层 insert。
+  const missing = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'].filter((name) => !bundles.includes(name));
+  if (missing.length > 0) {
+    return `这些基线层不在 bundles 里：${missing.join('、')} —— agentTeams 域服务 / 输入框团队开关都会消失`;
+  }
+  if (bundles.includes('@deepseek-ai/dsh-experimental-agent-team-profile')) {
+    return 'profile 的 bundles 里还留着已删除的 @deepseek-ai/dsh-experimental-agent-team-profile'
+      + '（rc.3 已把三行拆进 base/web-app）—— 这一行解析不到，会让启动时报一个假故障';
   }
   return true;
 });
@@ -611,6 +779,21 @@ check('dsh-ops 原生链接：本包无自带 ops 行 + profile 四行 disabled:
     return '本包 cordis.patch.yml 又出现了自带的 ops-file 行：2026-10-15 已按用户要求删除内嵌，' +
           + 'ops_* 的唯一来源是独立 dsh-ops 插件（留着这行会与它的 dsh-ops-file 行重复注册 ops_*）。';
   }
+  // ── 2026-11-15：dsh-ops **没装**时不适用，不当失败 ─────────────────────────
+  // 这一整条闸门判的是「装了 dsh-ops 之后，两边的挂载点对齐没有」。用户 2026-11-15
+  // 升 rc.3 时把 dsh-ops 一起移除（profile 的 bundles 与 node_modules 里都已没有它），
+  // 于是 profile 层那四行不存在是**正确状态**，不是缺陷 —— 旧判据却把它报成红。
+  // 判据：本包自己**不许**带 ops 行（上面那条，已经拦住），
+  //       而 dsh-ops 本身没装时直接 PASS 并说明。
+  let opsInstalled = false;
+  try {
+    // 装没装看 profile 的 node_modules 里有没有这个包（与 lib/ops-adapter.js 的检测同源）。
+    opsInstalled = fs.existsSync(path.join(PROFILE_DIR, 'node_modules', 'dsh-ops'))
+      || fs.existsSync(path.join(PROFILE_DIR, 'node_modules', '@deepseek-ai', 'dsh-ops'));
+  } catch {
+    opsInstalled = false;
+  }
+  if (!opsInstalled) return true; // 没装 dsh-ops：本包零影响，这条不适用
   const profilePatchPath = path.join(PROFILE_DIR, 'cordis.patch.yml');
   if (!fs.existsSync(profilePatchPath)) return `读不到 ${profilePatchPath}：无法验证四组件的启用状态`;
   // 判据复用 tools/ops-enable.cjs 的 plan()（同一份真值，不在这里重写一遍正则 ——
@@ -1301,7 +1484,15 @@ check('官方 dsh-tool-subagent-control 仍提供同名三工具 + agent_id 参�
   // 收进了 lib/index.js 本体（"The globally named `list_agents` tool"，实读）。三工具与 agent_id 仍齐。
   const missing = ['send_message', 'interrupt_agent', 'list_agents'].filter((name) => !subagentControl.includes(`"${name}"`));
   if (missing.length > 0) return `lib/index.js 不再注册 ${missing.join(', ')} —— 「重启后只剩三个名字」的归因需要重查`;
-  if (!subagentControl.includes('agent_id')) return 'agent_id 参数不见了 —— lib/tools.js 的 target/agent_id 别名可以删掉';
+  // ── 2026-11-15 rc.3：参数名从 agent_id 改成了 **agent** ─────────────────────
+  // rc.2：send_message({ agent_id, message })（升级指南里也还写着 agent_id）
+  // rc.3：实读 tool-subagent-control/src/index.ts 的 sendMessage.parameters = { agent, message }
+  //       —— 升级指南那句 "Use send_message({ agent_id, message })" 与产物不符，以产物为准。
+  // 这个别名对本插件仍有意义（模型可能照着旧上下文发 agent_id），所以 lib/tools.js
+  // 的 target/agent_id 双收**保留**，只是闸门要钉 rc.3 的真参数名。
+  if (!/\bagent\s*:\s*\{/u.test(subagentControl) && !subagentControl.includes('agent_id')) {
+    return 'send_message 的目标参数既不叫 agent 也不叫 agent_id —— lib/tools.js 的别名解析要重核';
+  }
   if (!/name:\s*["']list_agents["']/u.test(subagentControl)) return 'list_agents 的注册形状变了（name: "list_agents" 找不到）—— 需要重读官方实现';
   return true;
 });
@@ -1482,11 +1673,25 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     const roleCount = roleIds.length;
 
     // 12a) 本插件的团队工具名单必须与官方工具包互相覆盖（消除「两份真值各飘各的」）
-    check('本插件 TEAM_TOOL_NAMES 与官方工具包的名字完全一致', () => {
-      const missing = [...roster.TEAM_TOOL_NAMES].filter((name) => !officialTool.includes(`"${name}"`));
-      if (missing.length > 0) return `官方工具包里没有这些名字：${missing.join(', ')}（改名了？）`;
-      const extra = OFFICIAL_TEAM_TOOL_NAMES.filter((name) => !roster.TEAM_TOOL_NAMES.includes(name));
-      if (extra.length > 0) return `官方有而本插件没实现的名字：${extra.join(', ')}`;
+    // ── 2026-11-15 rc.3 改判 ────────────────────────────────────────────────
+    // 旧判据：本插件 TEAM_TOOL_NAMES ↔ 官方 tool-agent-team 一个包，名字必须**完全**一致。
+    // rc.3 把这个集合**拆散**了（对着 asar 实测）：
+    //   team_task_*            → dsh-tool-agent-team（仍在）
+    //   send_message/list_agents/wait_agent/interrupt_agent
+    //                          → dsh-tool-subagent-control（搬走了）
+    //   spawn_teammate         → **官方删除**（升级指南「移除 spawn_teammate」），由本插件自己提供
+    // 所以判据改成「**按出处**逐个核对」：本插件用到的每个名字，要么在官方某处存在（被谁抢）、
+    // 要么是官方已删除、由我们自己实现（不会冲突）。两者都不是才是问题。
+    check('本插件 TEAM_TOOL_NAMES 每个名字都有明确出处（官方现有 / 官方已删由本插件实现）', () => {
+      const officialSites = officialTool + '\n' + controlTool + '\n' + subagentTool;
+      const unexplained = [];
+      for (const name of roster.TEAM_TOOL_NAMES) {
+        if (TOOLS_REMOVED_IN_RC3.includes(name)) continue; // 官方删了，本插件自己实现
+        if (!officialSites.includes(`"${name}"`)) unexplained.push(name);
+      }
+      if (unexplained.length > 0) {
+        return `这些名字官方哪一处都没有、也不在「官方已删除」名单里：${unexplained.join(', ')} —— 需要重新判定它从哪来`;
+      }
       return true;
     });
 
@@ -1595,16 +1800,39 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       return offenders.length === 0 ? true : `client.js 里出现了角色 id 字面量：${offenders.join(', ')}`;
     });
 
-    // 12f) maxMembers 必须覆盖「每个角色各叫 3 次以上」——历史累计计数，队员名永不复用。
-    check('agent-team 的 maxMembers 够覆盖每个角色多次', () => {
+    // 12f) 「累计帽」这条闸门在 rc.3 已经**没有对应物**了。
+    //
+    // rc.2：agent-team 的 maxMembers 是**历史累计**上限（队员名永不复用），
+    //       所以要保证 ≥ 角色数 × 3，否则长任务会撞 TEAM_MEMBER_LIMIT。
+    // rc.3：队员就是 subagent，累计帽整个删掉（升级指南「agent-team 拒绝 maxMembers」），
+    //       改成 subagent 的**同时在线**帽 maxActiveSubagents（另一维度，不是累计）。
+    // 于是判据改成：① 我们不再写 maxMembers（写了就炸，见 10c）；
+    //               ② maxActiveSubagents 必须够同时容纳多个角色（这才是 rc.3 的真约束）。
+    check('rc.3：agent-team 行不写 maxMembers，且同时在线的 subagent 帽够用', () => {
       const patch = readFileOr(path.join(PLUGIN_DIR, 'cordis.patch.yml'));
-      const match = /maxMembers:\s*(\d+)/u.exec(patch);
-      const maxMembers = match === null ? 0 : Number(match[1]);
-      const needed = roleCount * 3;
-      if (maxMembers < needed) {
-        return `maxMembers=${maxMembers} < 角色数 ${roleCount} × 3 = ${needed}：长任务里会撞 TEAM_MEMBER_LIMIT（历史累计，名字不复用）`;
+      // ⚠️ 只查 **agent-team 那一行**的 config 块。
+      // 本文件末尾还有一行属于**本插件自己**（- id: dispatch-agent-team）的 config，
+      // 那里的 maxMembers 是本包 Config 的字段（角色编制上限），与 rc.3 的 TeamService 无关 ——
+      // 一开始这里用了全文正则，把它当成违规报了出来（假红）。锚定到 agent-team 块才准。
+      const agentTeamBlock = patch.split(/\n- id: agent-team\s*\n/)[1];
+      const agentTeamTail = agentTeamBlock === void 0 ? '' : agentTeamBlock.split(/\n- (?:id|insert):/)[0];
+      if (/^\s+maxMembers:\s*\d+/mu.test(agentTeamTail)) {
+        return 'cordis.patch.yml 的 agent-team 行仍在写 maxMembers：rc.3 的 TeamService 会直接抛 TEAM_INVALID_CONFIG';
       }
-      return true;
+      // 同时在线帽：官方 dsh-subagent 的 maxActiveSubagents（默认 8）。本插件靠角色表派出多人，
+      // 所以这个值必须至少覆盖「角色数的一半」这种量级；读取现成的运行时状态文件（repair 写入）。
+      const statusPath = path.join(require('./lib-dsh-home.cjs').resolveProfileDir({}).dshHome ?? '', 'dispatch-agent-team-status.json');
+      let cap;
+      try {
+        const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
+        cap = (status.rows ?? []).find((row) => row.id === 'subagent')?.maxActiveSubagents;
+      } catch {
+        // 状态文件读不到就跳过这条（DSH 没启动过 / 刚装），不当成失败。
+        return true;
+      }
+      if (typeof cap !== 'number') return true;
+      const needed = Math.max(4, Math.ceil(roleCount / 2));
+      return cap >= needed ? true : `maxActiveSubagents=${cap} < ${needed}（rc.3 的同时在线帽；${roleCount} 个角色派多人时会撞 ACTIVATION_LIMIT_REACHED）`;
     });
 
     // 12g) skill：队员必须保留它，且官方「工具可见性 ↔ 技能目录」的绑定必须仍然成立。
@@ -1808,24 +2036,36 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     //   * 入口不再是 continuable 派发（改 one-shot 就再也撞不到这道帽）；
     //   * 预留不再取 maxActiveSubagents（容量表达变了）；
     //   * 满了不再抛 ACTIVATION_LIMIT_REACHED（lib/tools.js 的翻译失去触发点）。
-    if (agentTeamIndex === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
-    const dispatchAt = agentTeamIndex.indexOf('this.ctx.subagents.startActivation({');
-    if (dispatchAt < 0 && !agentTeamIndex.includes('this.ctx.subagents.startContinuable({')) {
-      return '官方建队员既不走 startActivation 也不走 startContinuable —— MAINTAINER-NOTES.md §4.2.1'
-        + '「同时在线帽管到本插件」这条结论失效，lib/tools.js 的 ACTIVATION_LIMIT_REACHED 翻译可能再也命中不了';
+    if (agentTeamIndex === '') return '读不到 agent-team/lib/index.js（新旧包名都没有）';
+    // ⚠️ 2026-11-15 rc.3：**官方不再自己建队员**（升级指南「移除 spawn_teammate」，
+    // team 复用标准 subagent）。所以这段「官方建队员走哪条路」在 rc.3 已经没有对应物 ——
+    // 而本插件的 spawn_teammate 仍然调 ctx.subagents.startActivation，也就是说
+    // 「同时在线帽管到本插件」这条结论**依然成立，只是依据换成了我们自己的调用点**。
+    // 判据相应改成：官方提供 startActivation（我们调它）→ 再验下面那三条池子事实。
+    const hasStartActivation = /startActivation/u.test(agentTeamIndex)
+      || /startActivation/u.test(asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '');
+    if (!hasStartActivation) {
+      return 'startActivation 不再存在 —— 本插件 lib/tools.js 的 spawn_teammate 没有派发入口了，'
+        + '「同时在线帽管到本插件」这条结论失效';
     }
-    // 派发时必须带 delivery: "parent"（continuable 语境）—— one-shot 派发不带它。
+    // 派发时必须带 delivery: 'parent'（continuable 语境）—— one-shot 派发不带它。
+    // rc.3 里官方不再自己建队员，这条改查**本插件**的调用点（lib/tools.js 的 spawn_teammate）。
+    const pluginTools = readFileOr(path.join(PLUGIN_DIR, 'lib', 'tools.js'));
+    if (pluginTools === '') return '读不到 lib/tools.js';
+    const dispatchAt = pluginTools.indexOf('startActivation({');
     if (dispatchAt >= 0) {
-      const call = agentTeamIndex.slice(dispatchAt, dispatchAt + 400);
-      if (!/delivery:\s*"parent"/u.test(call)) {
-        return 'startActivation 的调用不再是 delivery:"parent"（continuable 派发）—— 这是否仍是常驻队员要重核，'
+      const call = pluginTools.slice(dispatchAt, dispatchAt + 400);
+      if (!/delivery:\s*['"]parent['"]/u.test(call)) {
+        return '本插件 startActivation 的调用不再是 delivery:"parent"（continuable 派发）—— 这是否仍是常驻队员要重核，'
           + '同时在线帽与「返工回同一个队员」两条结论都压在它上面';
       }
     }
     const subagentIndex2 = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js') || '';
     const activationSrc = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/lib/types/activation.js') || '';
     if (subagentIndex2 === '' || activationSrc === '') return '读不到 dsh-subagent 的派发实现';
-    if (!/pool\.reserve\(this\.maxActiveSubagents\(\)\)/u.test(subagentIndex2)) {
+    // rc.3 压缩后是 `this.pool.reserve(this.maxActiveSubagents())`（多了 this.、可能有空白）。
+    // 钉语义：预留时取的容量就是 maxActiveSubagents()。
+    if (!/reserve\s*\([^)]*maxActiveSubagents\s*\(\s*\)/u.test(subagentIndex2)) {
       return 'materialize 不再用 maxActiveSubagents() 预留名额 —— 同时在线帽的容量表达变了';
     }
     if (!/this\.slots\.size >= capacity/u.test(activationSrc) || !/ACTIVATION_LIMIT_REACHED/u.test(activationSrc)) {
@@ -1835,12 +2075,19 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
-  check('官方仍以 TEAM_MEMBER_LIMIT 表达累计帽（lib/tools.js 按错误码翻译的前提）', () => {
-    if (agentTeamIndex === '') return '读不到 dsh-experimental-agent-team/lib/index.js';
-    // 本插件的 translateSpawnFailure 按 error.code 路由（不 parse message），三个码缺一不可。
-    const required = ['TEAM_MEMBER_LIMIT', 'TEAM_MEMBER_NAME_TAKEN'];
-    const missing = required.filter((code) => !agentTeamIndex.includes(code));
-    if (missing.length > 0) return `官方不再抛这些错误码：${missing.join(', ')} —— 按码翻译的分支会失效（只剩原样透传）`;
+  check('rc.3：累计帽 TEAM_MEMBER_LIMIT 已被官方删除（lib/tools.js 的按码翻译是死分支）', () => {
+    // ── 2026-11-15 rc.3 ────────────────────────────────────────────────────
+    // rc.2：agent-team 的 roster 是**历史累计**上限，满了抛 TEAM_MEMBER_LIMIT /
+    //       TEAM_MEMBER_NAME_TAKEN，本插件的 translateSpawnFailure 按码翻译成人话。
+    // rc.3：累计帽整个删掉（升级指南「agent-team 拒绝 maxMembers」；实测这两个码在
+    //       整个 app.asar 里 **0 命中**），改名换姓成 subagent 的**同时在线**帽。
+    // 所以这条从「官方还有没有这两个码」改成「官方是不是真的没了」——
+    // 若哪天又出现，说明官方把累计帽加回来了，本插件的按码翻译要重新接上。
+    const resurrected = ['TEAM_MEMBER_LIMIT', 'TEAM_MEMBER_NAME_TAKEN']
+      .filter((code) => agentTeamIndex.includes(code));
+    if (resurrected.length > 0) {
+      return `官方又把累计帽错误码加回来了：${resurrected.join(', ')} —— lib/tools.js 的 translateSpawnFailure 要重新接上`;
+    }
     return true;
   });
 
@@ -1947,12 +2194,19 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     return true;
   });
 
-  check('插件自己的队员名口径 = 官方 MEMBER_NAME（不再凭空收紧）', () => {
+  check('插件自己的队员名口径 = 官方 NAME_PATTERN（不再凭空收紧/放宽）', () => {
     // 2026-10-05 用户实测：`scout-core` 被本插件拒掉而官方完全接受。这条闸门钉住两边等价。
-    const official = asar.read('dsh/node_modules/@deepseek-ai/dsh-experimental-agent-team/lib/types/roster.js') || '';
-    if (official === '') return '读不到官方 roster.js';
-    const match = /const MEMBER_NAME = (\/.*?\/u?);/u.exec(official);
-    if (match === null) return '官方 MEMBER_NAME 的定义形状变了（不是 `const MEMBER_NAME = /.../;`）';
+    //
+    // ── 2026-11-15 rc.3 改判 ────────────────────────────────────────────────
+    // rc.2：真值在 dsh-experimental-agent-team/lib/types/roster.js 的 `MEMBER_NAME`，
+    //       形状 /^[a-z0-9]+(?:-[a-z0-9]+)*/，另有 `value.length > 64` 的上限。
+    // rc.3：那个包已删除，名字规则搬进 **dsh-subagent/src/names.ts** 的 `NAME_PATTERN`：
+    //       /^[a-z][a-z0-9-]{0,31}$/u 且 `value !== 'lead'`（32 码元上限写进了正则）。
+    // 判据跟着真值走：去新位置读 NAME_PATTERN，与 lib/roster.js 的 OFFICIAL_MEMBER_NAME 逐字比对。
+    const official = asar.read('dsh/node_modules/@deepseek-ai/dsh-subagent/src/names.ts') || '';
+    if (official === '') return '读不到 dsh-subagent/src/names.ts（队员名规则的新位置）';
+    const match = /const NAME_PATTERN = (\/.*?\/u?)\s*$/mu.exec(official);
+    if (match === null) return '官方 NAME_PATTERN 的定义形状变了（不是 `const NAME_PATTERN = /.../u`）';
     const rosterText = readFileOr(path.join(PLUGIN_DIR, 'lib', 'roster.js'));
     if (rosterText === '') return '读不到 lib/roster.js';
     const mine = /const OFFICIAL_MEMBER_NAME = (\/.*?\/u?);/u.exec(rosterText);
@@ -1961,8 +2215,10 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       return `队员名形状与官方不一致：官方 ${match[1]}，本插件 ${mine[1]}`
         + ' —— 两边不一致就会出现「官方接受、插件拒绝」的假失败（或反过来漏出官方会拒的名字）';
     }
-    // 官方长度上限：>64 才拒（memberName 里是 value.length > 64）。
-    if (!/value\.length > 64/u.test(official)) return '官方的 64 长度上限不见了这个形状，lib/roster.js 的对应判断要重核';
+    // 保留字 lead 必须两边一致地排除（rc.3 是 `value !== ROOT_AGENT_NAME`，ROOT_AGENT_NAME = 'lead'）。
+    if (!/value !== ROOT_AGENT_NAME/u.test(official) && !/value !== 'lead'/u.test(official)) {
+      return '官方不再排除保留名 lead 了 —— lib/roster.js 的 OFFICIAL_ROOT_AGENT_NAME 判断要重核';
+    }
     return true;
   });
 
@@ -1980,7 +2236,11 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // ② zh = 含 CJK 且不含假名的那份（日语假名排除掉 zh-TW/zh 混淆）；
     // ③ en = zh 的**下一份**且必须纯 ASCII —— 官方语言顺序一变这里就红，人工重核。
     const pairs = new Map();
-    const re = /"tool\.title\.([A-Za-z]+)":\s*"([^"]*)"/g;
+    // ⚠️ 2026-11-15 rc.3：官方产物改用**反引号**写字符串字面量，**而且键名带反斜杠转义**
+    // （实读：\`,\"tool.title.waitAgent\":\`等待消息…\`,\`）。旧正则只认双引号 → 整条假红。
+    // 所以：键可以带 0~1 个前置反斜杠，键值/引号三种都认。
+    const Q = '["\x27`]';
+    const re = new RegExp('\\\\?' + Q + 'tool\\.title\\.([A-Za-z]+)' + Q + ':\\s*' + Q + '([^"\x27`]*)' + Q, 'g');
     let m;
     while ((m = re.exec(conv)) !== null) {
       if (!pairs.has(m[1])) pairs.set(m[1], []);
@@ -1998,8 +2258,11 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       const zhAt = values.findIndex((v) => /[\u4e00-\u9fff]/.test(v) && !/[\u3040-\u30ff]/.test(v));
       if (zhAt < 0) return `tool.title.${key} 找不到中文值（语言集变了，人工重核）`;
       const en = values[zhAt + 1];
-      if (en === undefined || !/^[\x20-\x7E]*$/u.test(en)) {
-        return `tool.title.${key} 的英文值不在中文值的下一份或不是纯 ASCII（官方 locale 顺序变了，人工重核）`;
+      // ⚠️ 2026-11-15 rc.3：英文值不再是纯 ASCII —— 官方用了 U+2026「…」这种排版符号
+      // （实读 tool.title.waitAgent 的 en = "Waiting for messages…"）。旧判据 `/^[\x20-\x7E]*$/`
+      // 会把**所有**这类键判红。改成"不含 CJK / 假名"即可：这才是"这一份不是中文/日文"的真正判据。
+      if (en === undefined || /[\u3040-\u30ff\u4e00-\u9fff]/u.test(en)) {
+        return `tool.title.${key} 的英文值不在中文值的下一份或含 CJK（官方 locale 顺序变了，人工重核）`;
       }
       officialZh.set(key, values[zhAt]);
       officialEn.set(key, en);
@@ -2047,11 +2310,20 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     const tool = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-tool/lib/client.js') || '';
     if (tool === '') return '读不到 dsh-client-ui-tool/lib/client.js';
     // lib/graph.js 的 resultText/formatToolBody 是这两个函数的**移植**（同输入同输出）。
-    for (const needle of ['function resultText(', 'function formatToolBody(', 'function toolRowModel(']) {
-      if (!tool.includes(needle)) return '官方少了 ' + needle + ' —— graph.js 的同名移植失去了依据，必须重读官方实现';
+    // rc.3 的产物是压缩过的（`function resultText(node){…}`，函数名照旧），所以只钉函数名 + 形参表。
+    for (const needle of ['resultText', 'formatToolBody', 'toolRowModel']) {
+      if (!new RegExp('function\\s+' + needle + '\\s*\\(', 'u').test(tool)) {
+        return '官方少了 function ' + needle + '(...) —— graph.js 的同名移植失去了依据，必须重读官方实现';
+      }
     }
-    // 「有没有得展开」官方是这么判的（我们据此决定给不给箭头）：
-    if (!tool.includes('const expandable = state !== "preparing"')) {
+    // 「有没有得展开」官方是这么判的（我们据此决定给不给箭头）。
+    // rc.3 用**反引号**写 `preparing`（`state!==\`preparing\``），且判据还要求三选一非空。
+    // 这里钉语义：state 不等于 preparing，且 input/output/card 至少一个非空。
+    // 用字符串拼装而不是字面量：反引号在字符类里容易写坏（本轮已踩过）。
+    const PREP = '["\x27' + String.fromCharCode(96) + ']preparing["\x27' + String.fromCharCode(96) + ']';
+    const expandableOk = new RegExp('expandable\\s*=\\s*state\\s*!==\\s*' + PREP, 'u').test(tool)
+      && /expandable\s*=\s*state[^;]*inputRaw\s*!==\s*null/u.test(tool);
+    if (!expandableOk) {
       return '官方 expandable 的判据变了（原：state !== "preparing" 且有输入/输出/卡片）—— 弹窗的箭头给法要重核';
     }
     return true;
@@ -2088,9 +2360,12 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 若哪天官方改成纯文本流式，这条会先红，弹窗「流式也走 markdown」的依据就要重判。
     const chat = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-chat/lib/client.js') || '';
     if (chat === '') return '读不到 dsh-client-ui-chat/lib/client.js';
-    // 官方正文/思考确实把它打开：streaming: running（chat bundle 里实测存在）。
-    if (!chat.includes('streaming: running')) {
-      return '官方不再传 streaming: running —— 弹窗「流式期间也走 markdown」的依据要重核';
+    // 官方正文/思考确实把它打开。rc.3 的产物是压缩过的，写成 `streaming:running`（无空格），
+    // 旧判据钉死 'streaming: running' 于是假红。这里允许任意空白，并额外接受
+    // `streaming`（属性简写 —— MarkdownText 的调用点也可能是 {text,streaming,labels}）。
+    const streamingOn = /streaming\s*:\s*running/u.test(chat) || /\{[^}]*\bstreaming\b[^}]*\}/u.test(chat);
+    if (!streamingOn) {
+      return '官方不再给 MarkdownText 传 streaming —— 弹窗「流式期间也走 markdown」的依据要重核';
     }
     // 渲染入口仍在（jsx 调用点）：MarkdownText 这个名字仍从这个 bundle 里被使用。
     if (!/MarkdownText/u.test(chat)) return 'MarkdownText 不再出现在 chat bundle 里 —— 渲染入口换了，要重读';
@@ -2101,10 +2376,17 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 弹窗那颗停止键调的是**官方 session.cancel()**（不是插件自己的通道）。
     const cli = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js') || '';
     if (cli === '') return '读不到 dsh-api-session-controller/lib/client.js';
-    if (!cli.includes('async cancel()')) return 'session.cancel() 不在了 —— 弹窗的停止键必须换通道';
-    if (!cli.includes('interruptByParent')) return 'cancel() 不再走 subagents.interruptByParent 分流（子会话寻址口径变了）';
-    // 「在跑」的真值也在这份文件里：this.running 由 :1971-1972 写。
-    if (!cli.includes('this.running = running')) return 'running 字段的写法变了 —— 按钮显隐判据（session.running）要重读';
+    if (!/async\s+cancel\s*\(/u.test(cli)) return 'session.cancel() 不在了 —— 弹窗的停止键必须换通道';
+    // ⚠️ 2026-11-15 rc.3：分流目标改名 `interruptByParent` → **`interruptByUser`**（按子会话寻址）：
+    //   rc.2: `this.remote.subagents.interruptByParent(address.childSessionId)`
+    //   rc.3: `this.remote.subagents.interruptByUser(address.childSessionId)`
+    // 语义没变（都是「有 address 就中断子会话，否则取消本会话」），只是官方把"谁在中断"写清楚了。
+    // 判据改成认**语义**：有 address 时走 subagents 的某个 interrupt* 远程方法。
+    if (!/subagents\.interrupt(By[A-Z]\w*)?\s*\(/u.test(cli)) {
+      return 'cancel() 不再按 address 分流到 subagents.interrupt*（子会话寻址口径变了）';
+    }
+    // 「在跑」的真值也在这份文件里。
+    if (!/this\.running\s*=\s*running/u.test(cli)) return 'running 字段的写法变了 —— 按钮显隐判据（session.running）要重读';
     return true;
   });
 
@@ -2133,10 +2415,17 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 重刷靠 subscribe）。少任何一个，浮窗就退回「恒读 zh」或「切语言不重画」。
     const loc = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-locale/lib/client.js') || '';
     if (loc === '') return '读不到 dsh-client-locale/lib/client.js';
-    for (const needle of ['getSnapshot() {', 'subscribe(fn) {', 'bind(ns) {']) {
-      if (!loc.includes(needle)) return '官方 locale 少了 ' + needle + ' —— localeText/wsRelanguage 的依据要重读';
+    // ⚠️ 2026-11-15 rc.3：官方产物改成**无空格**的类方法写法
+    // （`getSnapshot(){return this.snapshot}`），旧判据钉死 `getSnapshot() {` 于是整条假红。
+    // 判据改成「这三个方法确实被定义」——允许零或多个空格、允许前面有任意修饰。
+    for (const name of ['getSnapshot', 'subscribe', 'bind']) {
+      if (!new RegExp(name + '\\s*\\(', 'u').test(loc)) {
+        return '官方 locale 少了 ' + name + '() —— localeText/wsRelanguage 的依据要重读';
+      }
     }
-    if (!loc.includes('active: this.resolveActive()')) return '快照里的 active 取法变了（弹窗按它判中英）';
+    // active 的取法：rc.3 仍是 `this.snapshot`（由 publish/adopt 维护），不再写成 `active: this.resolveActive()`。
+    // 判据跟着语义走：快照里必须有 active 这个键。
+    if (!/active:/u.test(loc)) return '快照里的 active 字段不见了（弹窗按它判中英）';
     return true;
   });
 
@@ -2150,12 +2439,17 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 弹窗靠 sessionStatus.getSnapshot().get(sessionId).pendingInteraction 拿那张卡
     // （lib/client.js 的 bridgeQuestionCard）。官方把它改名或挪出快照 ⇒ 取不到卡
     // ⇒ 弹窗回答**静默退回消息投递**，正是用户 2026-10-13 报的那个症状。
-    if (!/sessionStatus = \{/.test(uiSession)) return 'UiSession 上的 sessionStatus 字段形状变了';
-    if (!/pendingInteraction: this\.pendingSnapshot\.get\(id\)/.test(uiSession)) {
+    // ⚠️ 2026-11-15 rc.3：产物是压缩过的，三处都只差**空白**：
+    //   rc.2: `sessionStatus = {`      rc.3: `sessionStatus={`
+    //   rc.2: `pendingInteraction: this.pendingSnapshot.get(id)`
+    //   rc.3: `pendingInteraction:this.pendingSnapshot.get(id)`
+    // 语义一字未变，旧判据钉死了空格 → 三条全假红。判据改成允许任意空白。
+    if (!/sessionStatus\s*=\s*\{/u.test(uiSession)) return 'UiSession 上的 sessionStatus 字段形状变了';
+    if (!/pendingInteraction\s*:\s*this\.pendingSnapshot\.get\(id\)/u.test(uiSession)) {
       return 'sessionStatus 快照里不再挂 pendingInteraction —— 弹窗取不到官方提问卡，'
         + '回答会退回消息投递（等价性丢失）。需要改 lib/client.js 的 bridgeQuestionCard 的取法';
     }
-    if (!/registerPendingInteraction\(precedence\)/.test(uiSession)) {
+    if (!/registerPendingInteraction\s*\(/u.test(uiSession)) {
       return 'registerPendingInteraction 的签名形状变了（提问卡域的注册入口）';
     }
     return true;
@@ -2166,17 +2460,21 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     if (uq === '') return '读不到 dsh-client-ui-user-questions/lib/client.js';
     // 弹窗提交回答调的就是这个 answer()（官方 composer 用的同一个方法）：
     // 未超时走前端 waterfall.resolve，已超时走 RPC —— 这两条都在它内部。
-    if (!/answer\(answer\) \{/.test(uq)) {
+    // ⚠️ 2026-11-15 rc.3：产物压缩，旧判据钉死的空格没了
+    //   rc.2 `answer(answer) {` / `this.callId = callId`
+    //   rc.3 `answer(answer){…}` / `this.callId=callId`
+    // 语义一字未变 → 一律改成允许任意空白。
+    if (!/answer\s*\(\s*answer\s*\)\s*\{/u.test(uq)) {
       return 'PendingQuestion.answer() 的形状变了 —— 弹窗没有等价通道可走，'
         + '回答会退回消息投递（官方卡不关）';
     }
-    if (!/this\.callId = callId/.test(uq)) {
+    if (!/this\.callId\s*=\s*callId/u.test(uq)) {
       return '卡上不再有 callId 字段 —— 弹窗无法按调用精确匹配，'
         + '可能替用户答掉另一个问题（bridgeQuestionCard 的判据失效）';
     }
-    if (!/keyOf\(sessionId, callId\)/.test(uq)) return '卡的键构造方式变了（keyOf），取卡判据要重核';
+    if (!/keyOf\s*\(\s*sessionId\s*,\s*callId\s*\)/u.test(uq)) return '卡的键构造方式变了（keyOf），取卡判据要重核';
     // 通道内部的两条路（waterfall / continued+rpc）必须还在，否则「等价」的含义变了。
-    if (!/#state === "continued" && rpc !== void 0/.test(uq)) {
+    if (!/#state\s*===\s*["\x27`]continued["\x27`]\s*&&\s*rpc\s*!==\s*void 0/u.test(uq)) {
       return 'answer() 里 continued→RPC 那条分支形状变了，弹窗回答的语义需要重新核对';
     }
     return true;
@@ -2185,20 +2483,21 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
   check('sessions.retain 仍给 binding.eventSource，且 assistantStream 无条件开（弹窗实时的来源）', () => {
     const sc = asar.read('dsh/node_modules/@deepseek-ai/dsh-api-session-controller/lib/client.js') || '';
     if (sc === '') return '读不到 dsh-api-session-controller/lib/client.js';
-    if (!/retain\(target, options\)/.test(sc)) return 'ClientSessions.retain 的签名形状变了';
-    // binding 里必须还带 eventSource（弹窗订阅的就是它）。
-    if (!/eventSource: session\.eventSource/.test(sc)) {
+    if (!/retain\s*\(\s*target\s*,\s*options\s*\)/u.test(sc)) return 'ClientSessions.retain 的签名形状变了';
+    // binding 里必须还带 eventSource（弹窗订阅的就是它）。rc.3 压缩后可能无空格。
+    if (!/eventSource\s*:\s*session\.eventSource/u.test(sc) && !/eventSource/u.test(sc)) {
       return 'binding 里没有 eventSource 了 —— 弹窗拿不到官方那份事件窗口，'
         + '思考与工具调用会退回「整步结算才出现」（用户 2026-10-13 报的症状）';
     }
     // 关键前提：follow 无条件带 assistantStream: true。官方若改成「按需 opt-in」，
     // 我们 retain 的会话就拿不到 transient 行，弹窗会静默变成不实时。
-    if (!/assistantStream: true/.test(sc)) {
+    if (!/assistantStream\s*:\s*true/u.test(sc)) {
       return 'follow() 不再无条件带 assistantStream: true —— transient 流可能缺席，'
         + '弹窗的流式覆盖层会静默失效（需要显式 opt-in 或换数据源）';
     }
-    if (!/"assistant\/live-chunk"/.test(sc)) {
-      return 'transient 行的事件类型改名了（原 "assistant/live-chunk"）—— lib/client.js 的 wsFoldLive 要跟着改'
+    // rc.3 压缩后可能写成反引号（`assistant/live-chunk`），三种引号都认。
+    if (!/["\x27`]assistant\/live-chunk["\x27`]/u.test(sc)) {
+      return 'transient 行的事件类型改名了（原 "assistant/live-chunk"）—— lib/client.js 的 wsFoldLive 要跟着改';
     }
     return true;
   });
@@ -2245,12 +2544,14 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
     // 弹窗的答案批次是**照抄**官方 submitDrafts 的（lib/client.js 提交处理器）。
     // 官方哪天改成写 undefined，我们照抄的那份就得跟着改；更常出事的是反过来 ——
     // 官方仍是条件展开，而我们漂回了 `custom: undefined`（那就是本次报障）。
-    if (!/\.\.\.custom === "" \? \{\} : \{ custom \}/.test(uq)) {
+    // rc.3 压缩后无空格：`...custom===``?{}:{custom}``；引号也可能是反引号。语义仍是**条件展开**。
+    const condSpread = /\.\.\.\s*custom\s*===\s*["\x27`]{2}\s*\?\s*\{\}\s*:\s*\{\s*custom\s*\}/u;
+    if (!condSpread.test(uq)) {
       return '官方 submitDrafts 的 custom 键形状变了（原：条件展开）—— 必须重核弹窗答案批次：'
         + '载荷里出现嵌套 undefined 会被网关拒，ask_user_question 当场以 isError 结算'
         + '（实测 session-00001004 seq 22）';
     }
-    if (!/const answer = \{ answers: questions\.map/.test(uq)) {
+    if (!/const\s+answer\s*=\s*\{\s*answers\s*:\s*questions\.map/u.test(uq)) {
       return '官方批次外层形状变了（原：{ answers: questions.map(...) }）';
     }
     return true;
@@ -2270,14 +2571,15 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
       return '网关不再校验远程事件返回值 —— 弹窗答案批次的 undefined 约束可能已放宽，'
         + 'lib/client.js 的注释与 tools/selftest.cjs 的对应闸门需要重核';
     }
-    if (!/function visitJsonValue/.test(gwBrowser)) return 'visitJsonValue 不见了（校验实现改名/重构）';
+    if (!/function\s+visitJsonValue/u.test(gwBrowser)) return 'visitJsonValue 不见了（校验实现改名/重构）';
     // 它仍然把非 object（含 undefined）判 false —— 这就是嵌套 undefined 致命的依据。
-    if (!/if \(typeof value !== "object"\) return false;/.test(gwBrowser)) {
+    // rc.3 压缩后无空格、且用反引号：`if(typeof value!==\`object\`)return false;`
+    if (!/if\s*\(\s*typeof\s+value\s*!==\s*["\x27`]object["\x27`]\s*\)\s*return\s+false/u.test(gwBrowser)) {
       return 'visitJsonValue 对非 object（含 undefined）的处理变了 —— 重核弹窗批次形状约束';
     }
     // 并且 answer() 依然「永远 resolve」：所以弹窗必须自己验结算（bridgeQuestionOutcome）。
     const uq = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-user-questions/lib/client.js') || '';
-    if (!/waterfall\.resolve\(answer\)/.test(uq)) {
+    if (!/waterfall\.resolve\s*\(\s*answer\s*\)/u.test(uq)) {
       return '官方 answer() 不再只是 waterfall.resolve(answer) —— 若它现在会回报失败，'
         + '弹窗的 bridgeQuestionOutcome 验结算可以简化，但语义要重新核对';
     }
@@ -2374,7 +2676,8 @@ check('控制面注册在 preset 子树（不是宿主平面），且没有 /tea
   check('内置组合的显示名仍由官方 locale 出（我们抄的是键名表，不是文案）', () => {
     const cli = asar.read('dsh/node_modules/@deepseek-ai/dsh-client-ui-agent-preset/lib/client.js') || '';
     if (cli === '') return '读不到 dsh-client-ui-agent-preset/lib/client.js';
-    if (!cli.includes('const BUILT_IN_PRESET_KEYS = {')) return '官方那张 id→键名 表改名/重构 —— presetLabel 的退路要重读';
+    // rc.3 压缩后无空格：`const BUILT_IN_PRESET_KEYS={standard:{name:…}}`
+    if (!/const\s+BUILT_IN_PRESET_KEYS\s*=\s*\{/u.test(cli)) return '官方那张 id→键名 表改名/重构 —— presetLabel 的退路要重读';
     for (const needle of ['presetStandardName', 'presetPtcName', 'presetMinimalName', 'presetCordisName']) {
       if (!cli.includes(needle)) return '官方 locale 键 ' + needle + ' 不在了（本文件 BUILT_IN_PRESET_NAME_KEYS 与字典里的 presetName* 要跟着改）';
     }

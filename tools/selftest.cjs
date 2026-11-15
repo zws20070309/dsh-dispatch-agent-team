@@ -176,8 +176,14 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.deriveRole('lead'), undefined);
     assert.equal(roster.deriveRole('lead-2'), undefined, 'lead 不是任何角色 id 的前缀');
     assert.equal(roster.deriveRole('unknown-role'), undefined);
-    assert.equal(roster.deriveRole('scout-'), undefined);
-    assert.equal(roster.deriveRole('scout--2'), undefined);
+    // ── 2026-11-15 rc.3：官方把名字正则换成 /^[a-z][a-z0-9-]{0,31}$/ ──────────
+    // 旧版（rc.2 的 MEMBER_NAME）要求「段与段之间恰好一个连字符」，所以 'scout--2' 非法。
+    // rc.3 允许字符类里的连续连字符，所以 'scout--2' **现在是官方接受的名字** ——
+    // 我们再拒它就成了「官方接受、插件拒绝」的假失败（正是 2026-10-05 那次报错的同类）。
+    // rc.3 的 NAME_PATTERN 字符类是 [a-z0-9-]，**连字符可以在任意位置**（含结尾）。
+    // 所以 'scout-' 与 'scout--2' 官方都收 —— 这里如实跟随，不再比官方严。
+    assert.equal(roster.deriveRole('scout-'), 'scout', 'rc.3 接受结尾连字符');
+    assert.equal(roster.deriveRole('scout--2'), 'scout', 'rc.3 允许连续连字符');
     assert.equal(roster.deriveRole('Scout'), undefined);
     assert.equal(roster.deriveRole('scout_core'), undefined);
     assert.equal(roster.deriveRole(''), undefined);
@@ -204,18 +210,23 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.isValidTeammateName('scout-core-0'), false);
     assert.equal(roster.isValidTeammateName('scout-core-2'), true);
     assert.equal(roster.isValidTeammateName('nope'), false);
-    // 官方 MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/ —— 形状不一致的必须拒。
-    assert.equal(roster.isValidTeammateName('scout-'), false);
+    // 官方 rc.3 NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/ —— 形状不一致的必须拒。
+    // rc.3 接受结尾连字符（字符类含 '-'），但**必须字母开头**，所以 '-scout' 仍非法。
+    assert.equal(roster.isValidTeammateName('scout-'), true, 'rc.3 接受结尾连字符');
     assert.equal(roster.isValidTeammateName('-scout'), false);
-    assert.equal(roster.isValidTeammateName('scout--2'), false);
+    // rc.3 允许连续连字符（字符类 [a-z0-9-] 不含"段"约束）。
+    assert.equal(roster.isValidTeammateName('scout--2'), true, 'rc.3 允许连续连字符');
     assert.equal(roster.isValidTeammateName('Scout'), false);
+    // rc.3 要求**字母开头**：纯数字/数字开头一律非法（旧版 MEMBER_NAME 允许）。
+    assert.equal(roster.isValidTeammateName('2scout'), false, 'rc.3 必须字母开头');
     assert.equal(roster.isValidTeammateName('scout core'), false);
     assert.equal(roster.isValidTeammateName('scout_core'), false);
-    assert.equal(roster.isValidTeammateName('a'.repeat(65)), false);
-    const longest = `scout-${'x'.repeat(58)}`; // 64 码元整
-    assert.equal(longest.length, 64);
-    assert.equal(roster.isValidTeammateName(longest), true, '官方上限是 >64 才拒');
-    assert.equal(roster.isValidTeammateName(`${longest}x`), false);
+    // rc.3 的总长上限是 **32**（正则 {0,31}+首字符），不是旧的 64。
+    assert.equal(roster.isValidTeammateName('a'.repeat(33)), false, 'rc.3 上限 32 码元');
+    const longest = `scout-${'x'.repeat(26)}`; // 6 + 26 = 32 码元整
+    assert.equal(longest.length, 32);
+    assert.equal(roster.isValidTeammateName(longest), true, '32 码元整正好合法');
+    assert.equal(roster.isValidTeammateName(`${longest}x`), false, '33 码元超限');
     assert.equal(roster.isValidTeammateName(undefined), false);
   });
 
@@ -3432,12 +3443,26 @@ function functionBodyOf(source, needle) {
     for (const m of repairSrc.matchAll(markerRe)) fromRepair[m[1]] = m[2];
     assert.equal(fromHeal.START, fromRepair.START, 'MANAGED_START 两份定义不一致');
     assert.equal(fromHeal.END, fromRepair.END, 'MANAGED_END 两份定义不一致');
-    for (const key of ['maxMembers', 'maxTasks', 'maxPendingMessagesPerMember', 'maxMessageBytes', 'disposalTimeoutMs']) {
+    // 2026-11-15 rc.3：托管块只写得出 maxTasks 一个键。
+    // rc.3 的 TeamService 构造函数**主动拒绝** maxMembers / maxMessageBytes / disposalTimeoutMs
+    // （dsh-agent-team/src/index.ts:34-35 常量、:62-69 throw），而 schemastery 非 strict 模式
+    // **不剥未知键**（lib/index.mjs:512-527），所以那三个键会活到构造函数里并当场抛
+    // TEAM_INVALID_CONFIG → 域服务不注册 → 输入框团队开关消失。
+    for (const key of ['maxTasks']) {
       const inRepair = new RegExp(key + ':\\s*(\\d+)').exec(repairSrc);
       const inHeal = new RegExp(key + ':\\s*(\\d+)').exec(healSrc);
       assert.ok(inRepair !== null, `repair.cjs 里找不到 ${key}`);
       assert.ok(inHeal !== null, `self-heal.js 里找不到 ${key}`);
       assert.equal(inHeal[1], inRepair[1], `${key} 两份定义不一致（repair=${inRepair[1]} self-heal=${inHeal[1]}）`);
+    }
+    // 反向闸门（这条比上面重要）：rc.3 已删除的键**一次都不许**出现在托管块里。
+    // 写回去就等于让 rc.3 的团队域服务构造即抛错，而症状是「输入框的团队开关消失」——
+    // 与「配置项写错」看起来毫无关系，极难定位（2026-11-15 就是这么坏的）。
+    for (const banned of ['maxMembers', 'maxMessageBytes', 'disposalTimeoutMs', 'maxPendingMessagesPerMember']) {
+      // 注释里允许提到它们（解释为什么不能写），所以只查「像配置行」的形状：行首缩进 + key: 数字
+      const asConfigLine = new RegExp('^\\s+' + banned + ':\\s*\\d+', 'mu');
+      assert.ok(!asConfigLine.test(repairSrc), `repair.cjs 的托管块不得再写 ${banned}（rc.3 会因此拒绝整行配置）`);
+      assert.ok(!asConfigLine.test(healSrc), `self-heal.js 的托管块不得再写 ${banned}（rc.3 会因此拒绝整行配置）`);
     }
     assert.ok(healSrc.includes('- id: tool-agent-team') && healSrc.includes('disabled: true'),
       'self-heal.js 的托管块必须包含「关掉官方 tool-agent-team 行」');
@@ -4022,10 +4047,13 @@ function functionBodyOf(source, needle) {
     // 旧实现是自造文案（「已读取文件」「修改了文件」「已搜索代码」）—— 与官方不一致。
     const expect = {
       read: '读取', read_image: '读取图片', grep: '搜索文件内容', glob: '查找文件',
-      write: '写入', edit: '编辑', apply_patch: '应用补丁', bash: '运行命令', pwsh: '运行命令',
+      // 2026-11-15 rc.3 对齐官方真值：
+      //   apply_patch → 官方 tool.title.applyPatch 是「编辑」（不是「应用补丁」）
+      //   wait_agent  → 官方 tool.title.waitAgent  是「等待消息…」（不是「等待子智能体」）
+      write: '写入', edit: '编辑', apply_patch: '编辑', bash: '运行命令', pwsh: '运行命令',
       web_search: '网页搜索', web_fetch: '网页获取', subagent: '创建子智能体',
       spawn_teammate: '创建队友', send_message: '发送消息', list_agents: '查看子智能体',
-      wait_agent: '等待子智能体', team_task_create: '创建团队任务', get_team_task: '读取团队任务',
+      wait_agent: '等待消息…', team_task_create: '创建团队任务', get_team_task: '读取团队任务',
       read_terminal: '读取终端', lsp: '查询代码符号', find_references: '查找引用',
     };
     for (const [tool, label] of Object.entries(expect)) {

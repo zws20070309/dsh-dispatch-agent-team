@@ -34,18 +34,21 @@
 # 产生同名工具冲突。
 - id: agent-team
   config:
-    maxMembers: 48
     maxTasks: 512
-    maxPendingMessagesPerMember: 64
-    maxMessageBytes: 65536
-    disposalTimeoutMs: 5000
 
 - insert:
-    # 官方 Agent Teams 的 Web 端成员列表 / 任务看板，由我们自己的行重新挂载。
-    # 行 id 与官方不同，所以不会与官方行冲突；客户端半由 dsh-client-modules
-    # 按「specifier 是裸包名」的 loader 行发现，因此这里必须写完整包名。
-    - id: dispatch-agent-team-panel
-      name: '@deepseek-ai/dsh-experimental-client-ui-agent-team'
+    # ── 这里原本还有一行 dispatch-agent-team-panel（2026-11-15 删，rc.3）──────────
+    # 它挂的是 '@deepseek-ai/dsh-experimental-client-ui-agent-team'。rc.3 把团队包从
+    # dsh-experimental-* 改名为 dsh-*，那个 specifier 在 app.asar 里已 **0 命中**
+    # （实测条目表里只有 dsh-client-ui-agent-team / dsh-tool-agent-team / dsh-agent-team）。
+    # loader 行解析失败 = 该行不激活。它原来只在「官方行被我们关掉」时才需要顶替；
+    # 现在官方 dsh-client-ui-agent-team 由 web-app bundle 自己 insert 并保持启用，
+    # 本插件的客户端半也**从不** import 它（lib/client.js 只 require('react')），
+    # 所以这一行纯属多余的悬空引用，删掉不动任何可见行为。
+    # 同理，本文件里 **不要** 再 disable 官方的 ui-agent-team：输入框那个「启用智能体团队协作」
+    # 开关正是官方 ui-agent-team 注册的（dsh-client-ui-agent-team/src/client/mount.ts 的
+    # slots.register({ name: 'conversation.input.model.options', id: 'agent-team' })），
+    # 关掉它 = 开关消失，任何第三方插件都补不回来。
 
     # 调度模式智能体团队：host 半（配置读写 + HTTP 路由 + 团队工具安装 + 队员模型/强度覆盖）。
     # 该行的 specifier 必须是本包的**裸包名**，否则 lib/client.js 不会被挂载。

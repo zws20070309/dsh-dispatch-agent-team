@@ -52,14 +52,41 @@ console.log('');
 
 // 托管块的常量定义在这里（revert 早退分支与下方 --apply 分支共用）。
 const PROFILE_PATCH = path.join(profileDir, 'cordis.patch.yml');
-/** 与 cordis.patch.yml 里的值必须一致（drift-check 也校验这两份相等）。 */
+/**
+ * 与 cordis.patch.yml 里的值必须一致（drift-check 也校验这两份相等）。
+ *
+ * ── 为什么只剩两个键（2026-11-15，rc.3 升级）────────────────────────────────
+ * rc.3（0.2.2-rc.3）的 TeamService 构造函数**主动拒绝**这三个键：
+ *
+ *   REMOVED_CONFIG_KEYS = ['maxMembers', 'maxMessageBytes', 'disposalTimeoutMs']
+ *   throw new TeamError(`agent-team: ${key} is no longer supported...`, 'TEAM_INVALID_CONFIG')
+ *
+ *   证据：@deepseek-ai/dsh-agent-team/src/index.ts:34-35（常量）、:62-69（throw）；
+ *         编译产物 lib/index.js:697-701、:753。
+ *
+ * **而且 schemastery 不会替我们剥掉未知键**：object 类型的 resolve() 在非 strict 模式下
+ * 会把 schema 之外的键原样并回结果（schemastery/lib/index.mjs:512-527 的 merge()），
+ * 已用本机 app.asar 里的 schemastery + rc.3 真实 Config 实测：maxMembers 等三键**都活到构造函数里**。
+ * 于是「我们写这三个键」= agent-team 行构造即抛错 = 域服务不注册 = 输入框团队开关消失
+ * （开关自身的 agentTeam 投影在 TeamService 里注册）。
+ *
+ * maxMembers 的语义也已变：rc.3 起「队员就是 subagent」，累计帽换成 subagent 的同时在线帽
+ * （maxActiveSubagents）。所以这里不再需要、也不能再写 maxMembers。
+ */
 const AGENT_TEAM_CONFIG = {
-  maxMembers: 48,
   maxTasks: 512,
-  maxPendingMessagesPerMember: 64,
-  maxMessageBytes: 65536,
-  disposalTimeoutMs: 5000,
 };
+
+/**
+ * rc.3 的 TeamService **主动拒绝**的键（写进去 = 构造即抛 TEAM_INVALID_CONFIG）。
+ *
+ * 这比「缺字段」危险得多：缺字段只是容量退回默认，写进去是整个域服务**不注册**，
+ * 于是输入框那个「启用智能体团队协作」开关直接消失（开关自己的 agentTeam 投影就在
+ * TeamService 里注册）。2026-11-15 升 rc.3 后用户看到的就是这个 —— 而旧版体检只查
+ * 「AGENT_TEAM_CONFIG 里的键在不在」，完全不看「有没有多出来不该有的键」，
+ * 所以它对着这份**已坏**的 profile 报「齐备」。
+ */
+const FORBIDDEN_AGENT_TEAM_KEYS = ['maxMembers', 'maxMessageBytes', 'disposalTimeoutMs'];
 const MANAGED_START = '# ── dispatch-agent-team:managed:start（由 tools/repair.cjs 维护，勿手改）──';
 const MANAGED_END = '# ── dispatch-agent-team:managed:end ──';
 
@@ -195,6 +222,7 @@ const PACKAGE_FILES = [
   'lib/self-heal.js',
   'lib/status-pump.js',
   'lib/ops-adapter.js',
+  'lib/member-rows.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
   'tools/ops-enable.cjs',
@@ -365,11 +393,23 @@ if (!Array.isArray(bundles)) {
       problems.pop();
     }
   }
-  // 官方 agent-team bundle 是否还在（我们的域服务复用它）
-  const OFFICIAL = '@deepseek-ai/dsh-experimental-agent-team-profile';
-  if (!bundles.includes(OFFICIAL)) {
-    notes.push(`官方 ${OFFICIAL} 不在 bundles 里。本插件的 cordis.patch.yml 假定它的 agent-team 域服务行处于启用状态；` +
-      `若确实要移除官方 bundle，需要把 agent-team 行自己 insert 进我们的 cordis.patch.yml。`);
+  // ── 2026-11-15 rc.3：官方 agent-team-profile 这个可选 bundle **已被删除** ──────────
+  // rc.2：agent-team / tool-agent-team / ui-agent-team 三行由 @deepseek-ai/dsh-experimental-agent-team-profile
+  //       这个独立 bundle 用 insert 新建，所以它必须被 profile 选中。
+  // rc.3：那个 bundle 整个没了（asar 里 0 命中），三行拆进**基线**：
+  //       agent-team + tool-agent-team → dsh-base/cordis.patch.yml:366-372
+  //       ui-agent-team              → dsh-web-app/cordis.patch.yml:412-413
+  // 所以现在该检查的是「基线层在不在」，而不是「那个可选 bundle 在不在」。
+  // 旧判据不但会一直报一条无解的提示，还会诱导人把一个解析不到的包名写回 bundles
+  //（那会让启动时报一个假故障）。
+  const BASE_LAYERS = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'];
+  const missingBase = BASE_LAYERS.filter((name) => !bundles.includes(name));
+  if (missingBase.length > 0) {
+    notes.push(`这些基线层不在 bundles 里：${missingBase.join('、')} —— agentTeams 域服务与输入框的团队开关都来自它们。`);
+  }
+  if (bundles.includes('@deepseek-ai/dsh-experimental-agent-team-profile')) {
+    notes.push('profile 的 bundles 里还留着已删除的 @deepseek-ai/dsh-experimental-agent-team-profile（rc.3 已把三行拆进 base/web-app）：'
+      + '这一行解析不到，会让启动时报一个假故障，建议从插件页移除。');
   }
 }
 
@@ -380,17 +420,22 @@ if (!Array.isArray(bundles)) {
 // （PROFILE_PATCH / AGENT_TEAM_CONFIG / MANAGED_START / MANAGED_END 定义在文件上方，revert 分支共用。）
 const MANAGED_BLOCK = [
   MANAGED_START,
-  '# 为什么这两条必须写在这一层：bundle 的 patch 按 dsh.profile.bundles 顺序应用，官方',
-  '# agent-team-profile 用 `insert` 新建这三行；我们的 bundle 排在它之前时，针对这些行的',
+  '# 为什么这条必须写在这一层：bundle 的 patch 按 dsh.profile.bundles 顺序应用；官方',
+  '# base 层用 `insert` 新建 `agent-team` 行。我们的 bundle 排在它之前时，针对该行的',
   '# 覆盖会**静默失效**（2026-09-28 实测）。本文件在所有 bundle 层之后应用，顺序无关。',
   '#',
-  '# 为什么必须关掉官方工具行：官方 `tool-agent-team` 给**每一个** live agent 都装九个团队工具',
-  '# （dsh-experimental-tool-agent-team/lib/index.js:539-546 的 maybeInstall；tryMembership 对任意',
-  '# 非子代理 agent 都返回 lead 身份 :420-426），而本插件在**同一个 agent 作用域**注册同样的九个',
-  '# 名字 → `tool "x" is already registered in this scope`，本插件的工具装不上，角色/模型参数丢失。',
+  '# 为什么必须关掉官方工具行：官方 `tool-agent-team` 也给 live agent 装团队工具，而本插件在',
+  '# **同一个 agent 作用域**注册同名工具 → `tool "x" is already registered in this scope`，',
+  '# 本插件的工具装不上，角色/模型参数丢失。',
   '- id: tool-agent-team',
   '  disabled: true',
   '',
+  '# ⚠️ 只写 maxTasks 一个键（2026-11-15，rc.3）。',
+  '# rc.3 的 TeamService 构造函数**主动拒绝** maxMembers / maxMessageBytes / disposalTimeoutMs',
+  '# （dsh-agent-team/src/index.ts:34-35 常量、:62-69 throw，编译产物 lib/index.js:697-701、:753），',
+  '# 而 schemastery 在非 strict 模式下**不剥未知键**（lib/index.mjs:512-527 的 merge()）。',
+  '# 实测：写这三个键 → 构造即抛 TEAM_INVALID_CONFIG → 域服务不注册 → 输入框团队开关消失。',
+  '# rc.3 起「队员就是 subagent」，累计帽换成 subagent 的同时在线帽（maxActiveSubagents）。',
   ...['- id: agent-team', '  config:', ...Object.entries(AGENT_TEAM_CONFIG).map(([key, value]) => `    ${key}: ${value}`)],
   MANAGED_END,
 ].join('\n');
@@ -414,6 +459,11 @@ if (!fs.existsSync(PROFILE_PATCH)) {
   }
   const missing = Object.entries(AGENT_TEAM_CONFIG).filter(([key, value]) => effective[key] !== value);
   console.log(`- profile 层 agent-team 容量覆盖：${missing.length === 0 ? '齐备' : `缺/不一致 ${missing.map(([key]) => key).join(', ')}`}`);
+  // (2b) 2026-11-15 rc.3 P0：多写了 rc.3 已删除的键 = 域服务构造即抛错 = 团队开关消失。
+  const forbidden = FORBIDDEN_AGENT_TEAM_KEYS.filter((key) => Object.hasOwn(effective, key));
+  if (forbidden.length > 0) {
+    console.log(`- profile 层 agent-team 含 rc.3 已删除的键：${forbidden.join(', ')} —— 会让域服务构造即抛 TEAM_INVALID_CONFIG`);
+  }
 
   // (3) 2026-10-10 P0：哨兵区**结构**是否还健康。两条判据：
   //     * 块必须写在文件开头（否则宿主 AST 追加会再次把外来行塞进哨兵区）；
@@ -435,9 +485,10 @@ if (!fs.existsSync(PROFILE_PATCH)) {
     console.log(`- 哨兵区内外来行：${foreignInside.length === 0 ? '无（正确）' : `**${foreignInside.join(', ')}** —— 切片重写会误删它们`}`);
   }
 
-  if (!toolRowDisabled || missing.length > 0 || !blockAtTop || foreignInside.length > 0) {
+  if (!toolRowDisabled || missing.length > 0 || forbidden.length > 0 || !blockAtTop || foreignInside.length > 0) {
     const why = [
-      toolRowDisabled ? '' : '官方 tool-agent-team 行还开着：它会把九个同名工具装进每个会话的 agent 作用域，本插件的工具装不上（角色/模型参数不可用）',
+      toolRowDisabled ? '' : '官方 tool-agent-team 行还开着：它会把同名工具装进每个会话的 agent 作用域，本插件的工具装不上（角色/模型参数不可用）',
+      forbidden.length === 0 ? '' : `agent-team 含 rc.3 已删除的键（${forbidden.join('、')}）：rc.3 的 TeamService 构造函数遇到它们直接抛 TEAM_INVALID_CONFIG，域服务不注册 → 输入框的「启用智能体团队协作」开关消失。这三个键的语义已被 subagent 取代（队员就是 subagent）`,
       missing.length === 0 ? '' : `agent-team 容量缺/不一致（${missing.map(([key, value]) => `${key} 应为 ${value}，实际 ${effective[key] ?? '缺'}`).join('；')}）：顺序不利时 maxMembers 会退回官方默认 8，团队 8 次 spawn 后派不出人`,
       blockAtTop ? '' : '托管块不在文件开头：宿主切换插件组件时会用 YAML AST 把新行追加到文件尾部注释之前，即**哨兵区内部**，下次 --apply/--revert 会把它们静默删掉',
       foreignInside.length === 0 ? '' : `哨兵区内混入了外来插件行（${foreignInside.join(', ')}）：它们随时会被切片重写误删`,

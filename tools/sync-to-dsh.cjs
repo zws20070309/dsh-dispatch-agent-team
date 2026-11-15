@@ -93,6 +93,7 @@ const FILES = [
   'lib/self-heal.js',
   'lib/status-pump.js',
   'lib/ops-adapter.js',
+  'lib/member-rows.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
   'tools/ops-enable.cjs',
