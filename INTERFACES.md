@@ -136,6 +136,12 @@ export function annotateTruncatedMembers(rows, truncatedIds);
 export const RETRY_DIAGNOSTIC_PREFIX;     // '最近一次请求被宿主自动重试：'（同样进成员行 diagnostics）
 export function annotateRetriedMembers(rows, retryBy);
                                     // -> 新数组；有重试记录的队员行追加该前缀 + 摘要，不改入参
+// 2026-11-15 新增（第六轮真机 session-987dedcf）：分辨「已经死了」与「干完了在等验收」。
+// 两者在官方行里**都是 status:"inactive"**；真相在队员的 turn/end reason.kind=error 里。
+export const TURN_FAILED_DIAGNOSTIC_PREFIX; // '最近一次 turn 以错误结束（它没有正常收尾，名下任务不会自己闭环）：'
+export function annotateFailedMembers(rows, failedBy);
+                                    // -> 新数组；failedBy: agentId → {kind:'error', message?}。
+                                    //    只写 role==='teammate' 那几行的 diagnostics，不新增字段、不改入参
 // 2026-10-14 新增（任务板闭环；现场 session-00001000，见 §2.1 的预算上调记录）：
 export const BOARD_CLOSURE_PREFIX;        // '任务板未闭环 '（进 Lead 行与 wait_agent 的 diagnostics）
 export const BOARD_CLOSURE_ID_LIMIT;      // 6：提示里最多点名的条目数
@@ -316,7 +322,17 @@ export function appliedMemberRoutes();      // -> Map<agentId, {provider?, model
                                             //    覆盖失败退回原配置时不记 = 宁缺毋滥）
 export function noteRetryEvent(agentId, data); // 重试账本的唯一写入点（监听器与测试共用）
 export function clearRetryEvent(agentId);   // 新一轮开始时作废旧码（不跨轮沿用）
-export function noteTurnEndReason(agentId, kind); // 截断账本的唯一写入点（监听器与测试共用）
+export function noteTurnEndReason(agentId, kind, detail?); // 截断账本 + 失败账本的唯一写入点（监听器与
+                                            //  测试共用）。kind==='error' 时把 detail（官方 turn/end 的
+                                            //  reason.error.message）截到 160 字记进失败账本；
+                                            //  任何非 error 的收尾都会清掉该队员的失败记录
+export function noteTurnStart(agentId);     // 「这一轮在跑」账本的唯一写入点（turn/start 监听器与测试共用）。
+                                            //   关团推迟拆装的判据就是它：正在跑的队员不能立刻拆 executor
+export function settleTurnEnd(agentId);     // turn/end 时收回「在跑」并兑现被推迟的拆装；返回是否真的拆了一个
+export function failedMemberIds();          // -> Map<agentId, {kind:'error', message?}>；最近一次 turn
+                                            //   **以错误结束**的队员（list_agents 标注用）。与 truncated 不同：
+                                            //   agent/disposed **不清**它 —— 可续期子代理每轮结束都会 disposed，
+                                            //   清了就等于把「它刚才是怎么死的」这条唯一证据抹掉
 export function noteAppliedRoute(agentId, route); // 路由账本的唯一写入点（installRouteOverride 与
                                             //   测试共用）；provider/model/reasoningEffort 三个键都只收非空白字符串，
                                             //   全空则整条不记（宁缺毋滥：记了就是把没用上的报成用过）
@@ -541,7 +557,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:754`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:797`）。
    注意 `lib/tools.js:$ln-987` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条

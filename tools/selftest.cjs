@@ -822,6 +822,58 @@ function functionBodyOf(source, needle) {
     assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
   });
 
+  await check('失败标志：以 error 收尾的队员必须标出来，正常收尾的队员不许被标（第六轮 P0）', () => {
+    // 真机依据（2026-11-15 第六轮 session-987dedcf）：Lead 关团时拆掉了正在跑的队员的
+    // executor，两名队员当场以 error 收尾。它们的 turn/end 是
+    //   {"kind":"error","error":{"message":"The selected tool executor is unavailable. …"}}
+    // 而 Lead 在 list_agents 里只看到 status:"inactive" —— 与「干完在等验收」一模一样，
+    // 于是它只能人肉猜，还把两条僵尸任务当「未交付」挂着。
+    // 这条闸门同时钉住**反方向**：正常收尾（completed / max-tokens）的队员不许被标成失败。
+    const rows = [
+      { id: 'lead-id', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'a-id', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: ['已有诊断'] },
+      { id: 'b-id', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    const marked = roster.annotateFailedMembers(rows, new Map([
+      ['a-id', { kind: 'error', message: 'The selected tool executor is unavailable.' }],
+    ]));
+    assert.equal(marked[1].diagnostics.length, 2, '标志要追加，不能吞掉官方已有的 diagnostics');
+    assert.ok(marked[1].diagnostics[1].startsWith(roster.TURN_FAILED_DIAGNOSTIC_PREFIX), '要带固定前缀，Lead 才认得出');
+    assert.ok(marked[1].diagnostics[1].includes('executor is unavailable'), '官方错误正文要原样带上（不翻译、不猜）');
+    assert.ok(/任务不会自己闭环/.test(roster.TURN_FAILED_DIAGNOSTIC_PREFIX),
+      '文案必须点破僵尸任务：以 error 死掉的队员不会 complete / release 它名下的条目');
+    assert.equal(marked[2].diagnostics.length, 0, '没被记账的队员不许被标注');
+    assert.equal(marked[0], rows[0], 'Lead 行不许动（它不是队员，也没有失败记录）');
+    assert.deepEqual(rows[1].diagnostics, ['已有诊断'], '入参必须不被修改（该数组同时是 Lead 请求前缀的一部分）');
+    // 反方向：正常收尾的队员**不许**被标成失败。
+    assert.equal(roster.annotateFailedMembers(rows, new Map())[1], rows[1], '空账本时连对象都不该重建');
+    assert.equal(roster.annotateFailedMembers(rows, null)[1], rows[1]);
+    // 记了账但 kind 不是 error（例如 max-tokens 或 completed）→ 一律不标。
+    // 这条防的是「把所有 turn/end 都当失败」这种过度标注 —— 那会让失败标志失去意义。
+    assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', { kind: 'max-tokens' }]]))[1], rows[1],
+      '只有 kind==="error" 才算失败；别的收尾一律不标');
+    assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', null]]))[1], rows[1], '脏记录不标也不抛');
+    assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', 'error']]))[1], rows[1], '非对象记录不标也不抛');
+    assert.equal(roster.annotateFailedMembers(null, new Map([['a-id', { kind: 'error' }]])).length, 0, 'rows 不是数组时退化成空表，不抛');
+    // 幂等：重复标注不加第二份。
+    assert.equal(roster.annotateFailedMembers(marked, new Map([
+      ['a-id', { kind: 'error', message: 'The selected tool executor is unavailable.' }],
+    ]))[1].diagnostics.length, 2);
+    // 没有 message 也要标（「死了但没说原因」仍然比「看着像干完了」有用）。
+    const noMsg = roster.annotateFailedMembers(rows, new Map([['b-id', { kind: 'error' }]]));
+    assert.equal(noMsg[2].diagnostics.length, 1);
+    assert.ok(noMsg[2].diagnostics[0].includes('没有留下错误正文'));
+    // 与前面两个标注器串联（生产路径是 截断 → 重试 → 失败 → model）。
+    const chain = roster.annotateFailedMembers(
+      roster.annotateRetriedMembers(roster.annotateTruncatedMembers(rows, new Set(['b-id'])), new Map([['a-id', 'x']])),
+      new Map([['a-id', { kind: 'error', message: 'boom' }]]),
+    );
+    assert.equal(chain[1].diagnostics.length, 3, '重试 + 失败两个标注必须能共存');
+    assert.equal(chain[2].diagnostics.length, 1, '截断标志不受影响');
+    assert.deepEqual(Object.keys(chain[1]).sort(), ['diagnostics', 'id', 'name', 'role', 'status'],
+      '标注只写已有字段，绝不新增（新增 = 改 Lead 工具目录 = 动缓存前缀）');
+  });
+
   await check('队员 model 校正：官方给的是继承模型，必须换成请求真正用的那份（session-00001005 的 P1）', () => {
     // 现场（2026-10-16 session-00001005，逐条从会话日志核出）：两名队员的 list_agents 行都写
     // model=model-a（= Lead 自己的模型），而它们的 request/header.header.config 与 request/context
@@ -3982,45 +4034,7 @@ function functionBodyOf(source, needle) {
     assert.ok(!/const purePtc = !batchDeclared/.test(runtimeSrc),
       '又用布尔反推 purePtc 了 —— 新语义下它是反的');
 
-    // ②c 队员 model 显示链路（2026-10-16 session-00001005 P1 的形状闸门）：
-    //     runtime 必须在**真的把覆盖写进请求对象之后**才记账（记早了会把「解析出但没采用」的写进去），
-    //     list_agents 必须消费这份账（否则 Lead 拿到的还是继承来的模型 = 错数据）。
-    const rtForModel = runtimeSrc;
-    const ioAt = rtForModel.indexOf('function installRouteOverride');
-    assert.ok(ioAt >= 0, 'runtime.js 必须有 installRouteOverride');
-    const ioBody = rtForModel.slice(ioAt, ioAt + 3600);
-    assert.ok(ioBody.includes('noteAppliedRoute(agent.id,'), 'installRouteOverride 必须经唯一写入点记路由（不许散写 appliedRoutes.set）');
-    assert.ok(ioBody.indexOf('noteAppliedRoute(agent.id,') < ioBody.indexOf('return override;'),
-      '记账必须在 return override 之前、且在覆盖真的合进请求对象之后（catch 分支里不许记 = 宁缺毋滥）');
-    assert.ok(!/catch[\s\S]{0,240}noteAppliedRoute/.test(ioBody),
-      'catch 分支（覆盖失败退回原配置）里不许记路由：记了就是把没用上的东西报成用过');
-    assert.ok(/export function noteAppliedRoute\(agentId, route\)/.test(rtForModel), '必须有唯一写入点 noteAppliedRoute');
-    assert.ok(/export function clearAppliedRoute\(agentId\)/.test(rtForModel), '必须有唯一作废点 clearAppliedRoute');
-    assert.ok(!/function installRouteOverride[\s\S]{0,3000}appliedRoutes\.set/.test(rtForModel),
-      'installRouteOverride 里不许绕过写入点直接 set 账本');
-    // 2026-10-17 更正：旧断言要求 disposeInstalled **必须**清掉路由账本 —— 那条断言本身是错的。
-    // 真机 session-00001002 实测：可续期子代理每轮结束都触发 agent/disposed，清了账本之后
-    // list_agents 对 inactive 队员退回「继承自 Lead 的模型」（同一次调用里 running 的对、inactive 的全错）。
-    // 现在的要求反过来：**不许**在 disposeInstalled 里清，只允许在插件整体卸载（disposeAll）时清。
-    const disposeBody = rtForModel.slice(rtForModel.indexOf('function disposeInstalled'), rtForModel.indexOf('function disposeInstalled') + 1200);
-    assert.ok(!disposeBody.includes('clearAppliedRoute('),
-      'disposeInstalled 不许清路由账本：可续期子代理每轮结束都触发 agent/disposed，清了就会让 list_agents 对已结束的队员报回继承模型（2026-10-17 真机 P1）');
-    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账（插件整体卸载时才回收）');
-    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账');
-    assert.ok(/export function appliedMemberRoutes\(\) \{/ .test(rtForModel), 'runtime 必须导出 appliedMemberRoutes()');
-    // ── 2026-10-17 更正：账本必须在「队员结束」之后仍然存在 ──────────────────────
-    // 起因（真机 session-00001002）：可续期子代理每轮结束都会触发 agent/disposed
-    // （官方 dsh-subagent 的 finishDisposal 结算后调 activation.handle.dispose()，
-    //  dsh-agent 的 detachEntered 随即 emit agent/disposed），于是 disposeInstalled 被调用。
-    // 旧实现里它 clearAppliedRoute —— 结果 list_agents 对**已结束**的队员退回继承模型：
-    // 实测同一次 list_agents 里 running 的 builder/verify = model-b（对），
-    // inactive 的 researcher = model-d（= Lead 的模型，错）。
-    assert.ok(/appliedMemberRoutes,\n/.test(rtForModel), 'appliedMemberRoutes 必须进 runtimeApi');
-    const toolsSrc = readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8');
-    assert.ok(toolsSrc.includes("annotateMemberModels(withRetries, runtime?.appliedMemberRoutes?.() ?? new Map())"),
-      'list_agents 必须消费 appliedMemberRoutes（不接 = Lead 继续看到继承模型）');
-    assert.ok(!/model:\s*\{[^\n]*required/.test(toolsSrc.split('MEMBER_VIEW_SCHEMA')[1]?.slice(0, 1200) ?? ''),
-      '不许把 model 变成必填字段（那是改 Lead 的工具目录）');
+
 
     // ②a 纪律闸门（用户 2026-10-15 明令「别改 ops 的源码」）：本仓库不得再出现任何
     //     修改 dsh-ops 包内文件的工具、判据字面或备份痕迹。适配只能发生在本包这一侧。
@@ -4098,6 +4112,61 @@ function functionBodyOf(source, needle) {
       assert.ok(!listSrc.includes("'lib/ops-coexist.js'"), listFile + ' 不得再列已删除的 ops-coexist.js');
       assert.ok(listSrc.includes("'tools/ops-mount-check.mjs'"), listFile + ' 的文件清单必须含 ops-mount-check.mjs（离线验收工具要能随包分发）');
     }
+  });
+
+  await check('队员 model 显示链路 + list_agents 标注链：runtime 记真账、工具面真的消费它（缓存前缀纪律）', () => {
+    // 这一块原来被塞在「dsh-ops 原生链接」那个 check 里（2026-11-15 第六轮整理）：
+    // 变异测试把 list_agents 的失败标注摘掉时，红的是**dsh-ops 那条闸门** ——
+    // 报错名与真实缺陷无关，排查会被带偏。内容与 ops 毫无关系，所以拆出来独立命名。
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    // ②c 队员 model 显示链路（2026-10-16 session-00001005 P1 的形状闸门）：
+    //     runtime 必须在**真的把覆盖写进请求对象之后**才记账（记早了会把「解析出但没采用」的写进去），
+    //     list_agents 必须消费这份账（否则 Lead 拿到的还是继承来的模型 = 错数据）。
+    const rtForModel = runtimeSrc;
+    const ioAt = rtForModel.indexOf('function installRouteOverride');
+    assert.ok(ioAt >= 0, 'runtime.js 必须有 installRouteOverride');
+    const ioBody = rtForModel.slice(ioAt, ioAt + 3600);
+    assert.ok(ioBody.includes('noteAppliedRoute(agent.id,'), 'installRouteOverride 必须经唯一写入点记路由（不许散写 appliedRoutes.set）');
+    assert.ok(ioBody.indexOf('noteAppliedRoute(agent.id,') < ioBody.indexOf('return override;'),
+      '记账必须在 return override 之前、且在覆盖真的合进请求对象之后（catch 分支里不许记 = 宁缺毋滥）');
+    assert.ok(!/catch[\s\S]{0,240}noteAppliedRoute/.test(ioBody),
+      'catch 分支（覆盖失败退回原配置）里不许记路由：记了就是把没用上的东西报成用过');
+    assert.ok(/export function noteAppliedRoute\(agentId, route\)/.test(rtForModel), '必须有唯一写入点 noteAppliedRoute');
+    assert.ok(/export function clearAppliedRoute\(agentId\)/.test(rtForModel), '必须有唯一作废点 clearAppliedRoute');
+    assert.ok(!/function installRouteOverride[\s\S]{0,3000}appliedRoutes\.set/.test(rtForModel),
+      'installRouteOverride 里不许绕过写入点直接 set 账本');
+    // 2026-10-17 更正：旧断言要求 disposeInstalled **必须**清掉路由账本 —— 那条断言本身是错的。
+    // 真机 session-00001002 实测：可续期子代理每轮结束都触发 agent/disposed，清了账本之后
+    // list_agents 对 inactive 队员退回「继承自 Lead 的模型」（同一次调用里 running 的对、inactive 的全错）。
+    // 现在的要求反过来：**不许**在 disposeInstalled 里清，只允许在插件整体卸载（disposeAll）时清。
+    const disposeBody = rtForModel.slice(rtForModel.indexOf('function disposeInstalled'), rtForModel.indexOf('function disposeInstalled') + 1200);
+    assert.ok(!disposeBody.includes('clearAppliedRoute('),
+      'disposeInstalled 不许清路由账本：可续期子代理每轮结束都触发 agent/disposed，清了就会让 list_agents 对已结束的队员报回继承模型（2026-10-17 真机 P1）');
+    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账（插件整体卸载时才回收）');
+    assert.ok(rtForModel.includes('appliedRoutes.clear()'), 'disposeAll 必须清空记账');
+    assert.ok(/export function appliedMemberRoutes\(\) \{/ .test(rtForModel), 'runtime 必须导出 appliedMemberRoutes()');
+    // ── 2026-10-17 更正：账本必须在「队员结束」之后仍然存在 ──────────────────────
+    // 起因（真机 session-00001002）：可续期子代理每轮结束都会触发 agent/disposed
+    // （官方 dsh-subagent 的 finishDisposal 结算后调 activation.handle.dispose()，
+    //  dsh-agent 的 detachEntered 随即 emit agent/disposed），于是 disposeInstalled 被调用。
+    // 旧实现里它 clearAppliedRoute —— 结果 list_agents 对**已结束**的队员退回继承模型：
+    // 实测同一次 list_agents 里 running 的 builder/verify = model-b（对），
+    // inactive 的 researcher = model-d（= Lead 的模型，错）。
+    assert.ok(/appliedMemberRoutes,\n/.test(rtForModel), 'appliedMemberRoutes 必须进 runtimeApi');
+    const toolsSrc = readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8');
+    // ── 成员行标注链（2026-11-15 第六轮扩成四环）────────────────────────────────
+    // 顺序有语义：截断 → 重试 → 失败 → 模型。断言整条链，而不是只看最后一环 ——
+    // 只断最后一环的话，中间把「失败标注」接丢了也不会红（那正是本轮要修的东西）。
+    assert.ok(toolsSrc.includes('const withTruncation = annotateTruncatedMembers(members,'),
+      'list_agents 标注链第一环：截断');
+    assert.ok(toolsSrc.includes('const withRetries = annotateRetriedMembers(withTruncation,'),
+      'list_agents 标注链第二环：重试（必须吃上一步的产物，不能各自从 members 起）');
+    assert.ok(toolsSrc.includes('const withFailures = annotateFailedMembers(withRetries,'),
+      'list_agents 标注链第三环：以 error 收尾的队员（不接 = Lead 分不清「死了」与「干完了」，2026-11-15 第六轮）');
+    assert.ok(toolsSrc.includes('const rows = annotateMemberModels(withFailures, runtime?.appliedMemberRoutes?.() ?? new Map())'),
+      'list_agents 必须消费 appliedMemberRoutes（不接 = Lead 继续看到继承模型），且必须是链的最后一环');
+    assert.ok(!/model:\s*\{[^\n]*required/.test(toolsSrc.split('MEMBER_VIEW_SCHEMA')[1]?.slice(0, 1200) ?? ''),
+      '不许把 model 变成必填字段（那是改 Lead 的工具目录）');
   });
   await check('ops-adapter 的 profile 退回链必须有 .dsh 那一段（2026-10-16 真机 P1 回归闸门）', async () => {
     // 真机抓出来的过程：状态文件里四个 dsh-ops 组件行都 phase:2 挂着，但 opsIntegration.package = null。

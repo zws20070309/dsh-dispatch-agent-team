@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:754），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:797），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -2982,11 +2982,103 @@ async function main() {
     });
   }
 
+  // ── 7.9d) 关团不许拆「正在跑」的队员的执行器（2026-11-15 第六轮 P0）──────────────────
+  // 真机事故（session-987dedcf turn 6）：Lead 在两名队员正跑着的时候调 disable_agent_team，
+  // 206~237 ms 后两名队员**同时**以 error 收尾，子会话日志里是：
+  //   turn/end {"kind":"error","error":{"message":"The selected tool executor is
+  //   unavailable. Load an executor in this composition before running the agent."}}
+  // 根因是源码事实：disable → disposeInstalled → 跑掉 declareMemberMode 注册的那条
+  //   `fork?.dispose?.()`（lib/runtime.js 的 keepDisposer(..., `ctx.plugin(tool-executor-${mode})`, ...)），
+  // 而 executor 一旦离开作用域，dsh-tools 的 selectExecutor 沿 scopeChainOf 找不到 record，
+  // 直接抛 ToolExecutorUnavailableError —— 那一轮脚下的地板被抽走。
+  // 修法：跑着的队员推迟到 turn/end 再拆（终态相同，只是不弄死在途工作）。
+  // 这条用例走**生产写入点**（runtime.noteTurnStart / settleTurnEnd，与事件监听器同一个函数），
+  // 并用工具返回的 deferredTeardown 做可观测判据。
+  {
+    const ddKey = { name: 'stand-defer-member' };
+    const ddScope = createScope(root, ddKey);
+    const ddSession = makeStandSession('stand-defer', 'dispatch-mode', false);
+    const ddMate = { id: 'stand-defer', ctx: agentCtx(ddScope.ctx), options: {}, session: ddSession };
+    agents.push(ddMate);
+    membershipById.set(ddMate.id, { root: standLead, id: ddMate.id, role: 'teammate', name: 'defer-tester' });
+    joinOrRebind(ddMate.ctx, 'dispatch-mode');
+    root.emit('agent/created', { agent: ddMate });
+    await tick();
+    await tick();
+    const installedBefore = runtime.status(ddMate).enabled === true;
+    // 模拟「这一轮正在跑」：走生产监听器用的同一个写入点。
+    runtime.noteTurnStart('stand-defer');
+    const deferInstalled = await runtime.enable(root, standLead, { source: 'integration-test' });
+    if (deferInstalled?.ok !== true) console.error('[integration-test] 推迟用例 enable 失败：', JSON.stringify(deferInstalled));
+    const offDuringRun = await runtime.disable(root, standLead);
+    const enabledWhileRunning = runtime.status(ddMate).enabled;
+    // 这一轮跑完：真 turn/end 会走 settleTurnEnd，把推迟的拆装兑现掉。
+    const drained = runtime.settleTurnEnd('stand-defer');
+    await tick();
+    const enabledAfterSettle = runtime.status(ddMate).enabled;
+    check('关团不会拆掉正在跑的队员：它的注册活到这一轮结束，然后才被拆干净', () => {
+      if (installedBefore !== true) return '前提不成立：夹具里这名队员一开始就没装上';
+      if (offDuringRun?.ok !== true) return '关团本身没成功：' + JSON.stringify(offDuringRun);
+      if (enabledWhileRunning !== true) {
+        return '在跑的队员被当场拆了（status.enabled=' + String(enabledWhileRunning) + '）—— '
+          + '这会让它当前这一轮取执行器时抛 ToolExecutorUnavailableError（真机 206~237ms 后以 error 收尾）';
+      }
+      const deferredList = Array.isArray(offDuringRun.deferredTeardown) ? offDuringRun.deferredTeardown : [];
+      if (!deferredList.includes('stand-defer')) {
+        return '关团回执没有如实报告被推迟的队员：' + JSON.stringify(offDuringRun.deferredTeardown);
+      }
+      if (drained !== true) return '这一轮跑完后没有兑现推迟的拆装（settleTurnEnd 返回 false）';
+      if (enabledAfterSettle !== false) {
+        return '跑完后没拆干净（status.enabled=' + String(enabledAfterSettle) + '）：团队关了就该断干净，只是不能打断在途那一轮';
+      }
+      return true;
+    });
+  }
+
+  // 反方向：不在跑的队员，关团时必须**立刻**拆（不回退成「关团什么都不做」）。
+  {
+    const idleKey = { name: 'stand-idle-member' };
+    const idleScope = createScope(root, idleKey);
+    const idleSession = makeStandSession('stand-idle', 'dispatch-mode', false);
+    const idleMate = { id: 'stand-idle', ctx: agentCtx(idleScope.ctx), options: {}, session: idleSession };
+    agents.push(idleMate);
+    membershipById.set(idleMate.id, { root: standLead, id: idleMate.id, role: 'teammate', name: 'idle-tester' });
+    joinOrRebind(idleMate.ctx, 'dispatch-mode');
+    // ⚠️ 顺序有讲究：必须**先 enable 再 emit agent/created**。
+    // 反过来的话，上一条用例结尾的 disable 已经把团队关了，agent/created 上的安装
+    // 会因为「树根不在已开团名单里」直接跳过 —— 前提就不成立（第一次写就是这样翻车的）。
+    await runtime.enable(root, standLead, { source: 'integration-test' });
+    root.emit('agent/created', { agent: idleMate });
+    await tick();
+    await tick();
+    const idleBefore = runtime.status(idleMate).enabled === true;
+    const offWhenIdle = await runtime.disable(root, standLead);
+    const idleAfter = runtime.status(idleMate).enabled;
+    check('停着的队员在关团时立刻被拆（推迟只针对正在跑的那一轮，不是「关团什么都不做」）', () => {
+      if (idleBefore !== true) return '前提不成立：夹具里这名队员一开始就没装上';
+      if (offWhenIdle?.ok !== true) return '关团没成功：' + JSON.stringify(offWhenIdle);
+      const deferredList = Array.isArray(offWhenIdle.deferredTeardown) ? offWhenIdle.deferredTeardown : [];
+      if (deferredList.includes('stand-idle')) return '不在跑的队员被误判成「正在跑」而推迟了拆装：' + JSON.stringify(deferredList);
+      if (idleAfter !== false) return '停着的队员关团后还开着（status.enabled=' + String(idleAfter) + '）';
+      return true;
+    });
+  }
+
   // ── 工具返回值的**形状**校验（官方同一个校验器）────────────────────────────────────
   // 为什么单列一段：上面所有断言都是直调 definition.execute(...)，而**生产路径**上
   // dsh-tools 的 createSuccessResult 会先 validateJsonSchemaValue(tool.output.schema, value)
   // （@deepseek-ai/dsh-tools/lib/index.js:3541-3544），不合 schema 就抛 ToolOutputError ——
   // 也就是说「execute 返回值对了」不等于「模型真能拿到」。这一步补上那段空白。
+  // 两个开关工具走真实的 controlToolDefinitions（与生产同一份），签名是 {runtime}。
+  // 用一个最小替身把 execute 跑通即可 —— 这里验的是**返回值形状**，不是域服务语义。
+  const controlStub = toolsModule.controlToolDefinitions({
+    runtime: {
+      enable: async () => ({ ok: true, enabled: true, wasEnabled: false, diagnostics: [] }),
+      disable: async () => ({ ok: true, wasEnabled: true, diagnostics: [] }),
+    },
+  });
+  const enableTeamTool = controlStub.find((definition) => definition.name === 'enable_agent_team');
+  const disableTeamTool = controlStub.find((definition) => definition.name === 'disable_agent_team');
   const shapeCases = [
     ['broadcast_message', broadcastTool, { message: 'shape' }, leadAgent],
     ['broadcast_message(点名)', broadcastTool, { targets: ['scout', 'ghost'], message: 'shape' }, leadAgent],
@@ -2994,6 +3086,10 @@ async function main() {
     ['ask_lead', askTool, { question: 'shape' }, scoutAgent],
     ['ask_lead(非阻塞)', askTool, { question: 'shape', blocking: false }, scoutAgent],
     ['list_agents', listTool, {}, leadAgent],
+    // 开团/关团：这两个工具是唯一有「control」schema 的，且 2026-11-15 之前
+    // disable 从不回 wasEnabled（验收方点名六轮），必须连字段一起过校验。
+    ['enable_agent_team', enableTeamTool, {}, standLead],
+    ['disable_agent_team', disableTeamTool, {}, standLead],
   ];
   const shapeResults = [];
   for (const [label, definition, args, agent] of shapeCases) {
@@ -3009,6 +3105,28 @@ async function main() {
     const bad = shapeResults.filter((item) => item.violations.length > 0);
     if (bad.length > 0) return bad.map((item) => `${item.label}: ${JSON.stringify(item.violations).slice(0, 200)}`).join('\n        ');
     if (shapeResults.length !== shapeCases.length) return `只跑了 ${shapeResults.length}/${shapeCases.length} 个用例`;
+    return true;
+  });
+  // ── wasEnabled 必须真的出现在开关工具的返回值里（2026-11-15 第六轮）──────────────
+  // 验收方点名六轮：「字段仍是 enabled，无 wasEnabled」。查证结论：runtime.disable
+  // 从第一天就返回它，契约（INTERFACES §3）也写着它，但 disable_agent_team
+  // **从来没把它放回工具返回值** —— 所以模型永远看不到。这不是「没修」，是「一直在丢」。
+  // 只有在 wasEnabled 里才分得清「这次真的关了」与「本来就关着」（幂等判断要用它）。
+  check('enable/disable_agent_team 必须回 wasEnabled（只有它能区分「真的变了」与「本来就那样」）', () => {
+    const enableRow = shapeResults.find((item) => item.label === 'enable_agent_team');
+    const disableRow = shapeResults.find((item) => item.label === 'disable_agent_team');
+    if (enableRow === undefined || disableRow === undefined) return '开关工具没有进 shapeCases（夹具漏了）';
+    if (enableRow.value === null || enableRow.value === undefined) return 'enable_agent_team 没跑出返回值';
+    if (disableRow.value === null || disableRow.value === undefined) return 'disable_agent_team 没跑出返回值';
+    if (typeof enableRow.value.wasEnabled !== 'boolean') {
+      return 'enable_agent_team 的返回值里没有布尔 wasEnabled：' + JSON.stringify(enableRow.value);
+    }
+    if (typeof disableRow.value.wasEnabled !== 'boolean') {
+      return 'disable_agent_team 的返回值里没有布尔 wasEnabled：' + JSON.stringify(disableRow.value);
+    }
+    // 方向也要对：替身给的是 enable→false（真的开了）、disable→true（真的关了）。
+    if (enableRow.value.wasEnabled !== false) return 'enable 的 wasEnabled 方向反了（替身返回 false，工具却报 ' + String(enableRow.value.wasEnabled) + '）';
+    if (disableRow.value.wasEnabled !== true) return 'disable 的 wasEnabled 方向反了（替身返回 true，工具却报 ' + String(disableRow.value.wasEnabled) + '）';
     return true;
   });
   sentMessages.length = 0;
