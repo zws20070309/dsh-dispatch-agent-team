@@ -117,6 +117,7 @@ export const WAKE_TOOL_NAME;              // 'wake_teammate'（Lead 专属）
 export const REPORT_TOOL_NAME;            // 'report_result'（队员专用）
 export const LEAD_TEAM_TOOL_NAMES;        // Lead 的安装名单（官方九个 + 本插件为 Lead 加的两个）
 export const OFFICIAL_TEAM_POLICY_SECTION;// 官方 team:policy 段名（preset 作用域遮蔽它）
+export const TOOLS_REMOVED_IN_RC3;        // rc.3 已删除的官方工具名（'spawn_teammate'）—— TEAM_TOOL_NAMES 不再是官方的镜像
 // 注意：以下 5 个为 2026-10-04 新增（§8 三条建议落地）：
 export const BROADCAST_TOOL_NAME;         // 'broadcast_message'（Lead 专属）
 export const ASK_LEAD_TOOL_NAME;          // 'ask_lead'（队员专用）
@@ -538,8 +539,8 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:737`）。
-   注意 `lib/tools.js:983-987` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:754`）。
+   注意 `lib/tools.js:1069-987` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
    **user 消息**（`source.kind = "skill-catalog"`，内含 `<available_skills>`，描述截 500 字符），

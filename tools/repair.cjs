@@ -223,6 +223,7 @@ const PACKAGE_FILES = [
   'lib/status-pump.js',
   'lib/ops-adapter.js',
   'lib/member-rows.js',
+  'lib/team-api.js',
   'tools/drift-check.cjs',
   'tools/selftest.cjs',
   'tools/ops-enable.cjs',

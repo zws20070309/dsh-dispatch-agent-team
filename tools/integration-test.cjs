@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:737），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:754），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -612,7 +612,10 @@ async function main() {
   });
 
   // ── 6) 关闭团队后回卷干净 ───────────────────────────────────────────────────
-  const disabled = runtime.disable(root, leadAgent);
+  // 2026-11-15：disable 改成 async 了（F2：关团要同时把官方 team/mode 拨下来，
+  // 而官方 setEnabled 是 async）。这里必须 await —— 不 await 时 disabled 是个 Promise，
+  // 下面读 .ok 永远是 undefined（假红）。
+  const disabled = await runtime.disable(root, leadAgent);
   await tick();
   check('disable 返回 ok:true', () => (disabled.ok === true ? true : `disable 返回 ${JSON.stringify(disabled)}`));
   check('disable 后队员的工具目录退回 preset 面', () => {

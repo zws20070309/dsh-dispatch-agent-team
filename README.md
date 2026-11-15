@@ -149,6 +149,58 @@ Lead 派完活等队员时，它那段对话前缀可能几分钟到几十分钟
 - 团队开关**按会话记忆**：`/team` 成功后这个会话会被记下来，宿主重启或重开该会话时自动装回来。
 - **`/team` 可以带附件**：贴一张截图再打 `/team 帮我查这个报错`，图片会和那行文字一起进 Lead 的上下文。
 
+#### 输入框那个「启用智能体团队协作」开关，和 `/team` 是什么关系？
+
+**它们现在是一件事（2026-11-15 起）。** 你只打 `/team` 就够了。
+
+DSH 0.2.2-rc.3 把「团队模式」的选择存在 Lead 会话日志里的 `team/mode` 事件中
+（`agentTeams.setEnabled()`），而官方那个输入框开关就是它的界面。本插件的 `/team`
+管的是**另一套**状态（哪些会话开着本插件的团队，记在
+`~/.dsh/dispatch-agent-team-sessions.json`）。
+
+两套状态原来**互不相通**，于是有一个很难查的坑：
+
+- rc.3 的任务板读接口 `TeamTaskBoard.state()` 第一行就是
+  `if (state.enabled !== true) throw TEAM_DISABLED`
+  （`dsh-agent-team/lib/index.js:436`，`get` / `list` 都走它）。
+- 也就是说：**只用 `/team` 开团、而输入框开关是关的**时，
+  `team_task_create / list / get / update` 四个工具**全部报错**。
+- 更糟的是插件当时把这类错误静默吞成「空数组」，于是界面上看起来是
+  「任务板一直是空的」——不是报错，是**什么都没发生**。
+
+从 2026-11-15 起：
+
+| 动作 | 官方开关 | 本插件团队 |
+|---|---|---|
+| 输入 `/team` | **自动打开** | 打开 |
+| Lead 调 `enable_agent_team` | **自动打开** | 打开 |
+| 说「关掉团队」（`disable_agent_team`） | **自动关闭** | 关闭 |
+| 手动拨输入框开关 | 开 / 关 | **不动**（那是官方状态，本插件不臆测） |
+
+实现上走官方公开方法 `agentTeams.setEnabled(agent, enabled)`
+（`dsh-agent-team/lib/index.js:789`）。它内部有 `if (this.isEnabled(root) !== enabled)`
+判断，所以**重复调用是幂等的**：不会重复写事件，也不会无谓地改动缓存前缀。
+rc.2 及更早的宿主没有这个方法，插件会跳过同步（那边本来就不需要）。
+
+如果你**手动**把输入框开关关掉，`/team` 的团队仍然开着（本插件状态没变），
+但任务板会读不到 —— 这时 `list_agents` 的返回里会明确写出
+「任务板不可用：…官方团队开关没开」，而不是假装 0 条任务。
+
+#### 调度模式下用的是谁的团队？
+
+**用本插件的，不是官方的。** 这由 profile 的 `cordis.patch.yml` 保证：
+官方的 `tool-agent-team` 行是 `disabled: true`（`tools/repair.cjs --apply` 维护），
+所以官方那套同名工具根本不会注册。
+
+即使有人把那一行重新打开，本插件的工具仍会**赢**：本插件把 11 个工具注册在
+**agent 作用域**，而官方注册在**全局层**，而 `dsh-tools` 的解析规则是
+「本作用域自己的注册无条件覆盖继承面」（`dsh-tools/src/index.ts:219-225`）。
+所以调度模式里你看到的永远是本插件这套（角色编制、队员分工、模型/强度覆盖）。
+
+同理，官方那段 `team:policy`（Team Lead 方法论）也进不来：本插件在调度模式的
+preset 作用域里注册了一个**同名空段**把它盖掉（官方语义：scoped section shadows
+global，`dsh-system-prompt/src/index.ts:477-483`）。
+
 ### 典型的协作节奏
 
 ```
@@ -382,8 +434,35 @@ node tools/install.cjs --uninstall          # 推荐：走官方 CLI（先退出
 |---|---|
 | DSH 桌面端 | 0.2.0-rc.2 或更新（更早的版本请先跑 `node tools/drift-check.cjs` 看兼容性） |
 | Node.js | ≥ 18 |
-| 官方 bundle | 需在插件页启用 `@deepseek-ai/dsh-experimental-agent-team-profile`（本插件复用它不可替代的持久化域服务；工具面与界面由本插件接管） |
+| 官方 bundle | 需要 `@deepseek-ai/dsh-base` 与 `@deepseek-ai/dsh-web-app`（任何 profile 的基线两层，通常本来就在）。**rc.3 起不再需要** `@deepseek-ai/dsh-experimental-agent-team-profile` —— 那个可选 bundle 已被官方删除，`agent-team` / `tool-agent-team` 两行改由 `dsh-base` 的 `insert` 提供，`ui-agent-team` 由 `dsh-web-app` 提供 |
 | 可选：dsh-ops | 装了并启用后，Lead 与每个队员自动获得它的文件检索能力。**不装也完全能用**，本插件不依赖它 |
+
+---
+
+## 兼容性（DSH 0.2.2-rc.3 起）
+
+rc.3 对官方 Agent Teams 做了一次大改：**队员就是 subagent**。本插件跟着改了一轮，
+下面是「官方改了什么 → 本插件怎么应对」，出问题时按这张表定位。
+
+| 官方变化（rc.3） | 影响 | 本插件的应对 |
+|---|---|---|
+| 包名 `dsh-experimental-*` → `dsh-*` | 旧名在 asar 里 0 命中 | `tools/drift-check.cjs` 加别名表，先试新名再退回旧名 |
+| `agentTeams` 构造函数**拒绝** `maxMembers` / `maxMessageBytes` / `disposalTimeoutMs` | 写了就抛 `TEAM_INVALID_CONFIG`，域服务不注册，**输入框开关消失** | 托管块只写 `maxTasks`；加了反向闸门，任何一处写回这三个键都会红 |
+| `agentTeams.listMembers` / `tryMembership` / `spawnTeammate` / `waitForChange` **已删除** | 成员枚举、通信、中断全部失效 | `lib/member-rows.js` + `lib/team-api.js`：rc.3 走 `ctx.subagents`（`rootOf` / `listDescendants` / `startActivation` / `sendMessage` / `interrupt`），rc.2 走旧路，形状统一 |
+| `team/member` + `team/message*` 事件**已删除** | 工作区画布的成员节点与派活边会变 0 | 判据改钉现行的 `team/task` + `team/mode`；派活边靠 `SPAWN_TOOLS` 与 task `ownerId` |
+| `spawn_teammate` **已删除**；`send_message` 的 `agent_id` 改成 `agent` | 官方九个名字不再一一对应 | 插件自己提供 `spawn_teammate`；`target` / `agent_id` 两种写法都收 |
+| 队员名正则 `^[a-z0-9]+…`（≤64）→ `^[a-z][a-z0-9-]{0,31}$` + 排除 `lead` | 旧规则会造出官方拒绝的名字 | `lib/roster.js` 逐字对齐 rc.3 |
+| 输入框团队开关的触发器 `data-team-action` **已删除**，成员浏览搬到 `dsh-client-ui-subagent` | 工作区入口按钮会静默消失 | 入口注入同时支持 rc.2 的 `data-team-*` 与 rc.3 的 `data-subagent-*` 两套标记 |
+| `team:policy` 段 | 官方 Team Lead 方法论若进来会与调度模式的 playbook 打架 | preset 作用域同名空段遮蔽；今天更主要靠 profile 层关掉官方工具行（见下文实况说明） |
+
+自检命令（改完 DSH 版本后先跑）：
+
+```bash
+node tools/drift-check.cjs    # 官方实现与本插件假设的逐条对账，应当 106/106
+node tools/selftest.cjs       # 纯逻辑与文档一致性，应当 152/152
+node tools/integration-test.cjs
+node tools/client-smoke-test.cjs
+```
 
 ---
 
