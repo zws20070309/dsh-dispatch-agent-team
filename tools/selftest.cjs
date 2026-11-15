@@ -1228,7 +1228,24 @@ function functionBodyOf(source, needle) {
     const lead = actual.PLAYBOOK + actual.TEAM_POLICY;
     const mate = actual.TEAMMATE_CARD + playbook.teammateBrief('scout', 'scout').length;
     assert.ok(lead <= 5310, `Lead 侧提示词 ${lead} > 5310 字符`);
-    assert.ok(mate <= 1800, `队员侧提示词 ${mate} > 1800 字符`);
+    // ── 2026-11-15：上限从 1800 抬到 1960（+160）───────────────────────────
+    // 理由（真机 session-987dedcf 第五轮 seq 974）：队员被派去做「权限清点」时，
+    // 把工具表里的 write/edit/pwsh 当成了「我被授予了写权限」，花整轮时间质疑、
+    // 并在报告里写了「超权」与两条阻止验收的未决项 —— 而实际它是**只读角色**、
+    // 一个写操作都没做（它自己写了「只求不超权，未实际调用写类工具」）。
+    // 根因是派活提示词里「## 你的写权限 / 只读」这句**没有说明那只是纪律**，
+    // 与工具面上真实存在的写类工具自相矛盾。补一句边界说明（约 100 字符）
+    // 换来的是「队员不再把共用工具面误读成授权」。
+    // 抬上限而不是删旧约束：旧的那几句（不越界、停下报告）都是必要的。
+    //
+    // 2026-11-15 二次核定（用户要求「不要乱压缩」）：这四句话**队员卡里一句都没有** ——
+    //   ① 工具「不按角色裁剪」；② 工具存在「不代表你被授权」；
+    //   ③ 团队工具「按队员身份装」；④ 「只读角色照样要 claim / 交报告」。
+    // 逐条比对过 TEAMMATE_CARD 原文（卡片只说了「只做分配给你的任务、不越界改别人的文件、
+    // 必须越界时停下来报告」，那是**行为**纪律，不是**工具面**语义）。
+    // 所以这不是可删的重复，是把「纪律 ≠ 能力边界」这件事讲清楚 —— 保留。
+    // 上限按实测 1984 留 26 字符余量取 2010。
+    assert.ok(mate <= 2010, `队员侧提示词 ${mate} > 2010 字符`);
   });
 
   await check('纪律只在 PLAYBOOK、运行期语义只在 TEAM_POLICY（重复写 = 多付钱 + 迟早自相矛盾）', () => {
@@ -3733,6 +3750,36 @@ function functionBodyOf(source, needle) {
     const strayChild = { id: 'g-stray', session: { id: 'g-stray', header: { origin: 'subagent' } }, ctx: mkCtx() };
     const stray = runtime.forceSyncMember(hostCtx, strayChild);
     assert.equal(stray.ok, false, '树根不在已开团名单里时 forceSyncMember 必须拒绝（防团队泄漏到别处）');
+  });
+  await check('队员简报必须说明「写权限是纪律，不是工具面硬限制」（2026-11-15 真机 seq 974 的闸门）', () => {
+    // ── 为什么（session-987dedcf 第五轮）────────────────────────────────────────
+    // 用户让队员做「权限清点」，队员把工具表里的 write / edit / pwsh 当成了
+    // 「我被授予了写权限」，花了整轮质疑，并在 report_result 里写了「超权」
+    // 与两条阻止验收的未决项 —— 而它实际一个写操作都没做（它自己写明
+    // 「未实际调用写类工具验证是否被沙箱拒绝」）。
+    // 根因：简报里「## 你的写权限 / 只读」这句没有说明「那只是纪律」，
+    // 与工具面上真实存在的写类工具自相矛盾。
+    //
+    // 这条闸门钉住四点，**每一点都必须是队员卡里没有的**（否则就是可删的重复）：
+    //   ① 工具不按角色裁剪  ② 工具存在≠被授权  ③ 团队工具按队员身份装
+    //   ④ 只读角色照样要 claim / 交报告
+    const brief = playbook.teammateBrief('researcher', 'researcher-x');
+    const idx = brief.indexOf('## 你的写权限');
+    assert.ok(idx >= 0, '简报里必须有「## 你的写权限」小节');
+    const tail = brief.slice(idx, brief.indexOf('下面是 Lead 派给你'));
+    // ① + ②：必须点明工具是共用的、存在不代表授权。
+    assert.ok(/不按角色裁剪|不会按角色裁剪/.test(tail), '必须说明工具不按角色裁剪（否则队员会把共用工具面当成授权）');
+    assert.ok(/不代表你被授权|别当成/.test(tail), '必须说明「工具存在 ≠ 被授权」');
+    // ③ + ④：团队工具按身份装，只读角色也要 claim 与交报告。
+    assert.ok(/按\*\*队员身份\*\*装|按队员身份装/.test(tail), '必须说明团队工具按队员身份装');
+    assert.ok(/只读角色照样/.test(tail), '必须说明只读角色照样要 claim 与交报告');
+    // 反向闸门：这四点在队员卡里**不该**已经有（有就是重复，应当删简报而不是留两处）。
+    const card = playbook.TEAMMATE_CARD;
+    for (const dup of ['不按角色裁剪', '不代表你被授权', '按队员身份', '只读角色照样']) {
+      assert.ok(!card.includes(dup), '队员卡里已经出现「' + dup + '」—— 简报里的那份成了重复，应当删简报这一句而不是两处都留');
+    }
+    // 也不能把「越界怎么办」写两遍：那是队员卡的职责，简报只指过去。
+    assert.ok(/越界怎么办见队员卡|见队员卡/.test(tail), '越界处置应指向队员卡，不要在两处各写一遍');
   });
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
     // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，

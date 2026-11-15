@@ -560,8 +560,10 @@ async function main() {
       // 上限与 selftest 的预算表 / INTERFACES §2.1 同步（2026-10-14 上调 5000→5150、1650→1800：
       // 唯一来源是任务板闭环那条新纪律，依据与「先删再加」的记账见 INTERFACES §2.1 注记）。
       // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
+      // 2026-11-15：队员侧 1800→2010（实测 1984），来源是「纪律 ≠ 工具面硬限制」那四点说明；
+      // 逐条比对过 TEAMMATE_CARD，一句话都没有 —— 不是重复，是补缺。见 selftest 同处注记。
       if (ownLead > 5310) return `Lead 侧自有段落 ${ownLead} 字符 > 5310`;
-      if (ownMate > 1800) return `队员侧自有段落 ${ownMate} 字符 > 1800`;
+      if (ownMate > 2010) return `队员侧自有段落 ${ownMate} 字符 > 2010`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
       if (scoutPrompt.length < playbook.TEAMMATE_CARD.length) return '渲染结果比队员卡还短（卡没注册上？）';
@@ -1214,7 +1216,17 @@ async function main() {
     const at = lcpOf(flipOff.beforeSwap, flipOff.afterSwap);
     if (at >= personaEnd) return '公共前缀越过了 persona 全文（' + at + ' >= ' + personaEnd + '）：第一屏断裂复现不了，本包的依据要重读';
     if (at >= flipOff.beforeSwap.length) return '两版提示词竟然完全相同：这份夹具根本没换继承面';
-    if (at < 20) return '公共前缀短得不合理（' + at + '）：连身份段都没对齐，夹具形状变了';
+    // ⚠️ 2026-11-15 修正断言：原来写 `if (at < 20)`，而**这份夹具的公共前缀天然就是 17**。
+    // 夹具两份 persona 是 'STAND PERSONA :: dispatch-mode' 与 'STAND PERSONA :: standard'，
+    // 它们共用的前缀正是 'STAND PERSONA :: '（17 字符）—— 上面第 1209-1210 行的注释
+    // 早就写明了这件事（「两份夹具 persona 共用 "STAND PERSONA :: " 这 17 个字符」），
+    // 但下面这条阈值却要求 ≥20，自相矛盾，于是这条**永远红**（HEAD 上也是红的，不是回归）。
+    // 正确的判据是「公共前缀必须**真的包含**共享的那段身份前缀」，即 at >= 17；
+    // 再要求它不越过 persona 全文（上面一条已经钉住）。两个边界一起构成完整的语义。
+    const SHARED_IDENTITY = 'STAND PERSONA :: '.length; // 17
+    if (at < SHARED_IDENTITY) {
+      return '公共前缀 ' + at + ' < 共享身份前缀 ' + SHARED_IDENTITY + '：连夹具共用的身份段都没对齐，夹具形状变了';
+    }
     return true;
   });
 
@@ -2061,6 +2073,14 @@ async function main() {
         if (realFs.existsSync(candidate)) { file = candidate; break; }
       }
       if (file === null) return true; // 没有 profile：本机不是交付环境，跳过不算失败
+      // ── 2026-11-15：dsh-ops **没装** 时这条不适用 ────────────────────────────
+      // 这条判的是「装了 dsh-ops 之后，profile 里那四行该不该留」。
+      // 用户 2026-11-15 明确卸载了 dsh-ops（node_modules / plugins / bundles 三处都查过），
+      // 此后 profile 里没有那四行是**正确状态**，不是缺陷。
+      // 与 drift-check 同名闸门（那边也已改成「未安装 = 不适用」）保持同一口径。
+      const opsDirs = candidates.map((dir) => path.join(dir, 'node_modules', 'dsh-ops'));
+      const opsInstalled = opsDirs.some((dir) => realFs.existsSync(dir));
+      if (!opsInstalled) return true; // 没装 dsh-ops：本包对它零依赖，这条不适用
       const realText = realFs.readFileSync(file, 'utf8');
       // 2026-10-29：判据按**装机代数**分叉。0.5.0 起上游不再 insert 四组件行，
       // 于是「四行都在 profile 里」本身就不再是健康态 —— 它是死配置。
@@ -2115,14 +2135,21 @@ async function main() {
         '- id: dsh-ops-hide-official',
         '  disabled: false',
       ].join(LF4);
-      const found = enable.findOrphanRows(fixture);
-      if (found.legacyStillInserted !== false) return '本机 dsh-ops 0.5.0 却判成「上游仍 insert 四行」';
+      // ⚠️ 2026-11-15：**必须注入**「上游还 insert 哪些行」，否则这条测试依赖本机装没装 dsh-ops。
+      // 用户 2026-11-15 卸载了 dsh-ops 之后，upstreamInsertedIds() 读不到装机版本 → 返回 null →
+      // findOrphanRows 判成「上游仍 insert 四行」→ 这条恒红，而它测的明明是**0.5.0 新版**形状。
+      // 这条测试的意图就是「模拟新版上游不再 insert」，注入空集合正是这个意图的准确表达
+      //（findOrphanRows 的 JSDoc 也写了 options.inserted 就是给测试用的）。
+      const found = enable.findOrphanRows(fixture, { inserted: new Set() });
+      if (found.legacyStillInserted !== false) return '注入「上游不再 insert」后仍判成「上游仍 insert 四行」（代数分叉判据坏了）';
       const expected = ['dsh-ops-shell', 'dsh-ops-ptc', 'dsh-ops-hide-official'];
       if (JSON.stringify(found.orphans) !== JSON.stringify(expected)) {
         return '孤儿识别不全（hide-official 最容易漏）：' + JSON.stringify(found.orphans);
       }
       // plan() 在该代**不许**有任何写动作 —— 否则它会把清理掉的行重新种回去（史山的成因）。
-      const planned = planEnable(fixture);
+      // 与上面 findOrphanRows 同一处口径：注入「上游不再 insert」，否则会退回依赖装机版本
+      // （用户卸载 dsh-ops 后，plan() 读不到版本就按老版补齐，这条恒红）。
+      const planned = planEnable(fixture, { legacyStillInserted: false });
       if (planned.flipped.length + planned.appended.length + planned.patched.length !== 0) {
         return '0.5.0 上 plan() 仍想写盘（会把死配置种回来）：' + JSON.stringify([planned.flipped, planned.appended, planned.patched]);
       }
@@ -2141,10 +2168,20 @@ async function main() {
       // 用 junction 指到本机真装的那份，保证判据与真机同源（不是伪造一个 version）。
       const opsReal = path.join(realOs.homedir(), '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-ops');
       const opsLink = path.join(tmpProfile, 'node_modules', 'dsh-ops');
+      // ── 2026-11-15：dsh-ops 没装时**不适用**，不是失败 ──────────────────────
+      // 下面这段要真跑一次 --prune（落在临时 profile 上），而它的代数判据必须能从临时 profile
+      // 里解析到**装机那份 dsh-ops**（resolveOpsPackageJson → <profile>/node_modules/dsh-ops）。
+      // 用户 2026-11-15 卸载了 dsh-ops，这个目录已不存在，junction 必然建不出来。
+      // 旧写法把「建不出 junction」也当成失败（return 一句红字），于是只剩一句误导的话。
+      // 现在：目录不存在 = 本机没有 dsh-ops = 这条清理实测不适用，直接 PASS；
+      //       目录在、却建不出 junction 才是真的环境问题，照旧报。
+      if (!realFs.existsSync(opsReal)) {
+        return true; // 没装 dsh-ops：纯函数判据（孤儿识别 + plan 不写盘）上面已经覆盖
+      }
       realFs.mkdirSync(path.dirname(opsLink), { recursive: true });
       let linkedOk = true;
       try { realFs.symlinkSync(opsReal, opsLink, 'junction'); } catch { linkedOk = false; }
-      if (!linkedOk) return '建不出 dsh-ops junction，跳过清理实测（判据本身已由纯函数断言覆盖）';
+      if (!linkedOk) return '装机有 dsh-ops 却建不出 junction（权限问题？）—— 清理实测无法进行';
       const prunedRun = require('node:child_process').spawnSync(
         process.execPath,
         [path.join(__dirname, 'ops-enable.cjs'), '--prune'],
