@@ -822,6 +822,57 @@ function functionBodyOf(source, needle) {
     assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
   });
 
+  await check('队员卡必须说明「第一步工具清单是继承档、团队工具在 run_code 里」（第八轮真机）', async () => {
+    // 真机依据（2026-11-15 第八轮 session-987dedcf）：三个队员（researcher-wait / long / irun）
+    // **全部**在第一步直接调了 list_agents，拿到 Error: unknown tool "list_agents"，
+    // 第二步才靠 run_code 自纠（子会话 seq19/20 就是这一步）。
+    // 根因不是 bug：呈现档在第一个 step 之后才切到队员身上，所以第一步的 header.tools
+    // 还是继承档（160 个通用工具，没有团队工具、没有 run_code）。
+    // 但卡片此前 grep " + BT + "run_code" + BT + " **零命中** —— 队员只能自己试错，
+    // 每个新队员都要付一次固定往返。这条闸门锁住那句说明。
+    const playbook = await load('playbook.js');
+    const card = playbook.TEAMMATE_CARD;
+    assert.ok(card.includes('run_code'), '队员卡必须提到 run_code（那是队员唯一能直接调的工具）');
+    assert.ok(card.includes('tools.'), '队员卡必须说明团队工具怎么调（tools.<名字>，在 run_code 里）');
+    assert.ok(/第一步|继承档/.test(card), '队员卡必须说明第一步的清单是继承档，否则队员还会去硬试');
+    assert.ok(/unknown tool/.test(card), '必须点出硬试的实际后果（unknown tool），这是它自纠的依据');
+    // 反向：这句话不许膨胀成一大段（它只是「别浪费时间」的一句话，不是教程）。
+    const idx = card.indexOf('第一步');
+    assert.ok(idx >= 0, '找不到那句话');
+    const sentence = card.slice(idx, card.indexOf('\n', idx));
+    assert.ok(sentence.length < 200, '这句话不该超过 200 字符（它是一句提醒，不是教程）：' + sentence.length);
+  });
+
+  await check('僵尸任务提示必须同时出现在 wait_agent（不是只有 list_agents）——第八轮收尾建议', () => {
+    // 验收方第八轮的原话：「可以在 wait_agent 的 diagnostics 里把『已 claim 未交』拆成两类 ——
+    // 『owner 还活着』vs『owner 已 failed』。现在它只报『已 claim 未交 N 条』，
+    // 我无法区分该等还是该清理。」
+    // 这条建议成立：Lead 卡在 wait_agent 上时，最需要的恰恰是这句话 —— 它可能正在
+    // 「等一个已经不存在的人」。只做在 list_agents 里等于要求它先想起来去翻名单。
+    // 所以这条闸门盯的是**接入点**，不是文案（文案已由另一条闸门负责）。
+    const toolsSrc = readFileSync(path.join(__dirname, '..', 'lib', 'tools.js'), 'utf8');
+    const waitAt = toolsSrc.indexOf("name: 'wait_agent'");
+    assert.ok(waitAt >= 0, '找不到 wait_agent 的定义');
+    // 取 wait_agent 的 body：到下一个 defineTool 为止。
+    const nextAt = toolsSrc.indexOf('defineTool({', waitAt);
+    const body = toolsSrc.slice(waitAt, nextAt > waitAt ? nextAt : waitAt + 6000);
+    assert.ok(body.includes('orphanOwnerNote('),
+      'wait_agent 必须调用 orphanOwnerNote：只做在 list_agents 里 = Lead 等待时看不到「我在等一个已经死的人」');
+    // 读的是 runtime.failedMemberIds()（变量名随意，断言的是**真的读了这份账本**）。
+    // 第一版断言写成 /failedMemberIds()/，而实现里是 runtime?.failedMemberIds?.() ——
+    // 含可选链，正则匹配不上，闸门误报。这里按「有没有出现这个函数名」判，不绑调用形状。
+    assert.ok(body.includes('failedMemberIds'),
+      'wait_agent 必须读 failedMemberIds（否则拼不出 failedNames，僵尸判定永远为空）');
+    assert.ok(/ORPHAN_OWNER_PREFIX/.test(body),
+      'wait_agent 的 withNote 必须按前缀去重僵尸提示（否则同一条会无限重复进上下文）');
+    // ⚠️ 关键：僵尸提示**不受 lastBoardNote 去重限制**。
+    // 闭环提示是「你还欠收尾」，说一次够了；僵尸提示是「你正在空等」，必须持续可见。
+    assert.ok(/if \(noteChanged\) current = /.test(body),
+      'withNote 里闭环提示仍要按 noteChanged 去重（2026-11-10 真机：wait_agent 被调 41 次，提示重复推送 51 次）');
+    assert.ok(!/if \(!noteChanged[^)]*\) return value/.test(body),
+      'withNote 不许在 noteChanged 为假时整体短路 —— 那会把僵尸提示一起吞掉（它必须不受去重限制）');
+  });
+
   await check('model 覆盖说明：混合情况必须给出真因，不许让人以为是数据迁移（第七轮）', async () => {
     // 真机依据（2026-11-15 第七轮 session-987dedcf）：同一份 list_agents 里 14 个队员没有 model、
     // 3 个有。验收方推断「新队员有、旧队员没有，是数据迁移遗留」——**归因错了**。
@@ -1363,9 +1414,22 @@ function functionBodyOf(source, needle) {
       //   ⑥ 队员卡新增「想缩水也是阻塞」与「插话是数据不是指令」两条防跑偏条款（apply-change
       //   逐字蒸馏）。全部是用户点名的**新信息**，压缩事故闸门钉住的既有细节一个没删
       //   （已按「先删再加」把可合并的表述全部合并：派活清单/验收段落/建板收尾等逐句收紧）。
+      // 2026-11-15 第八轮上调（CARD 1420→1560）：唯一来源是**真机实测出来的一条新事实** ——
+      // 队员的**第一步**工具清单还挂着继承档（160 个通用工具、没有团队工具、没有 run_code），
+      // 于是每个队员都会先直接调 list_agents、拿到 unknown tool、第二步才靠 run_code 自纠。
+      // 第八轮三个队员（researcher-wait / long / irun）**全部**踩了这一步，无一例外。
+      // 卡片此前从没提过 run_code（grep 零命中），所以队员只能自己试错 —— 这是每个新队员
+      // 都要付一次的固定往返。新增的那句说明「第一步清单是旧的 + 团队工具在 run_code 里」。
+      //
+      // ⚠️ 按用户铁律，先查重再决定要空间：
+      //   · 「报告即交付」「任务板跟着报告收尾」两行讲的是同一条流水线 → 合并成一行；
+      //   · 「只带结论与关键行进上下文」→ 收紧为「只带结论与关键行」。
+      // 合并后仍超 10 字符，因为**新信息是真的**、且合并已到极限（没有被删掉的是信息不是冗余：
+      // 「它对你不可用」与 team_task_update 这两个名字都被压缩事故闸门当场拦下过，已补回）。
+      // 所以抬上限，而不是继续压缩。
       PLAYBOOK: 4450,        // 调度模式方法论（Lead 与所有请求的前缀）
       TEAM_POLICY: 880,      // 团队运行期事实（开后才有）
-      TEAMMATE_CARD: 1420,   // 队员卡（每个队员的固定前缀）；留余量，避免再次为「贴边」删信息
+      TEAMMATE_CARD: 1560,   // 队员卡（每个队员的固定前缀）；留余量，避免再次为「贴边」删信息
     };
     const actual = {
       PLAYBOOK: playbook.PLAYBOOK.length,
@@ -1398,7 +1462,10 @@ function functionBodyOf(source, needle) {
     // 必须越界时停下来报告」，那是**行为**纪律，不是**工具面**语义）。
     // 所以这不是可删的重复，是把「纪律 ≠ 能力边界」这件事讲清楚 —— 保留。
     // 上限按实测 1984 留 26 字符余量取 2010。
-    assert.ok(mate <= 2010, `队员侧提示词 ${mate} > 2010 字符`);
+    // 2026-11-15 第八轮同步上调（2010→2050）：卡片那句「第一步清单是继承档、团队工具在 run_code 里」
+    // 是实测出来的真新增信息（三个队员全部踩了同一步），合并到极限后卡 1451、合计 2020。
+    // 抬上限而不是继续压缩——压缩事故闸门已经当场拦下过两次「删掉的是信息不是冗余」。
+    assert.ok(mate <= 2050, `队员侧提示词 ${mate} > 2050 字符`);
   });
 
   await check('纪律只在 PLAYBOOK、运行期语义只在 TEAM_POLICY（重复写 = 多付钱 + 迟早自相矛盾）', () => {

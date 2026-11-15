@@ -562,8 +562,11 @@ async function main() {
       // ownMate = 队员卡 + 角色简报（scout），与 selftest「队员侧合计」同口径。
       // 2026-11-15：队员侧 1800→2010（实测 1984），来源是「纪律 ≠ 工具面硬限制」那四点说明；
       // 逐条比对过 TEAMMATE_CARD，一句话都没有 —— 不是重复，是补缺。见 selftest 同处注记。
+      // 2026-11-15 第八轮再上调 2010→2050（实测 2020），来源是**真机实测出来的新事实**：
+      // 队员第一步的工具清单还挂着继承档，三个队员全部先直接调 list_agents 拿 unknown tool、
+      // 第二步才靠 run_code 自纠 —— 卡片此前连 run_code 都没提过。见 selftest 同处注记。
       if (ownLead > 5310) return `Lead 侧自有段落 ${ownLead} 字符 > 5310`;
-      if (ownMate > 2010) return `队员侧自有段落 ${ownMate} 字符 > 2010`;
+      if (ownMate > 2050) return `队员侧自有段落 ${ownMate} 字符 > 2050`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
       if (scoutPrompt.length < playbook.TEAMMATE_CARD.length) return '渲染结果比队员卡还短（卡没注册上？）';
