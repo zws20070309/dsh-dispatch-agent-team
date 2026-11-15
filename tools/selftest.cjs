@@ -3424,6 +3424,38 @@ function functionBodyOf(source, needle) {
     }
   });
 
+  await check('F3 双向同步：team/mode 分支必须排在队员过滤之前，且带防回环闸', () => {
+    // 2026-11-15 用户要求「拨开关就等于开关整个团队」。这条闸门守两件**极易写错**的事：
+    const runtimeSrc = readFileSync(path.join(__dirname, '..', 'lib', 'runtime.js'), 'utf8');
+    const teamApiSrc = readFileSync(path.join(__dirname, '..', 'lib', 'team-api.js'), 'utf8');
+
+    // ① 顺序：team/mode 的处理必须出现在「只关心队员」那个 return **之前**。
+    //    第一版我写在后面，结果 team/mode 只出现在 Lead 会话里、而那段只处理队员，
+    //    于是反向同步**永远不触发** —— 端到端测试里 isEnabled 一直是 false 才暴露。
+    //    这类「写了但永远不执行」靠读代码看不出来，必须钉住顺序。
+    // ⚠️ 判据必须锚到**代码行**，不能锚到裸子串：'entry.name === \'lead\') return'
+    // 这个字符串在注释里也出现过（解释「为什么必须排在它前面」那段），
+    // 用 indexOf 会命中注释 ⇒ 闸门永远假绿。第一次写这条时就是这么错的。
+    const modeAt = runtimeSrc.indexOf("if (event.type === 'team/mode')");
+    const filterAt = runtimeSrc.indexOf("if (entry === undefined || entry.name === undefined || entry.name === 'lead') return;");
+    assert.ok(modeAt > 0, 'runtime.js 里找不到 team/mode 的处理分支（F3 被删了？）');
+    assert.ok(filterAt > 0, 'runtime.js 里找不到「只关心队员」的过滤（判据变了？）');
+    assert.ok(modeAt < filterAt,
+      'team/mode 的处理被排到了队员过滤之后 —— 它只会出现在 Lead 会话里，'
+      + '放在过滤后等于永不执行（反向同步会静默失效）');
+
+    // ② 回环闸：本插件自己 setEnabled 时必须置位，否则监听器会把自己写的事件
+    //    当成用户操作再拨一次（轻则重复动作，重则无限递归）。
+    assert.ok(/applyingOfficialMode\s*=\s*true/u.test(teamApiSrc),
+      'team-api.js 里没有把 applyingOfficialMode 置位的写入点 —— 防回环闸失效');
+    assert.ok(/finally\s*\{[\s\S]{0,80}applyingOfficialMode\s*=\s*false/u.test(teamApiSrc),
+      'applyingOfficialMode 没有在 finally 里复位 —— 抛错后回环闸会永久卡住，监听器从此失灵');
+    assert.ok(/export function isApplyingOfficialMode/u.test(teamApiSrc),
+      'team-api.js 必须导出 isApplyingOfficialMode（runtime 的监听器要读它）');
+    assert.ok(runtimeSrc.includes('teamApi.isApplyingOfficialMode()'),
+      'runtime.js 的反向同步没有读防回环闸 —— 会与自己写入的事件打架');
+    return true;
+  });
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
     // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
     // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方
