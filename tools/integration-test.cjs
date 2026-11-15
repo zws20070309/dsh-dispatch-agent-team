@@ -370,7 +370,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:797），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:894），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -2672,6 +2672,57 @@ async function main() {
       return true;
     });
 
+    // ── nextAction：任务还挂着时，必须把「你还欠一次 team_task_update」放到**顶层** ──────
+    // 2026-11-15 第七轮：验收方连续几轮判「report_result 不自动闭环、未修」，理由都是
+    // 「revision 停在 2，没变」。但实测那次返回的 diagnostics 里明明白白写着
+    //   「你 claim 的 task-19（当前 revision 2）还挂在 in_progress：逐条 team_task_update action=complete」
+    // —— 是它没读 diagnostics。diagnostics 在语义上就是「附注」，而这是必须做的动作，
+    // 两者不该放同一个字段。现在顶层给 nextAction，模型看返回值就不可能漏。
+    {
+      const ownedTask = {
+        id: 'task-r7', revision: 2, subject: 's', description: 'd', status: 'in_progress',
+        ownerName: 'scout', ownerId: 'scout-agent', blockedBy: [], writeScopes: [],
+        ready: false, writeScopeWarnings: [],
+      };
+      const pendingTask = {
+        ...ownedTask, id: 'task-other', ownerName: 'builder',
+      };
+      const withBoard = toolsModule.teamToolDefinitions({
+        runtime: reportRuntime,
+        agentTeams: { ...reportTeams, listTasks: () => [ownedTask, pendingTask] },
+        include: roster.MEMBER_TEAM_TOOL_NAMES,
+      }).find((definition) => definition.name === roster.REPORT_TOOL_NAME);
+      const withBoardResult = await withBoard.execute(
+        { status: 'completed', summary: '做完了', evidence: ['true → 0'], unresolved: [] },
+        { agent: { id: 'scout-agent' } },
+      );
+      const noBoardResult = await reportTool.execute(
+        { status: 'completed', summary: '做完了', evidence: ['true → 0'], unresolved: [] },
+        { agent: { id: 'scout-agent' } },
+      );
+      check('report_result：任务还挂在 in_progress 时，顶层 nextAction 必须点名下一步（不许只埋进 diagnostics）', () => {
+        if (typeof withBoardResult.nextAction !== 'string' || withBoardResult.nextAction === '') {
+          return '有未闭环任务时没有顶层 nextAction（拿到 ' + JSON.stringify({ nextAction: withBoardResult.nextAction, diagnostics: withBoardResult.diagnostics }) + '）—— '
+            + '验收方连着几轮就是因此判「不自动闭环、未修」';
+        }
+        if (!withBoardResult.nextAction.includes('task-r7')) return 'nextAction 没点名那条任务：' + withBoardResult.nextAction;
+        if (!/team_task_update/.test(withBoardResult.nextAction)) return 'nextAction 没给出具体动作：' + withBoardResult.nextAction;
+        if (!/complete/.test(withBoardResult.nextAction)) return 'nextAction 没说清该 complete：' + withBoardResult.nextAction;
+        // 别人的任务不许被点名（只收自己名下）。
+        if (withBoardResult.nextAction.includes('task-other')) return '点名了别人的任务：' + withBoardResult.nextAction;
+        // 没有欠账时必须**没有这个键**（不是空串），否则模型会以为每一步都要接着做事。
+        if (Object.hasOwn(noBoardResult, 'nextAction')) {
+          return '没有未闭环任务时不该出现 nextAction（拿到 ' + JSON.stringify(noBoardResult.nextAction) + '）';
+        }
+        // 形状必须仍过 schema。
+        const violations = dshTools.validateJsonSchemaValue(withBoard.output.schema, withBoardResult, 'value');
+        if (violations.length > 0) return '过不了自己的 schema：' + JSON.stringify(violations);
+        const violationsNone = dshTools.validateJsonSchemaValue(reportTool.output.schema, noBoardResult, 'value');
+        if (violationsNone.length > 0) return '无 nextAction 时过不了 schema：' + JSON.stringify(violationsNone);
+        return true;
+      });
+    }
+
     // 投递失败的那条路径：记录里必须留下 delivered=false，而不是显示成一条正常的报告。
     // 这正是修复前的问题——「插件页记录」与「Lead 邮箱」两套口径不一致。
     {
@@ -3337,6 +3388,40 @@ async function main() {
     const leadTarget = await boardDefinitions.get('wake_teammate').execute({ target: 'lead' }, leadExec).then((v) => v, (e) => e.message);
     check('wake_teammate：target=lead 原样透传（不拿去和队员名单比，否则官方错误信息会误导）', () => {
       if (typeof leadTarget === 'string') return '被拒了：' + leadTarget;
+      return true;
+    });
+
+    // ── rc.3 的 interrupt 是 void：previousStatus 必须**自己读**（2026-11-15 第七轮）──────
+    // 上面那个用例用的是 rc.2 形状的替身，interrupt() 会返回 {previousStatus}，
+    // 于是「从回包里挑字段」也能量出值 —— 这条路径在真机上**不存在**。
+    // 真机（session-987dedcf 第七轮）用的是 rc.3：subagents.interrupt() 没有返回值（void），
+    // 验收方因此连续多轮看到 {"accepted":true} 而没有 previousStatus。
+    // 这条用例专门喂一个 void 替身，逼工具走「自己观测」那条路。
+    const rc3Subagents = {
+      rootOf: () => leadAgent,
+      listDescendants: async () => [
+        { kind: 'child', id: 'rc3-running', name: 'scout', mode: 'continuable', activity: 'running' },
+        { kind: 'child', id: 'rc3-idle', name: 'builder', mode: 'continuable', activity: 'inactive' },
+      ],
+      // 关键：返回 void，与官方 rc.3 实现一致（Fire-and-return，源码里没有 return 值）。
+      interrupt: () => undefined,
+    };
+    const rc3Teams = { ctx: { get: (key) => (key === 'subagents' ? rc3Subagents : undefined) } };
+    const rc3Interrupt = toolsModule.teamToolDefinitions({ runtime: reportRuntime, agentTeams: rc3Teams })
+      .find((definition) => definition.name === 'interrupt_agent');
+    const runningHit = await rc3Interrupt.execute({ target: 'scout' }, leadExec);
+    const idleHit = await rc3Interrupt.execute({ target: 'builder' }, leadExec);
+    check('interrupt_agent：rc.3 的 interrupt 返回 void 时，previousStatus 仍必须如实给出（自己观测，不挑回包）', () => {
+      if (runningHit.previousStatus !== 'running') {
+        return 'running 队员的中断回执没有 previousStatus=running（拿到 ' + JSON.stringify(runningHit) + '）—— '
+          + '验收方连续多轮就是看到这个：只有 {accepted:true}，分不清「真打断了」与「对停着的队员空操作」';
+      }
+      if (idleHit.previousStatus !== 'inactive') {
+        return 'inactive 队员的中断回执没有 previousStatus=inactive（拿到 ' + JSON.stringify(idleHit) + '）';
+      }
+      // 形状必须仍过 schema（previousStatus 是可选字段，写了就得合法）。
+      const violations = dshTools.validateJsonSchemaValue(rc3Interrupt.output.schema, runningHit, 'value');
+      if (violations.length > 0) return '过不了自己的 schema：' + JSON.stringify(violations);
       return true;
     });
   })();

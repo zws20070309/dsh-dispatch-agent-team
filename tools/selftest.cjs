@@ -822,6 +822,100 @@ function functionBodyOf(source, needle) {
     assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
   });
 
+  await check('model 覆盖说明：混合情况必须给出真因，不许让人以为是数据迁移（第七轮）', async () => {
+    // 真机依据（2026-11-15 第七轮 session-987dedcf）：同一份 list_agents 里 14 个队员没有 model、
+    // 3 个有。验收方推断「新队员有、旧队员没有，是数据迁移遗留」——**归因错了**。
+    // 实测分界线是 T6→T7 之间 4028 秒的一次宿主重启：appliedRoutes 是内存账本，重启即清空，
+    // 所以字段存在性取决于「本进程内它发没发过请求」，与新旧无关。
+    // 这里钉住两件事：① 混合情况要说真因；② **绝不填猜测值**（那会把「不知道」变成错数据）。
+    const roster = await load('roster.js');
+    const mixed = [
+      { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [] },
+      { id: 'a', name: 'scout', role: 'teammate', status: 'inactive', model: 'model-x', diagnostics: [] },
+      { id: 'b', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    const note = roster.modelCoverageNote(mixed);
+    assert.ok(typeof note === 'string' && note.startsWith(roster.MODEL_UNOBSERVED_PREFIX), '混合情况要有固定前缀：' + String(note));
+    assert.ok(note.includes('1/2'), '要点名缺失比例（1/2 个队员没有）：' + note);
+    assert.ok(/重启/.test(note), '必须点破真因是宿主重启清了内存账本，而不是数据迁移：' + note);
+    assert.ok(!/迁移/.test(note.replace('不是按新旧数据迁移', '')), '不许把原因说成数据迁移（那是错的归因）');
+    assert.ok(/刻意不填猜测值/.test(note), '必须说明「记不到就不填」是刻意的：填错比留空更糟');
+    // 全都有 / 全都没有 → 没有信息量，不产生提示。
+    const allHave = [
+      { id: 'a', name: 'scout', role: 'teammate', status: 'inactive', model: 'm', diagnostics: [] },
+    ];
+    assert.equal(roster.modelCoverageNote(allHave), undefined, '全都有时不该刷一句废话');
+    const noneHave = [
+      { id: 'a', name: 'scout', role: 'teammate', status: 'inactive', diagnostics: [] },
+      { id: 'b', name: 'builder', role: 'teammate', status: 'inactive', diagnostics: [] },
+    ];
+    assert.equal(roster.modelCoverageNote(noneHave), undefined, '全都没有时也不该刷（那是重启后的正常态）');
+    // Lead 行不计入统计（它不参与 model 校正）。
+    const onlyLead = [{ id: 'l', name: 'lead', role: 'lead', status: 'running', diagnostics: [] }];
+    assert.equal(roster.modelCoverageNote(onlyLead), undefined);
+    assert.equal(roster.modelCoverageNote(null), undefined);
+    assert.equal(roster.modelCoverageNote([]), undefined);
+    // 空字符串 model 等于没有（annotateMemberModels 同一条口径）。
+    const blank = [
+      { id: 'a', name: 'scout', role: 'teammate', status: 'inactive', model: 'm', diagnostics: [] },
+      { id: 'b', name: 'builder', role: 'teammate', status: 'inactive', model: '', diagnostics: [] },
+    ];
+    assert.ok(typeof roster.modelCoverageNote(blank) === 'string', '空串 model 要算「没有」');
+  });
+
+  await check('僵尸任务：owner 已经死了的任务必须被点出来（第七轮，验收方连报多轮）', async () => {
+    // 真机依据（2026-11-15 第七轮 session-987dedcf）：验收方用**三种死法**验证过同一后果 ——
+    //   * 关团拆执行器 → 队员 failed；
+    //   * interrupt_agent 强制中断；
+    //   * 队员正常跑完但没交付。
+    // 三种都会留下「status=in_progress 且 owner 还在」的任务，而收尾提示只说
+    // 「已 claim 未交 N 条」——它分不清「队员还活着在干」与「队员已经死了」。
+    // 它的原话：「我必须人肉识别并 release……队员越多、任务越多，漏掉的概率越高。」
+    const roster = await load('roster.js');
+    const tasks = [
+      { id: 'task-1', revision: 2, status: 'in_progress', ownerName: 'researcher-dead' },
+      { id: 'task-2', revision: 2, status: 'in_progress', ownerName: 'researcher-alive' },
+      { id: 'task-3', revision: 1, status: 'pending' },
+      { id: 'task-4', revision: 4, status: 'completed', ownerName: 'researcher-dead' },
+      { id: 'task-5', revision: 3, status: 'deleted', ownerName: 'researcher-dead' },
+    ];
+    const note = roster.orphanOwnerNote(tasks, new Set(['researcher-dead']));
+    assert.ok(typeof note === 'string' && note.startsWith(roster.ORPHAN_OWNER_PREFIX), '要有固定前缀：' + String(note));
+    assert.ok(note.includes('task-1'), '必须点名那条僵尸任务');
+    assert.ok(!note.includes('task-2'), '活的 owner 的任务不许被点名（误报会让 Lead 去动别人的活）');
+    assert.ok(!note.includes('task-4'), 'completed 的任务不是僵尸（闭环过的不算）');
+    assert.ok(!note.includes('task-5'), 'deleted 的任务不是僵尸');
+    assert.ok(!note.includes('task-3'), '没有 owner 的 pending 任务不是僵尸（那是「还没派」）');
+    assert.ok(/reassign|release|delete/.test(note), '必须给出下一步动作，否则只是把问题复述一遍');
+    // 反向：没人死 → 不产生提示（零副作用）。
+    assert.equal(roster.orphanOwnerNote(tasks, new Set()), undefined, '失败账本为空时必须零副作用');
+    assert.equal(roster.orphanOwnerNote(tasks, []), undefined);
+    assert.equal(roster.orphanOwnerNote(tasks, null), undefined);
+    // 有失败账本但没命中任何任务 → 也不提示。
+    assert.equal(roster.orphanOwnerNote(tasks, new Set(['someone-else'])), undefined);
+    // 任务列表读不到 → 不猜、不抛。
+    assert.equal(roster.orphanOwnerNote(null, new Set(['researcher-dead'])), undefined);
+    assert.equal(roster.orphanOwnerNote([], new Set(['researcher-dead'])), undefined);
+    // 多条时按上限截断，并说明总数（与 boardClosureNote 同一套口径）。
+    const many = Array.from({ length: 9 }, (_, i) => ({
+      id: 'task-' + String(i + 10), revision: 2, status: 'in_progress', ownerName: 'dead',
+    }));
+    const manyNote = roster.orphanOwnerNote(many, new Set(['dead']));
+    assert.ok(manyNote.includes('共 9 条'), '超过点名上限要如实说总数：' + manyNote);
+    // 与 boardClosureNote 能共存（两条提示挂在同一行 diagnostics 上，生产路径就是这样）。
+    const closure = roster.boardClosureNote(tasks);
+    const rows = [
+      { id: 'lead-1', name: 'lead', role: 'lead', status: 'running', diagnostics: [closure] },
+    ];
+    const withBoth = roster.annotateBoardClosure(rows, closure).map((row) => ({
+      ...row,
+      diagnostics: [...row.diagnostics, note],
+    }));
+    assert.equal(withBoth[0].diagnostics.length, 2, '两条提示必须能同时挂在 Lead 行上');
+    assert.deepEqual(Object.keys(withBoth[0]).sort(), ['diagnostics', 'id', 'name', 'role', 'status'],
+      '只写已有字段，绝不新增（新增 = 改 Lead 工具目录 = 动缓存前缀）');
+  });
+
   await check('失败标志：以 error 收尾的队员必须标出来，正常收尾的队员不许被标（第六轮 P0）', () => {
     // 真机依据（2026-11-15 第六轮 session-987dedcf）：Lead 关团时拆掉了正在跑的队员的
     // executor，两名队员当场以 error 收尾。它们的 turn/end 是
@@ -848,12 +942,19 @@ function functionBodyOf(source, needle) {
     // 反方向：正常收尾的队员**不许**被标成失败。
     assert.equal(roster.annotateFailedMembers(rows, new Map())[1], rows[1], '空账本时连对象都不该重建');
     assert.equal(roster.annotateFailedMembers(rows, null)[1], rows[1]);
-    // 记了账但 kind 不是 error（例如 max-tokens 或 completed）→ 一律不标。
-    // 这条防的是「把所有 turn/end 都当失败」这种过度标注 —— 那会让失败标志失去意义。
-    assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', { kind: 'max-tokens' }]]))[1], rows[1],
-      '只有 kind==="error" 才算失败；别的收尾一律不标');
+    // ⚠️ 这条断言在第七轮被**修正**过（原来写「只有 kind==='error' 才算」）。
+    // 那个口径漏掉了验收方真正用来造僵尸任务的手段：
+    //   * kind='error'   —— 关团拆执行器 / 宿主报错（第六轮实测）；
+    //   * kind='aborted' —— interrupt_agent 强制中断（第七轮实测，这就是它卡住的那个）。
+    // 账本的写入点（runtime.noteTurnEndReason）现在只在 completed / max-tokens 时清除，
+    // 所以「账本里有记录」本身就等于「这一轮没正常收尾」。
+    const aborted = roster.annotateFailedMembers(rows, new Map([['a-id', { kind: 'aborted' }]]));
+    assert.equal(aborted[1].diagnostics.length, 2, 'interrupt（kind=aborted）必须也被标出来：验收方第七轮就是用它造的僵尸任务');
+    assert.ok(aborted[1].diagnostics[1].includes('aborted'), '要如实带上收尾方式，别都写成 error');
     assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', null]]))[1], rows[1], '脏记录不标也不抛');
     assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', 'error']]))[1], rows[1], '非对象记录不标也不抛');
+    assert.equal(roster.annotateFailedMembers(rows, new Map([['a-id', { message: 'no kind' }]]))[1], rows[1],
+      '没有 kind 的记录不标（账本的写入点永远带 kind，缺了说明来源不明）');
     assert.equal(roster.annotateFailedMembers(null, new Map([['a-id', { kind: 'error' }]])).length, 0, 'rows 不是数组时退化成空表，不抛');
     // 幂等：重复标注不加第二份。
     assert.equal(roster.annotateFailedMembers(marked, new Map([
@@ -1555,6 +1656,70 @@ function functionBodyOf(source, needle) {
       '提到名字但非定向措辞不该触发');
     // 没有任何队员名 → 不提醒
     assert.equal(roster.broadcastTargetingHint('其他人忽略这条', names), '', '没点名就不提醒');
+  });
+
+  await check('waitForInbox 的「已有待处理输入」分支不许 TDZ 崩溃（第七轮真机 seq 1305）', async () => {
+    // ── 真机事故（2026-11-15 第七轮 session-987dedcf turn 7 seq 1304/1305）─────────
+    // Lead 调 wait_agent(timeout_ms=180000) 等一个正在跑的队员，工具直接崩：
+    //   Error: Cannot access 'timer' before initialization
+    // 根因在 lib/team-api.js 的 waitForInbox：cleanup() 是闭包、在上面就引用了 timer，
+    // 而 let timer 声明在它下面 22 行。当 caller.inbox.nextStep 里**已有待处理输入**时，
+    // 代码走「立刻返回」那一支 → finish() → cleanup() → 读 timer → TDZ。
+    // 所以它**不是偶发**：只要有待处理输入就必崩。
+    // 验收方当时写「只观察到 1 次，未能稳定复现」——它没能复现是因为重试时队员已经结束，
+    // 走了另一条分支（no-active-peer 快捷路径，压根没进 waitForInbox）。
+    //
+    // 这条闸门**直接从源码里抠出那个函数**跑，不抄一份实现：
+    // 抄一份就等于测「我记忆里的实现」，而 bug 恰恰在真实实现里。
+    const apiSrc = readFileSync(path.join(__dirname, '..', 'lib', 'team-api.js'), 'utf8');
+    const startAt = apiSrc.indexOf('function waitForInbox(');
+    assert.ok(startAt >= 0, 'lib/team-api.js 里必须有 waitForInbox（rc.3 的等待实现）');
+    let depth = 0;
+    let endAt = -1;
+    for (let i = apiSrc.indexOf('{', startAt); i < apiSrc.length; i++) {
+      if (apiSrc[i] === '{') depth++;
+      else if (apiSrc[i] === '}') { depth--; if (depth === 0) { endAt = i + 1; break; } }
+    }
+    assert.ok(endAt > startAt, 'waitForInbox 的函数体没闭合（源码本身坏了）');
+    const fnBody = apiSrc.slice(startAt, endAt);
+    // 诊断性断言：声明必须在 cleanup 之前。变异测试（把三个 let 挪回下面）会先在这里红。
+    const declAt = fnBody.indexOf('let timer;');
+    const cleanupAt = fnBody.indexOf('const cleanup =');
+    assert.ok(declAt >= 0 && cleanupAt >= 0, 'waitForInbox 里找不到 let timer / const cleanup');
+    assert.ok(declAt < cleanupAt,
+      'let timer 必须声明在 cleanup 之前：cleanup 是闭包，任何「先 finish 再走到声明」的路径都会 TDZ 崩溃');
+    const vm = await import('node:vm');
+    const sandbox = { clearTimeout, setTimeout, Promise, Array, Error, result: null };
+    vm.createContext(sandbox);
+    vm.runInContext(fnBody + '\nthis.waitForInbox = waitForInbox;', sandbox);
+    const waitForInbox = sandbox.waitForInbox;
+    const fakeCtx = { on: () => () => {} };
+    const run = async (caller, timeoutMs, signal) => {
+      try {
+        return { ok: true, value: await waitForInbox(fakeCtx, caller, timeoutMs, signal) };
+      } catch (error) {
+        return { ok: false, message: error && error.message ? error.message : String(error) };
+      }
+    };
+    // ① 真机崩的那一支：inbox 里已有待处理输入 → 必须立刻返回 timedOut:false，而不是崩。
+    const withPending = await run({ inbox: { nextStep: [{ text: 'hi' }] } }, 10, undefined);
+    assert.ok(withPending.ok, '「已有待处理输入」分支崩了：' + withPending.message
+      + '（真机就是 wait_agent 直接失败，调度主循环断在这里）');
+    assert.equal(withPending.value.timedOut, false, '有待处理输入时必须立刻返回 timedOut:false（不是超时）');
+    // ② 没有待处理输入 → 正常超时。
+    const noPending = await run({ inbox: { nextStep: [] } }, 20, undefined);
+    assert.ok(noPending.ok, '普通超时分支崩了：' + noPending.message);
+    assert.equal(noPending.value.timedOut, true);
+    // ③ inbox 整个缺失（调用者形状不全）→ 也只许超时，不许崩。
+    const noInbox = await run({}, 20, undefined);
+    assert.ok(noInbox.ok, 'inbox 缺失时崩了：' + noInbox.message);
+    // ④ 已 abort 的 signal → 要用 signal.reason 拒绝，而不是 TDZ。
+    const ac = new AbortController();
+    ac.abort(new Error('cancelled'));
+    const aborted = await run({ inbox: { nextStep: [] } }, 200, ac.signal);
+    assert.equal(aborted.ok, false, '已 abort 的 signal 必须拒绝');
+    assert.ok(/cancelled/.test(aborted.message), '拒绝原因要原样带 signal.reason：' + aborted.message);
+    assert.ok(!/before initialization/.test(aborted.message), 'abort 分支也不能是 TDZ：' + aborted.message);
   });
 
   await check('全部工具返回值与自己声明的 output.schema 相容（schema 漂移的永久闸门）', async () => {

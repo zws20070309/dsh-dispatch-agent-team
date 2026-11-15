@@ -139,6 +139,25 @@ export function annotateRetriedMembers(rows, retryBy);
 // 2026-11-15 新增（第六轮真机 session-987dedcf）：分辨「已经死了」与「干完了在等验收」。
 // 两者在官方行里**都是 status:"inactive"**；真相在队员的 turn/end reason.kind=error 里。
 export const TURN_FAILED_DIAGNOSTIC_PREFIX; // '最近一次 turn 以错误结束（它没有正常收尾，名下任务不会自己闭环）：'
+export const MODEL_UNOBSERVED_PREFIX;     // '部分队员没有 model 字段：'（进 Lead 行 diagnostics）
+export function modelCoverageNote(rows);
+                                    // -> 一句说明 | undefined。**只在混合情况**（有的队员有 model、
+                                    //    有的没有）时返回；全有或全无时没有信息量。
+                                    //    2026-11-15 第七轮：验收方把「14 个没有、3 个有」归因成
+                                    //    「新队员有、旧队员没有，是数据迁移遗留」——归因错了。
+                                    //    真因是 appliedRoutes 为**内存账本**，T6→T7 之间隔了 4028 秒
+                                    //    的一次重启；字段存在性取决于「本进程内发没发过请求」。
+                                    //    这里说明它，但**不填猜测值**（填错比留空更糟，见 2026-10-16 P1）。
+export const ORPHAN_OWNER_PREFIX;         // '僵尸任务 '（进 Lead 行 diagnostics；与上面那条不同：
+                                          //  ｜上面讲「这个队员死了」，这条讲「这条任务别再等了」）
+export function orphanOwnerNote(tasks, failedNames, idLimit?);
+                                    // -> 一句提示 | undefined。把「任务 status=in_progress 且它的
+                                    //    ownerName 在 failedNames 里」的条目点出来，并给出下一步
+                                    //    （reassign / release / delete）。**不自动改任务板** ——
+                                    //    release 是 Lead 的决定（与 reportBoardFollowUps 同一条哲学）。
+                                    //    2026-11-15 第七轮：验收方用三种死法（关团/中断/正常未交付）
+                                    //    验证过同一后果，而收尾提示当时只报「已 claim 未交 N 条」，
+                                    //    分不清「在干」与「已经死了」。
 export function annotateFailedMembers(rows, failedBy);
                                     // -> 新数组；failedBy: agentId → {kind:'error', message?}。
                                     //    只写 role==='teammate' 那几行的 diagnostics，不新增字段、不改入参
@@ -557,7 +576,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:797`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:894`）。
    注意 `lib/tools.js:$ln-987` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条
