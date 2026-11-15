@@ -3518,7 +3518,16 @@ function functionBodyOf(source, needle) {
       startActivation: async (s) => ({ childId: 'n1', name: s.name }),
     };
     const ctx = { get: (n) => (n === 'subagents' ? subagents : undefined), on: () => () => {} };
-    const task = { id: 'task-1', revision: 1, subject: 's', description: 'd', status: 'pending', blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [], ownerName: 'researcher-alpha' };
+    // ⚠️ 2026-11-15：这份夹具**必须带上 rc.3 真实会产出的每个字段**。
+    // 第一版漏了 ownerId —— 于是闸门永远绿，而真机上任务一旦被 claim，
+    // team_task_get/list/update 三个工具就因 'ownerId' 未声明而全部报错
+    // （session-987dedcf 第二轮 seq 465/471/481/497）。
+    // 教训：夹具比实现"干净"是危险的 —— 闸门测的是夹具，不是真实返回值。
+    const task = {
+      id: 'task-1', revision: 2, subject: 's', description: 'd', status: 'in_progress',
+      ownerId: 'c1', ownerName: 'researcher-alpha',
+      blockedBy: [], writeScopes: [], ready: true, writeScopeWarnings: [],
+    };
     const agentTeams = {
       ctx,
       listTasks: () => [task], getTask: () => task,
