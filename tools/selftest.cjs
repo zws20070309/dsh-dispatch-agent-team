@@ -3616,6 +3616,41 @@ function functionBodyOf(source, needle) {
       + '而动作其实已经成功 —— 模型会以为失败并重试）：' + problems.join(' | '));
   });
 
+  await check('关团后必须提示「四个同名工具会变回官方版本」（2026-11-15 真机 seq 628 的闸门）', async () => {
+    // ── 为什么（session-987dedcf 实测）──────────────────────────────────────────
+    // 那一轮关团之后模型又调了一次 list_agents，拿到的却是**官方**的文本行格式
+    // （"lead [running] — root agent"），而不是本插件的 JSON 数组。
+    // 根因：调度模式 preset 里那个官方 @deepseek-ai/dsh-tool-subagent-control
+    // 注册了 list_agents / wait_agent / send_message / interrupt_agent 四个同名工具；
+    // 本插件在更深的 agent 作用域遮蔽它们，**卸载后就会露出来**。
+    // 同名不同义（官方 list_agents 没有 target、官方 send_message 目标参数叫 agent），
+    // 模型按旧字段名继续调就会失败 —— 所以关团的返回值里必须**明说**这件事。
+    const tools = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'tools.js')).href);
+    const subagents = {
+      rootOf: (a) => a,
+      namesOf: () => ({ self: 'lead' }),
+      listDescendants: async () => [],
+      resolveName: async (_c, n) => n,
+      sendMessage: async () => 'm',
+      interrupt: () => {},
+      startActivation: async (s) => ({ childId: 'n', name: s.name }),
+    };
+    const ctx = { get: (n) => (n === 'subagents' ? subagents : undefined), on: () => () => {} };
+    const agentTeams = { ctx, listTasks: () => [], isEnabled: () => false, setEnabled: async () => {}, config: {} };
+    const lead = { id: 'lead', session: { id: 'lead' }, ctx };
+    const runtimeStub = { enable: async () => ({ ok: true, enabled: true, diagnostics: [] }), disable: async () => ({ ok: true, wasEnabled: true }) };
+    const defs = tools.controlToolDefinitions({ runtime: runtimeStub });
+    const byName = new Map(defs.map((d) => [d.name, d]));
+    const exec = { agent: lead, ctx, signal: new AbortController().signal, rootCallId: 'c' };
+    const value = await byName.get('disable_agent_team').execute({}, exec);
+    const text = (value?.diagnostics ?? []).join(' ');
+    // 四个名字必须都被点到（少一个就说明提示不完整）。
+    for (const name of ['list_agents', 'send_message', 'wait_agent', 'interrupt_agent']) {
+      assert.ok(text.includes(name), '关团提示没有提到 ' + name + '：模型会按团队的字段名继续调官方那份');
+    }
+    assert.ok(/没有 target|不叫 target/.test(text), '关团提示必须点明字段名差异（官方 list_agents 无 target、send_message 目标参数叫 agent）');
+  });
+
   await check('托管块自愈：lib/self-heal.js 与 tools/repair.cjs 的常量必须逐字一致', () => {
     // 用户 2026-10-10 的事故：他做的插件让 DSH 崩溃，重启时选「关闭所有插件并重启」，
     // 那个流程重置了 profile 的 cordis.patch.yml ⇒ 本插件的托管块（关掉官方
