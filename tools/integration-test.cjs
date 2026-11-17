@@ -186,7 +186,16 @@ async function main() {
   });
 
   /** preset 平面注册的「继承面」工具。send_message 特意与团队工具同名，用来验证「own 层压过继承面」。 */
-  const PRESET_TOOL_NAMES = [...roster.TEAMMATE_TOOL_DENY, 'send_message', 'read', 'pwsh'];
+  // interrupt_agent 必须在夹具里模拟「官方注册在继承面上」的那一份：
+  // 真机 presets/dispatch-mode.patch.yml:208-209 挂的就是官方 dsh-tool-subagent-control。
+  // 它不在 TEAMMATE_TOOL_DENY 里的那些年里，这条夹具也一直没覆盖它 —— 于是「队员拿到了
+  // 能打断兄弟的工具」这件事在测试里完全不可见（2026-11-17 真机才暴露）。
+  // ⚠️ 用 Set 去重，并把 interrupt_agent **独立写出来**（不要只靠 deny 名单）。
+  // 原因：如果这份夹具派生自 TEAMMATE_TOOL_DENY，那么「把 interrupt_agent 从 deny 里删掉」
+  // 这个**回归**会连带把它从继承面夹具里一起删掉 —— 于是那条断言仍然绿，变成假绿灯。
+  // （2026-11-17 变异验证时就是这样：去掉 deny 里的那条，集成测试照样 PASS。）
+  // 现在继承面上**永远**有这个工具，和 deny 名单怎么写无关，断言才真的能抓到回归。
+  const PRESET_TOOL_NAMES = [...new Set([...roster.TEAMMATE_TOOL_DENY, 'send_message', 'interrupt_agent', 'read', 'pwsh'])];
 
   const root = new Context();
   root.plugin(SystemPrompt, { includeHarnessIdentity: true, personaPrefix: '', includeRuntimeContext: true });
@@ -353,6 +362,35 @@ async function main() {
     for (const name of ['read', 'pwsh']) {
       if (!scoutTools.includes(name)) return `队员丢了未被收窄的 preset 工具：${name}`;
       if (!leadTools.includes(name)) return `Lead 丢了 preset 工具：${name}`;
+    }
+    return true;
+  });
+
+  // ── Lead 专属工具**真的**从队员的工具面消失了（2026-11-17 真机 session-f0ff263b 的 P1）──
+  // 事故：interrupt_agent 被声明成 Lead 专属（LEAD_ONLY_TEAM_TOOL_NAMES），却既不在队员的
+  // 9 个团队工具里、也不在 TEAMMATE_TOOL_DENY 里。于是官方注册在 preset 继承面上的那一份
+  // 一路漏给每个队员 —— 原生档看得见（真机 scribe-context 第二份工具表 160 个里就有它），
+  // 而官方 interrupt 的判据是 ancestor authority，队员对兄弟**确实**算 ancestor，
+  // 所以这把刀在队员手里是真能用的：它能打断其他队员的活。
+  // ptc 档看不见它（executor 只送 run_code），所以这条**只有原生档能暴露** —— 夹具正好是原生档。
+  check('Lead 专属的 interrupt_agent 必须从队员工具面消失（原生档下尤其重要）', () => {
+    for (const name of ['interrupt_agent']) {
+      // 前提（夹具自检）：这个工具在**继承面（preset 平面）**上真的存在，
+      // 否则下面的「队员没有」是空断言。直接读 preset 平面，不靠 Lead 的工具面
+      // （Lead 自己也注册了一份同名团队工具，会掩盖继承面缺失）。
+      if (!root.get('tools').view(KEY.preset).visible.has(name)) {
+        return `前提不成立：继承面（preset 平面）上没有 ${name}，下面的断言会变成空断言`;
+      }
+      if (scoutTools.includes(name)) {
+        return `队员拿到了 ${name} —— 它是 Lead 专属（LEAD_ONLY_TEAM_TOOL_NAMES），却漏在 `
+          + 'TEAMMATE_TOOL_DENY 之外，于是官方继承面上的那一份直接落到队员手里；'
+          + '官方 interrupt 的判据是 ancestor authority，队员对兄弟真的算 ancestor，这把刀能用';
+      }
+    }
+    // 负对照：证明上面那条不是恒真 —— 队员**仍然**拿得到自己的 list_agents / send_message，
+    // 说明「消失」来自 deny 名单，而不是整个团队工具面都没装上。
+    for (const name of ['list_agents', 'send_message']) {
+      if (!scoutTools.includes(name)) return `负对照失败：队员连自己的 ${name} 都没了`;
     }
     return true;
   });
@@ -4748,6 +4786,81 @@ async function main() {
       return true;
     });
 
+    // ── 正向守卫（第二个方向）：batch 开 + 预设不带 executor，创建时也必须挂上 ptc ────────
+    // 第一版修复只处理了「ptc + batch 关」这一个方向。另一边同样会翻转：
+    // 角色预设是 standard / minimal-grayscale（**这两个都没有 executor 行**，
+    // 实读 dsh-web-app/presets/standard.patch.yml 与本机 minimal-grayscale：/tool-executor/ 零命中），
+    // 而 batch 开 = 要 run_code。创建时照传 standard → 第一步继承 root 的 native（160 个工具），
+    // 之后 installMember 挂 ptc 才翻成 run_code —— 还是那个翻转，只是换了触发条件。
+    // 判据必须是「要什么档」，不是「配置里写的是什么」。
+    const stdConfig = {
+      version: 1,
+      roles: { builder: { provider: 'p1', model: 'm1', preset: 'standard' } },
+      cache: { keepalive: { routes: {} } },
+    };
+    const stdRequests = [];
+    const stdTeams = {
+      listMembers: () => [],
+      ctx: { get: (key) => (key === 'subagents'
+        ? { startActivation: async (spec) => { stdRequests.push(spec); return { childId: 'c', name: spec.name }; } }
+        : undefined) },
+    };
+    const stdTool = toolsModule.teamToolDefinitions({
+      runtime: { ...spawnRuntime, peekConfig: () => stdConfig },
+      agentTeams: stdTeams,
+      include: roster.LEAD_TEAM_TOOL_NAMES,
+    }).find((d) => d.name === "spawn_teammate");
+    await rc3Spawn(stdTool, { role: 'builder', name: 'builder-std1', description: 'x', prompt: 'y' });
+    check("batch 开 + 预设不带 executor（standard）：创建时必须挂 ptc，否则第一步是原生档", () => {
+      const spec = stdRequests[0];
+      if (spec === undefined) return '没抓到 startActivation';
+      if (spec.agentPreset !== 'ptc') {
+        return "要 run_code（batch 开）却把预设 " + JSON.stringify(spec.agentPreset)
+          + " 交给了官方 —— 它不带 executor，第一步会继承 root 的 native 档（全套原生工具），"
+          + "之后 installMember 挂 ptc 才翻成 run_code：还是那个翻转，只是换了触发条件";
+      }
+      return true;
+    });
+
+    // ── 不许用 ptc 顶掉 minimal-grayscale 的组合（目录与 persona 完全不同）────────────
+    // 事实（实读三份预设的 name: 集合与 persona）：
+    //   * ptc               30 行，带 executor；
+    //   * standard          29 行，与 ptc 的差**只有** tool-executor-ptc 一行；
+    //   * minimal-grayscale 17 行，persona 是 'You are a helpful software engineer assistant.'，
+    //     还有 persistent-shell 一族，多数 ptc 行都没有 → 换过去等于把用户选的组合整个换掉。
+    // 所以「要 run_code 就传 ptc」只能对 ptc / standard 成立。
+    const mgConfig = {
+      version: 1,
+      roles: { builder: { provider: 'p1', model: 'm1', preset: 'minimal-grayscale' } },
+      cache: { keepalive: { routes: {} } },
+    };
+    const mgRequests = [];
+    const mgTeams = {
+      listMembers: () => [],
+      ctx: { get: (key) => (key === 'subagents'
+        ? { startActivation: async (spec) => { mgRequests.push(spec); return { childId: 'c', name: spec.name }; } }
+        : undefined) },
+    };
+    const mgTool = toolsModule.teamToolDefinitions({
+      runtime: { ...spawnRuntime, peekConfig: () => mgConfig },
+      agentTeams: mgTeams,
+      include: roster.LEAD_TEAM_TOOL_NAMES,
+    }).find((d) => d.name === "spawn_teammate");
+    const mgResult = await rc3Spawn(mgTool, { role: 'builder', name: 'builder-mg1', description: 'x', prompt: 'y' });
+    check("minimal-grayscale（batch 开）：创建时不许用 ptc 顶掉它，且必须如实说明会有一次翻转", () => {
+      const spec = mgRequests[0];
+      if (spec === undefined) return '没抓到 startActivation';
+      if (spec.agentPreset === 'ptc') {
+        return "把 minimal-grayscale 换成了 ptc —— 两者目录差 18 个插件行、persona 也不同，"
+          + "等于把用户特意选的极简组合整个换掉";
+      }
+      const text = String((mgResult && mgResult.diagnostics || []).join(" "));
+      if (!text.includes('第一步')) {
+        return "没有如实说明「第一步会先沿用继承档」—— 那一次翻转就变成静默的了：" + text;
+      }
+      return true;
+    });
+
     // ── 反向守卫：batch 关（要原生档）的角色**不许**在创建时传 ptc ────────────────────
     // 事实：三个白名单预设里只有 ptc 挂 executor（dsh-web-app/presets/ptc.patch.yml:127-128），
     // 而 executor 决定呈现档。所以「照抄 ptc」在 batch:false 的角色上会把**第一步**
@@ -4916,6 +5029,63 @@ async function main() {
       if (roster.deriveRole('scout-core') !== 'scout') return 'scout-core 的角色推导错了';
       return true;
     });
+
+    // ── BLOCKED 的两种含义不能混（2026-11-17 真机 session-f0ff263b seq=232）──────────────
+    // 官方 dsh-agent-team/src/task-board.ts:142-148 的 claim 分支只有两条判据，
+    // 而「status 不是 pending」和「依赖没满足」**共用同一个 TEAM_TASK_BLOCKED**：
+    //     if (ownerId 存在 && ownerId !== caller.id)           -> TEAM_TASK_ALREADY_CLAIMED
+    //     if (status !== "pending" || !taskReady(state,cur))   -> TEAM_TASK_BLOCKED
+    // 真机事故：researcher-refs 去 claim 一条 in_progress/owner=它自己 的条目，
+    // 插件却告诉它「依赖还没完成：先完成 blockedBy 里的条目，或 set_dependencies 调整依赖」——
+    // 那条任务根本没有 blockedBy，队员照这条去查依赖白烧一轮。
+    // 这条用例对**三种状态**分别断言「下一步」不许把原因说成依赖。
+    {
+      const blockedScenarios = [
+        { label: 'self-claimed', status: 'in_progress', ownerName: 'researcher-refs', wantMention: ['in_progress'], forbid: ['依赖还没完成'] },
+        { label: 'already-done', status: 'completed', ownerName: 'researcher-refs', wantMention: ['completed', 'reopen'], forbid: ['依赖没满足'] },
+        { label: 'really-blocked', status: 'pending', ownerName: '', wantMention: ['blockedBy'], forbid: [] },
+      ];
+      const blockedGot = {};
+      for (const scenario of blockedScenarios) {
+        const bt = toolsModule.teamToolDefinitions({
+          runtime: spawnRuntime,
+          agentTeams: {
+            listMembers: () => [],
+            getTask: async () => ({ id: 'task-1', revision: 2, status: scenario.status, ownerName: scenario.ownerName }),
+            updateTask: async () => {
+              const e = new Error("team task \"task-1\" is not ready to claim");
+              e.name = "TeamError";
+              e.code = "TEAM_TASK_BLOCKED";
+              throw e;
+            },
+          },
+          include: roster.LEAD_TEAM_TOOL_NAMES,
+        }).find((d) => d.name === "team_task_update");
+        try {
+          await bt.execute({ task_id: "task-1", action: "claim", expected_revision: 2 }, { agent: caller });
+          blockedGot[scenario.label] = "";
+        } catch (error) {
+          blockedGot[scenario.label] = String(error && error.message ? error.message : error);
+        }
+      }
+      check("team_task_update：BLOCKED 是「状态不对」还是「依赖没满足」必须分开说（不许一律怪依赖）", () => {
+        for (const scenario of blockedScenarios) {
+          const text = blockedGot[scenario.label] || "";
+          if (text === "") return scenario.label + "：没有抛出任何错误";
+          for (const word of scenario.wantMention) {
+            if (!text.includes(word)) {
+              return scenario.label + "：下一步里没有提到 " + word + " —— 实际：" + text.slice(-220);
+            }
+          }
+          for (const word of scenario.forbid) {
+            if (text.includes(word)) {
+              return scenario.label + "：仍然把原因说成「" + word + "」—— 实际：" + text.slice(-220);
+            }
+          }
+        }
+        return true;
+      });
+    }
 
     // ── task_id 绑定失败：诊断必须带**官方错误码**（2026-10-29）────────────────────
     // 官方 TeamError 是 HarnessError 的子类，code 是稳定可路由的失败类

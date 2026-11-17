@@ -136,10 +136,37 @@ function functionBodyOf(source, needle) {
 
     assert.equal(new Set(roster.TEAMMATE_TOOL_DENY).size, roster.TEAMMATE_TOOL_DENY.length, 'TEAMMATE_TOOL_DENY 有重复');
     for (const name of roster.TEAMMATE_TOOL_DENY) {
-      // 摘掉的名字必须是**继承面**上的第三方工具；团队工具由我们自己在 own layer 注册，
-      // restrict 对 own layer 无效，写进去只会得到一条「无法回卷」的诊断。
-      assert.ok(!teamTools.has(name), `TEAMMATE_TOOL_DENY 里不应出现团队工具名：${name}`);
+      // 真正的不变量：**我们自己在队员 own 层注册的**那些名字不能进 deny ——
+      // restrict 只过滤继承面，对 own layer 无效，写进去只会得到一条「无法回卷」的诊断。
+      //
+      // ⚠️ 2026-11-17 修正：原来这里写的是 `!teamTools.has(name)`（不许出现任何团队工具名），
+      // 那条口径**过宽**，把一个真实缺陷挡住了：`interrupt_agent` 既是我们的团队工具名
+      // （Lead 那份），也由官方 `dsh-tool-subagent-control` 注册在 preset 的**继承面**上
+      // （presets/dispatch-mode.patch.yml:208-209）。队员的 own 层**没有**它
+      // （MEMBER_TEAM_TOOL_NAMES 不含），所以它必须能被 deny 摘掉，否则原生档队员
+      // 会拿到一把真的能用的刀（官方 interrupt 的判据是 ancestor authority，队员对兄弟确实是
+      // ancestor）。真机 session-f0ff263b 的 scribe-context 就是这么拿到它的。
+      assert.ok(
+        !memberTools.has(name),
+        `TEAMMATE_TOOL_DENY 里不应出现**队员 own 层注册**的工具名（restrict 摘不掉 own 层）：${name}`,
+      );
       assert.match(name, /^[a-z][a-z0-9_-]*$/u, `工具名形状可疑：${name}`);
+    }
+    // 反向锁定「官方在继承面上真的注册了」的 Lead 专属工具，必须在 deny 里 ——
+    // 否则继承面那一份会漏给队员（原生档可见，而且真的能调）。
+    //
+    // 判据必须是「官方有没有在继承面注册同名工具」，不能笼统用 LEAD_ONLY_TEAM_TOOL_NAMES：
+    //   * interrupt_agent —— 有（官方 dsh-tool-subagent-control，presets/dispatch-mode.patch.yml:208-209）→ 必须 deny；
+    //   * spawn_teammate  —— 没有（rc.3 官方**删掉**了它，见 TOOLS_REMOVED_IN_RC3）→ 继承面上没有同名工具，
+    //     deny 里写它只会命中 restrict 的「unknown global tool」分支、多一条噪音诊断。
+    const inheritedOfficialTools = ['interrupt_agent'];
+    for (const name of inheritedOfficialTools) {
+      assert.ok(roster.LEAD_ONLY_TEAM_TOOL_NAMES.includes(name), `${name} 应当仍是 Lead 专属`);
+      assert.ok(
+        roster.TEAMMATE_TOOL_DENY.includes(name),
+        `Lead 专属的 ${name} 必须进 TEAMMATE_TOOL_DENY：官方在 preset 继承面上注册了同名工具，`
+        + '不摘就会漏给队员（原生档可见、且真的能调）。真机 session-f0ff263b 的 scribe-context 就是这么拿到它的',
+      );
     }
     // 用户明确要求的两条：不给队员目标、不给队员再派子代理的权限。
     for (const name of ['create_goal', 'get_goal', 'update_goal', 'subagent', 'subagent_fork', 'workflow']) {
@@ -686,7 +713,9 @@ function functionBodyOf(source, needle) {
     assert.equal(roster.MEMBER_TEAM_TOOL_NAMES.length, 9, '§1 注释写着队员 9 个');
     assert.equal(roster.TEAM_TOOL_NAMES.length, 9, '§1 注释写着官方九个团队工具');
     assert.equal(roster.LEAD_TEAM_TOOL_NAMES.length, 11, '§1 注释写着 Lead = 官方九个 + 为 Lead 加的两个');
-    assert.equal(roster.TEAMMATE_TOOL_DENY.length, 9, '§1 的 deny 表(MAINTAINER-NOTES.md §4.5)列了 9 个名字');
+    // 2026-11-17：9 → 10。补进去的是 interrupt_agent（Lead 专属，却漏在 deny 之外，
+    // 详见 lib/roster.js 里那条长注释与 MAINTAINER-NOTES.md §4.5 的那一行）。
+    assert.equal(roster.TEAMMATE_TOOL_DENY.length, 10, '§1 的 deny 表(MAINTAINER-NOTES.md §4.5)列了 10 个名字');
   });
 
   await check('tools.js 用到的每个 runtime.<name> 都必须在 runtimeApi 门面上（缺键=静默失效）', () => {
@@ -822,25 +851,34 @@ function functionBodyOf(source, needle) {
     assert.ok(both[2].diagnostics[0] === roster.TRUNCATED_DIAGNOSTIC);
   });
 
-  await check('队员卡必须说明「第一步工具清单是继承档、团队工具在 run_code 里」（第八轮真机）', async () => {
-    // 真机依据（2026-11-15 第八轮 session-987dedcf）：三个队员（researcher-wait / long / irun）
-    // **全部**在第一步直接调了 list_agents，拿到 Error: unknown tool "list_agents"，
-    // 第二步才靠 run_code 自纠（子会话 seq19/20 就是这一步）。
-    // 根因不是 bug：呈现档在第一个 step 之后才切到队员身上，所以第一步的 header.tools
-    // 还是继承档（160 个通用工具，没有团队工具、没有 run_code）。
-    // 但卡片此前 grep " + BT + "run_code" + BT + " **零命中** —— 队员只能自己试错，
-    // 每个新队员都要付一次固定往返。这条闸门锁住那句说明。
+  await check('队员卡必须说明「团队工具在 run_code 里、顶层没有它们」（第八/九轮真机）', async () => {
+    // 真机依据（2026-11-15 第八轮 session-987dedcf）：三个队员**全部**在第一步直接调了
+    // list_agents，拿到 Error: unknown tool "list_agents"，第二步才靠 run_code 自纠。
+    //
+    // ⚠️ 2026-11-17 第九轮修正这条闸门的**前提**：当时把原因写成「第一步的 header.tools
+    // 是继承档」，并把这句话钉进卡片。第九轮查明真正的原因是**安装时机**
+    //（installMember 只能在队员已存在后跑），并已修好 —— 修好之后第一步**就是**
+    // run_code（组合随创建参数 agentPreset 交上去，见 lib/tools.js 的 spawnPreset）。
+    // 所以「第一步清单是继承档」在修复之后**已经不再成立**，不能再当事实钉着：
+    // 钉下去只会让卡片对队员撒谎。
+    //
+    // 真正要钉的是**不会随实现变化**的那条：团队工具不是顶层工具，只能经 run_code 调，
+    // 硬试会得到 unknown tool。这条在任何呈现档下都成立。
     const playbook = await load('playbook.js');
     const card = playbook.TEAMMATE_CARD;
     assert.ok(card.includes('run_code'), '队员卡必须提到 run_code（那是队员唯一能直接调的工具）');
     assert.ok(card.includes('tools.'), '队员卡必须说明团队工具怎么调（tools.<名字>，在 run_code 里）');
-    assert.ok(/第一步|继承档/.test(card), '队员卡必须说明第一步的清单是继承档，否则队员还会去硬试');
     assert.ok(/unknown tool/.test(card), '必须点出硬试的实际后果（unknown tool），这是它自纠的依据');
-    // 反向：这句话不许膨胀成一大段（它只是「别浪费时间」的一句话，不是教程）。
-    const idx = card.indexOf('第一步');
+    // 反向：卡片**不许**再断言「第一步的清单是继承档」—— 修复之后那是假的。
+    assert.ok(
+      !card.includes('第一步的清单是继承档'),
+      '队员卡仍在说「第一步的清单是继承档」—— 2026-11-17 修好安装时机后第一步就是 run_code，这句话会让队员去怀疑一个不存在的问题',
+    );
+    // 这句话不许膨胀成一大段（它只是「别浪费时间」的一句提醒，不是教程）。
+    const idx = card.indexOf('run_code');
     assert.ok(idx >= 0, '找不到那句话');
-    const sentence = card.slice(idx, card.indexOf('\n', idx));
-    assert.ok(sentence.length < 200, '这句话不该超过 200 字符（它是一句提醒，不是教程）：' + sentence.length);
+    const sentence = card.slice(idx, card.indexOf(String.fromCharCode(10), idx));
+    assert.ok(sentence.length < 260, '这句话不该超过 260 字符（它是一句提醒，不是教程）：' + sentence.length);
   });
 
   await check('僵尸任务提示必须同时出现在 wait_agent（不是只有 list_agents）——第八轮收尾建议', () => {
