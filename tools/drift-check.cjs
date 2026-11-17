@@ -1527,22 +1527,39 @@ check('lib/tools.js 的 wake_teammate 与 Lead 名单仍在（用户 2026-10-01 
 });
 
 // 11c-6) 队员模型覆盖的优先级接线（2026-10-01 修的「面板上改回『跟随 Lead』不生效」）：
-//   * `installRouteOverride` 必须**每次请求实时**读角色配置（`resolveRoleRoute(peekConfig()`），
+//   * 路由解析必须**每次实时**读角色配置（`resolveRoleRoute(peekConfig()`），
 //     并且用 `resolveMemberRoute(显式钉, 角色配置, 显式强度)` 合成；
+//     ⚠️ 2026-11-17：这段解析从 installRouteOverride 内联抽成了 memberWantedRoute
+//     （两条渠道 agent/pre-step 与 agent/request 共用同一份解析）。断言跟着改成查那个函数 ——
+//     **语义完全不变**：仍然是「显式钉 > 实时角色配置 > 跟随 Lead」，仍然每次实时读。
 //   * `spawn_teammate` 只许钉**工具调用显式给出的**参数（`pinSpawnRoute(name, …explicit…)`），
 //     把角色配置一起钉住 = 那个队员永远不跟着面板走（用户报的正是这个）。
 check('队员模型覆盖：显式 spawn 钉 > 实时角色配置 > 跟随 Lead（接线未被改回旧语义）', () => {
   const runtime = readFileOr(path.join(PLUGIN_DIR, 'lib', 'runtime.js'));
   if (runtime === '') return '读不到 lib/runtime.js';
-  const listener = functionBodyOf(runtime, 'function installRouteOverride(');
-  if (listener === '') return '找不到 installRouteOverride';
+  const resolver = functionBodyOf(runtime, 'function memberWantedRoute(');
+  if (resolver === '') return '找不到 memberWantedRoute（模型覆盖的优先级解析）';
   const required = [
     ['resolveRoleRoute(peekConfig()', '每个请求实时读角色配置'],
     ['spawnEfforts.get(name)', '显式强度的单独账本'],
     ['resolveMemberRoute(explicit, roleRoute', '统一的优先级合成'],
   ];
-  const missing = required.filter(([needle]) => !listener.includes(needle)).map(([, label]) => label);
-  if (missing.length > 0) return `installRouteOverride 里找不到：${missing.join('、')}`;
+  const missing = required.filter(([needle]) => !resolver.includes(needle)).map(([, label]) => label);
+  if (missing.length > 0) return `memberWantedRoute 里找不到：${missing.join('、')}`;
+
+  // 两条渠道都必须真的接上 memberWantedRoute —— 只装一条等于一半宿主的队员模型失效：
+  //   新宿主（有 agent.model）必须走 pre-step 的 select；旧宿主必须走 agent/request。
+  const listener = functionBodyOf(runtime, 'function installRouteOverride(');
+  if (listener === '') return '找不到 installRouteOverride';
+  if (!listener.includes("agent.ctx.on('agent/pre-step'")) {
+    return 'installRouteOverride 不再挂 agent/pre-step —— 新宿主会把角色配置的模型判成「步进准备之后又提出新路由」并打死队员（2026-11-17 P0 会回来）';
+  }
+  if (!listener.includes("agent.ctx.on('agent/request'")) {
+    return 'installRouteOverride 不再挂 agent/request —— 旧宿主（无 agent.model）上角色模型配置会完全失效';
+  }
+  if (listener.indexOf('modelApi.select(') > listener.indexOf("agent.ctx.on('agent/request'")) {
+    return 'agent.model.select() 必须落在 pre-step 渠道里（早于步进准备），不能只在 agent/request 里';
+  }
 
   const tools = readFileOr(path.join(PLUGIN_DIR, 'lib', 'tools.js'));
   const spawn = functionBodyOf(tools, 'async execute(args, exec) {\n        const caller = callingAgent(exec.agent, \'spawn_teammate\')');

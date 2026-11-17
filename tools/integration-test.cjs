@@ -774,7 +774,13 @@ async function main() {
   });
 
   // 本插件行只声明了 webServer（与 cordis.patch.yml / INTERFACES 现状一致）。
-  indexModule.apply(loaderLikeCtx(root, ['webServer']), {});
+  // ⚠️ apply() 是 async 的（lib/index.js:525），路由注册发生在它内部的第一个 await 之后。
+  // 原来这里只写 `indexModule.apply(...)` 不管返回值，靠后面三个 `await tick()` 蒙混过关 ——
+  // 那是**时序巧合**，不是同步保证：任何在这之前加入的 await 都会改变 tick 的相对位置，
+  // 让「已注册路由」这条断言随机失败（本轮加了一条 await 就复现了，症状是
+  // 「没有注册 /zws-dispatch-agent-team/api，已注册：[]」，而 apply 其实完全正常）。
+  // 现在显式 await 它：既消除偶发，也让「apply 真的跑完」成为一条有保证的前提。
+  await indexModule.apply(loaderLikeCtx(root, ['webServer']), {});
   await tick();
   await tick();
   await tick();
@@ -3036,6 +3042,90 @@ async function main() {
     });
   }
 
+  // ── 7.9c2) 队员模型：必须**在步进准备之前**用 agent.model.select() 钉（2026-11-17 P0）──────
+  // 真机事故（session-f0ff263b）：用户在面板给 12 个角色配了 marvis/deepseek-v4-pro-external，
+  // 两个队员**第一次请求就死**，子会话 turn/end 原文：
+  //   agent/request proposed "marvis/deepseek-v4-pro-external" after step preparation fixed
+  //   "buddy/hy4flash-free"; use agent.model.select() before step preparation
+  // 源码事实（asar 实读 0.2.2-rc.3）：
+  //   * dsh-agent-loop/src/agent.ts:294  preStep 里 `const selection = this.model.current()` 先固定；
+  //   * 同文件 :636-643  agent/request 的提议与 selection 不一致 → **直接 throw**；
+  //   * 官方升级指南（docs/upgrade-guide/v0.2.1-alpha.4/session-model-selection/guide.zh.md:16、:23）
+  //     原文「agent/request 已弃用……不能改变提供方或模型」「不要添加 agent/request 监听器」。
+  // 旧的 installRouteOverride **只**挂 agent/request，所以在 rc.3 上必然撞这道校验。
+  // 这条用例走**生产路径**（真 runtime.enable → 真 installRouteOverride），
+  // 用一个记账替身冒充 agent.model，验证 select 发生在 next() 之前、且带的是角色路由。
+  {
+    const mKey = { name: 'stand-route-select' };
+    const mScope = createScope(root, mKey);
+    const mSession = makeStandSession('stand-route', 'dispatch-mode', false);
+    // 角色配置：researcher 配成 provider-m/model-m —— 这就是「用户给队员选了和 Lead 不同的模型」。
+    // ⚠️ 必须先备份再改，用完立刻还原：这段跑在 7.x 段落里，而后面的配置页用例（8.x）
+    // 依赖「配置里只剩它自己写的那几个角色」。不还原就会把后面 50 多条断言的前提改坏
+    // （第一版没还原，症状是配置页路由查不到 —— 完全是另一处，极具误导性）。
+    const routeConfigBackup = await runtime.loadConfig(root);
+    await runtime.saveConfig(root, {
+      version: roster.CONFIG_VERSION,
+      roles: { researcher: { provider: 'provider-m', model: 'model-m' } },
+    });
+    let current = { provider: 'buddy', model: 'hy4flash-free', reasoningEffort: 'high' };
+    const selectCalls = [];
+    const mModel = {
+      current: () => ({ ...current }),
+      select: (selection) => {
+        selectCalls.push({ ...selection });
+        current = { ...selection };
+      },
+    };
+    const mMate = { id: 'stand-route', ctx: agentCtx(mScope.ctx), options: {}, session: mSession, model: mModel };
+    agents.push(mMate);
+    membershipById.set(mMate.id, { root: standLead, id: mMate.id, role: 'teammate', name: 'researcher-route' });
+    joinOrRebind(mMate.ctx, 'dispatch-mode');
+    // ⚠️ 必须给会话一个真的 surface：installMember 装上 skill 工具后，它在每次
+    // agent/pre-step 里会读 `agent.session.surface.nodes`（dsh-tool-skill/lib/index.js:332）。
+    // 替身会话没有 surface → 整个 pre-step 直接抛 "Cannot read properties of undefined"，
+    // 那会掩盖本条用例要验的东西（也会让测试后半段崩掉）。
+    mSession.surface = { nodes: new Set(), contentGeneration: 1 };
+    mSession.seq = 0;
+    mSession.eventAt = () => undefined;
+    root.emit('agent/created', { agent: mMate });
+    await tick();
+    await tick();
+    // 走真的 agent/pre-step waterfall（与生产同一条分发路径）。
+    // next() 模拟官方 preStep：它内部那句 this.model.current() 就是 agent.ts:294。
+    let seenByNext = null;
+    await root.waterfall(
+      'agent/pre-step',
+      { agent: mMate, messages: [], signal: new AbortController().signal, step: 1, turn: 1 },
+      () => {
+        seenByNext = mModel.current();
+        return { kind: 'enter', messages: [] };
+      },
+    );
+    check('队员模型必须在 agent/pre-step 里 select（早于步进准备），否则 rc.3 会打死队员', () => {
+      if (selectCalls.length === 0) {
+        return 'pre-step 里一次 select 都没发生 —— 覆盖还挂在 agent/request 上，rc.3 的步进准备校验会直接抛 '
+          + '"agent/request proposed X after step preparation fixed Y" 并把队员打死';
+      }
+      // 断言顺序：select 必须发生在 next() 之前（next() 里读到的就是 select 之后的值）。
+      if (seenByNext === null || seenByNext.provider !== 'provider-m') {
+        return 'next()（= 官方步进准备）读到的还是 ' + JSON.stringify(seenByNext)
+          + ' —— select 发生在它之后，等于没赶在固定之前';
+      }
+      return true;
+    });
+    check('pre-step 的 select 带的是**角色配置**那条路由（不是 Lead 的继承值）', () => {
+      const last = selectCalls[selectCalls.length - 1];
+      if (last === undefined) return '没有任何 select 调用';
+      if (last.provider !== 'provider-m' || last.model !== 'model-m') {
+        return 'select 的是 ' + JSON.stringify(last) + '，应为角色配置的 provider-m/model-m';
+      }
+      return true;
+    });
+    // 还原配置（见上面那条备份的说明）。
+    await runtime.saveConfig(root, routeConfigBackup);
+  }
+
   // ── 7.9d) 关团不许拆「正在跑」的队员的执行器（2026-11-15 第六轮 P0）──────────────────
   // 真机事故（session-987dedcf turn 6）：Lead 在两名队员正跑着的时候调 disable_agent_team，
   // 206~237 ms 后两名队员**同时**以 error 收尾，子会话日志里是：
@@ -4575,6 +4665,122 @@ async function main() {
       if (pin?.reasoningEffort !== 'high') return `钉的是 ${JSON.stringify(pin)}`;
       if (pin.provider !== undefined || pin.model !== undefined) return `不应带上 provider/model：${JSON.stringify(pin)}`;
       if (!String((effortOnly?.diagnostics ?? []).join(' ')).includes('思考强度')) return '回执里没说清楚只钉了强度';
+      return true;
+    });
+
+    // ── P0（2026-11-17 真机 session-f0ff263b）：组合与路由必须在**创建时**交给官方 ──────
+    // 真机症状：用户在面板给 12 个角色配了 marvis/deepseek-v4-pro-external，两名队员
+    // **第一次请求就死**，报
+    //   agent/request proposed "marvis/..." after step preparation fixed "buddy/hy4flash-free"
+    // 另一面：幸存的那两名队员第一步拿到 **163 个原生工具**、第二步才切成 run_code。
+    // 同一个根因：installMember 只能在队员**已存在**之后跑（agent/created 在 rc.3 赶不及），
+    // 所以第一步用的是「继承来的组合 + 继承来的路由」。官方给创建窗口留了口
+    // （SubagentStartRequest.agentPreset / agentOptions），必须在 spawn 时就交上去。
+    //
+    // ⚠️ 这条只对 **rc.3** 有意义：rc.2 的 spawnTeammate 签名里根本没有这两个字段
+    //（见 lib/team-api.js 的 rc.2 分支注释），而 rc.2 也没有 agent/request 那道硬校验 ——
+    // 那一代宿主上「装晚一步」不会打死队员。所以这里用 **rc.3 形状**的替身来验。
+    const rc3SpawnRequests = [];
+    const rc3Teams = {
+      listMembers: () => [],
+      // rc.3：域服务没有 spawnTeammate，靠 ctx.get('subagents') 取 subagents 服务。
+      ctx: {
+        get: (key) => (key === 'subagents'
+          ? {
+            startActivation: async (spec) => {
+              rc3SpawnRequests.push(spec);
+              return { childId: 'child-' + String(spec.name), name: spec.name, messageId: 'm1' };
+            },
+          }
+          : undefined),
+      },
+    };
+    const rc3Definitions = toolsModule.teamToolDefinitions({ runtime: spawnRuntime, agentTeams: rc3Teams, include: roster.LEAD_TEAM_TOOL_NAMES });
+    const rc3SpawnTool = rc3Definitions.find((definition) => definition.name === 'spawn_teammate');
+    // 这份配置带 preset，用来同时验「组合」那条：见下面的 runtime 覆盖。
+    const rc3Runtime = {
+      ...spawnRuntime,
+      peekConfig: () => ({
+        version: 1,
+        roles: { builder: { provider: 'p1', model: 'm1', preset: 'ptc' } },
+        cache: { keepalive: { routes: {} } },
+      }),
+    };
+    const rc3PresetDefinitions = toolsModule.teamToolDefinitions({ runtime: rc3Runtime, agentTeams: rc3Teams, include: roster.LEAD_TEAM_TOOL_NAMES });
+    const rc3PresetTool = rc3PresetDefinitions.find((definition) => definition.name === 'spawn_teammate');
+    const rc3Spawn = async (tool, args) => {
+      try {
+        return await tool.execute(args, { agent: { id: 'lead-agent', name: 'lead' } });
+      } catch {
+        return undefined;
+      }
+    };
+    await rc3Spawn(rc3SpawnTool, { role: 'builder', name: 'builder-r1', description: 'x', prompt: 'y' });
+    await rc3Spawn(rc3SpawnTool, { role: 'builder', name: 'builder-r2', description: 'x', prompt: 'y', provider: 'p9', model: 'm9' });
+    await rc3Spawn(rc3SpawnTool, { role: 'builder', name: 'builder-r3', description: 'x', prompt: 'y', reasoning_effort: 'high' });
+    await rc3Spawn(rc3PresetTool, { role: 'builder', name: 'builder-r4', description: 'x', prompt: 'y' });
+
+    check('spawn_teammate：角色预设与角色路由必须**随创建参数**交给官方（否则第一步用继承值）', () => {
+      const [implicit, explicit, effortOnly, withPreset] = rc3SpawnRequests;
+      if (implicit === undefined) return '没抓到任何 rc.3 startActivation 调用';
+      // ① 角色配了模型 → 必须随创建参数传下去。不传 = 第一步用 Lead 的路由，
+      //    然后被官方 agent/request 校验打死（真机就是这么死的）。
+      if (implicit.agentOptions?.provider !== 'p1' || implicit.agentOptions?.model !== 'm1') {
+        return '角色配置的路由没有随创建参数传下去（第一步会用继承的 Lead 路由 → 被官方 '
+          + 'agent/request 校验打死）：' + JSON.stringify(implicit.agentOptions);
+      }
+      // ② 显式 provider/model 覆盖角色配置，创建参数必须跟着覆盖后的那条走。
+      if (explicit?.agentOptions?.provider !== 'p9' || explicit?.agentOptions?.model !== 'm9') {
+        return '显式路由没随创建参数传下去：' + JSON.stringify(explicit?.agentOptions);
+      }
+      // ③ 只给强度时：模型部分来自角色配置（p1/m1），强度 high 一并带上 ——
+      //    否则第一步是「角色模型 + 继承强度」，与后面每次请求的强度不一致。
+      if (effortOnly?.agentOptions?.reasoningEffort !== 'high') {
+        return '只给强度时创建参数里没有强度：' + JSON.stringify(effortOnly?.agentOptions);
+      }
+      if (effortOnly?.agentOptions?.model !== 'm1') return '只给强度时模型应该来自角色配置：' + JSON.stringify(effortOnly?.agentOptions);
+      // ④ 角色配了 preset（batch 默认开）→ 同样必须随创建参数传
+      //    （否则第一步是继承的组合 = 163 个原生工具）。
+      if (withPreset?.agentPreset !== 'ptc') {
+        return '角色预设没有随创建参数传下去（第一步会拿到继承的组合，不是 run_code 单工具）：'
+          + JSON.stringify(withPreset?.agentPreset);
+      }
+      return true;
+    });
+
+    // ── 反向守卫：batch 关（要原生档）的角色**不许**在创建时传 ptc ────────────────────
+    // 事实：三个白名单预设里只有 ptc 挂 executor（dsh-web-app/presets/ptc.patch.yml:127-128），
+    // 而 executor 决定呈现档。所以「照抄 ptc」在 batch:false 的角色上会把**第一步**
+    // 变成 run_code 单工具，然后 installMember 挂 native 再翻回全套原生工具 ——
+    // 等于把 P0-B 那个翻转反过来演一遍（这次坏在后面，不是前面）。
+    // 这条是给上面那条修复兜底的**反向断言**：修复不许把一个翻转换成另一个翻转。
+    const romeConfig = {
+      version: 1,
+      roles: { builder: { provider: 'p1', model: 'm1', preset: 'ptc', batch: false } },
+      cache: { keepalive: { routes: {} } },
+    };
+    const revRequests = [];
+    const revTeams = {
+      listMembers: () => [],
+      ctx: { get: (key) => (key === 'subagents'
+        ? { startActivation: async (spec) => { revRequests.push(spec); return { childId: 'c', name: spec.name }; } }
+        : undefined) },
+    };
+    const revTool = toolsModule.teamToolDefinitions({
+      runtime: { ...spawnRuntime, peekConfig: () => romeConfig },
+      agentTeams: revTeams,
+      include: roster.LEAD_TEAM_TOOL_NAMES,
+    }).find((definition) => definition.name === 'spawn_teammate');
+    await rc3Spawn(revTool, { role: 'builder', name: 'builder-rev1', description: 'x', prompt: 'y' });
+    check('batch 关（要原生档）时创建参数**不许**传 ptc（否则第一步是 run_code，之后才翻成原生）', () => {
+      const spec = revRequests[0];
+      if (spec === undefined) return '没抓到 startActivation';
+      if (spec.agentPreset === 'ptc') {
+        return 'batch:false 的角色被传了 agentPreset=ptc —— 第一步会是 run_code 单工具，'
+          + '之后 installMember 挂 native 才翻成全套原生工具（P0-B 那个翻转被反过来演了一遍）';
+      }
+      // 模型仍必须传（那是另一件事，与呈现档无关）。
+      if (spec.agentOptions?.provider !== 'p1') return 'batch 关不该影响模型随创建参数传：' + JSON.stringify(spec.agentOptions);
       return true;
     });
 
