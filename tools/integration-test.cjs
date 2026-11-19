@@ -408,7 +408,7 @@ async function main() {
   // ── 2.5) skill：队员能调，且「工具可见性 ↔ 技能目录」绑定（2026-10-07 新增）──────
   //
   // 为什么要有这一组：`skill` 是 preset 行带来的工具（presets/dispatch-mode.patch.yml:142-146），
-  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:894），所以队员天然保留它 ——
+  // 本插件的 TEAMMATE_TOOL_DENY 里**没有**它（lib/roster.js:939），所以队员天然保留它 ——
   // 于是「队员能不能用 skill」这件事**没有任何闸门**。谁哪天把 skill 加进 deny 名单，队员会
   // 同时失去工具**和**技能目录，而插件照常加载、/team 照常可用、配置页照常渲染：与 2026-10-07
   // 修掉的「/team 静默拒收附件」是同一类失效模式（坏了不报，只是能力没了）。
@@ -603,7 +603,10 @@ async function main() {
       // 2026-11-15 第八轮再上调 2010→2050（实测 2020），来源是**真机实测出来的新事实**：
       // 队员第一步的工具清单还挂着继承档，三个队员全部先直接调 list_agents 拿 unknown tool、
       // 第二步才靠 run_code 自纠 —— 卡片此前连 run_code 都没提过。见 selftest 同处注记。
-      if (ownLead > 5310) return `Lead 侧自有段落 ${ownLead} 字符 > 5310`;
+      // 2026-11-19 5310→5510：与 selftest 预算表 / INTERFACES §2.1 同步。
+      // 唯一来源是 PLAYBOOK 新增的「长跑 ≠ 卡死」两条判据（真机 session-9677126a：
+      // 一个跑了 1266 秒、96 次工具调用、死前还在取证的队员被当成「长时间无产出」中断）。
+      if (ownLead > 5510) return `Lead 侧自有段落 ${ownLead} 字符 > 5510`;
       if (ownMate > 2050) return `队员侧自有段落 ${ownMate} 字符 > 2050`;
       if (leadPrompt.length < ownLead) return '渲染结果比源文本还短（PLAYBOOK/策略段没注册上？）';
       // 注意：队员的**角色简报不在系统提示词里**（它是第一条 user 消息），所以这里只对队员卡。
@@ -3478,6 +3481,65 @@ async function main() {
     memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'running']]);
     waitCalls.length = 0;
     const active = await waitTool.execute({ timeout_ms: 15000 }, { agent: scoutAgent, signal: signalOf() });
+    // ── 「仍在活动」必须真的接到 wait_agent 上（2026-11-19 session-9677126a）──────────────
+    // 真机：Lead 连续 8 次 wait_agent 只拿到 {timedOut:true}，把「跑得久」读成「卡住了」，
+    // interrupt 掉一个正在干活（1266 秒 / 96 次工具调用）的队员。
+    // 这条验的是**接线**（runtime.memberIdleMs → stillWorkingNote → diagnostics），不是文案。
+    {
+      const savedIdle = boardRuntime.memberIdleMs;
+      boardRuntime.memberIdleMs = (id) => (id === 'builder-agent' ? 7 * 60 * 1000 : 30 * 1000);
+      memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'running']]);
+      waitCalls.length = 0;
+      const activeWait = await waitTool.execute({ timeout_ms: 15000 }, { agent: leadAgent, signal: signalOf() });
+      boardRuntime.memberIdleMs = savedIdle;
+      check('wait_agent：超时回执必须带上「仍在活动」（否则 Lead 只能把长跑当卡死）', () => {
+        const notes = Array.isArray(activeWait.diagnostics) ? activeWait.diagnostics : [];
+        const working = notes.filter((item) => typeof item === 'string' && item.startsWith(roster.STILL_WORKING_PREFIX));
+        if (working.length !== 1) {
+          return '超时回执里没有「仍在活动」这条（或重复了）：' + JSON.stringify(activeWait);
+        }
+        if (!working[0].includes('7 分钟')) return '时间差没传到提示里：' + working[0];
+        return true;
+      });
+      // 反向：没有 memberIdleMs（旧宿主/未接线）时不许崩，也不许编一条假的。
+      const saved2 = boardRuntime.memberIdleMs;
+      delete boardRuntime.memberIdleMs;
+      waitCalls.length = 0;
+      const noApiWait = await waitTool.execute({ timeout_ms: 15000 }, { agent: leadAgent, signal: signalOf() });
+      boardRuntime.memberIdleMs = saved2;
+      check('wait_agent：拿不到进度账本时不许崩、也不许编时间', () => {
+        if (noApiWait.timedOut !== true) return JSON.stringify(noApiWait);
+        const notes = Array.isArray(noApiWait.diagnostics) ? noApiWait.diagnostics : [];
+        if (notes.some((item) => typeof item === 'string' && item.includes('NaN'))) return '编出了 NaN 时间：' + JSON.stringify(notes);
+        return true;
+      });
+    }
+    // ── list_agents 也要给「仍在活动」（2026-11-19 session-9677126a）────────────────────
+    // Lead 决定中断前往往先看名单。名单上只有 status:"running" 时，「跑了很久」是唯一
+    // 可见的信号 —— 真机就是这么把在干活的队员读成卡住并 interrupt 的。
+    {
+      const listTool = boardDefinitions.get('list_agents');
+      const savedIdle = boardRuntime.memberIdleMs;
+      boardRuntime.memberIdleMs = (id) => (id === 'builder-agent' ? 12 * 60 * 1000 : 5 * 1000);
+      memberStatus = new Map([['lead-agent', 'running'], ['scout-agent', 'inactive'], ['builder-agent', 'running']]);
+      const listRows = await listTool.execute({}, { agent: leadAgent, signal: signalOf() });
+      boardRuntime.memberIdleMs = savedIdle;
+      check('list_agents：Lead 行必须带「仍在活动」（中断前看名单时也要能分清在干活）', () => {
+        const leadRow = listRows.find((row) => row.role === 'lead');
+        if (leadRow === undefined) return '没有 lead 行';
+        const notes = Array.isArray(leadRow.diagnostics) ? leadRow.diagnostics : [];
+        const working = notes.filter((item) => typeof item === 'string' && item.startsWith(roster.STILL_WORKING_PREFIX));
+        if (working.length !== 1) return 'lead 行没有「仍在活动」：' + JSON.stringify(leadRow.diagnostics);
+        if (!working[0].includes('12 分钟')) return '时间差没传进去：' + working[0];
+        // 只挂 Lead 行：队员看别人跑多久没有用处，纯粹污染它的上下文。
+        const memberRow = listRows.find((row) => row.role === 'teammate');
+        const memberNotes = Array.isArray(memberRow?.diagnostics) ? memberRow.diagnostics : [];
+        if (memberNotes.some((item) => typeof item === 'string' && item.startsWith(roster.STILL_WORKING_PREFIX))) {
+          return '这条提示灌进了队员行（应该只在 Lead 行）';
+        }
+        return true;
+      });
+    }
     check('wait_agent：有 running 对端时正常转给 waitForChange，并把 timeout_ms 原样传下去', () => {
       if (waitCalls.length !== 1) return 'waitForChange 调用 ' + waitCalls.length + ' 次';
       if (waitCalls[0].timeoutMs !== 15000) return JSON.stringify(waitCalls[0]);

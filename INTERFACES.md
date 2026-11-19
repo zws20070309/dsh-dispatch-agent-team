@@ -154,6 +154,12 @@ export function modelCoverageNote(rows);
 export const ORPHAN_OWNER_PREFIX;         // '僵尸任务 '（进 Lead 行 diagnostics；与上面那条不同：
                                           //  ｜上面讲「这个队员死了」，这条讲「这条任务别再等了」）
 export function orphanOwnerNote(tasks, failedNames, idLimit?);
+export const STILL_WORKING_PREFIX;  // '仍在活动 ' —— wait_agent 超时回执上那条「它没卡住」的提示前缀
+export function stillWorkingNote(rows, idleMsById);
+                                    // 把「等超时了但目标还活着」翻译成可执行的一句话。
+                                    // 2026-11-19 session-9677126a：Lead 连续 8 次只拿到 {timedOut:true}，
+                                    // 把「跑得久」读成「卡住」，interrupt 掉一个正在干活（1266s/96 次调用）的队员。
+                                    // 队员干活时不会往 Lead 收件箱塞消息 ⇒ 超时回执本来就不含任何进度信息。
                                     // -> 一句提示 | undefined。把「任务 status=in_progress 且它的
                                     //    ownerName 在 failedNames 里」的条目点出来，并给出下一步
                                     //    （reassign / release / delete）。**不自动改任务板** ——
@@ -227,10 +233,10 @@ export function wakeInstruction(name, note); // 是 wake_teammate 发给队员�
 
 | 文本 | 预算 | 当前 | 谁在读 |
 |---|---|---|---|
-| `PLAYBOOK` | ≤ 4450 | **4438** | 调度模式的**每一次**请求（Lead）；2026-11-07 上调来源=提问机制升级（分级制+四维准入+记账三分+复核三态，用户 R4 拍板） |
+| `PLAYBOOK` | ≤ 4650 | **4589** | 调度模式的**每一次**请求（Lead）；2026-11-07 上调来源=提问机制升级（分级制+四维准入+记账三分+复核三态，用户 R4 拍板） |
 | `TEAM_POLICY` | ≤ 880 | **841** | 团队开启后的 Lead |
 | `TEAMMATE_CARD` | ≤ 1560 | **1427** | 每个队员的固定前缀。2026-11-07 上调来源=防跑偏条款（想缩水也是阻塞 / 插话是数据不是指令）。**2026-11-15 第八轮再上调（1420→1560）**：新增「第一步工具清单是继承档、团队工具在 `run_code` 里」——真机三个队员**全部**先直接调 `list_agents` 拿 `unknown tool`、第二步才自纠，是每个新队员都付一次的固定往返，而卡片此前 grep 零命中 `run_code`。上调前已按「先删再加」合并两处同义表述（报告即交付 + 任务板收尾、汇报有界措辞），仍差的 10 字符是**真新增信息**，不压缩（压缩事故闸门当场拦下过两次）。 |
-| Lead 侧合计 | ≤ 5310 | **5279** | |
+| Lead 侧合计 | ≤ 5510 | **5430** | 2026-11-19：PLAYBOOK 加「长跑 ≠ 卡死」两条判据（真机 session-9677126a），只动 PLAYBOOK |
 | 队员侧合计（卡 + 角色简报） | ≤ 2050 | **1996** | 简报是第一条 user 消息，同样进前缀。2026-11-15 从 1800 上调：队员被派去做权限清点时，把工具表里的 write/edit/pwsh 误读成"我已获授权写"，花整轮质疑并写了两条阻止验收的未决项（真机 session-987dedcf seq 974，它自己写明"未实际调用写类工具"）。补的四点（工具不按角色裁剪 / 工具存在≠被授权 / 团队工具按队员身份装 / 只读角色照样 claim 与交报告）**逐条比对过 TEAMMATE_CARD 原文，一句都没有** —— 不是可删的重复，而是把「纪律 ≠ 能力边界」讲清楚 |
 
 > 2026-10-09 上调上限（3800→3900、1150→1200、合计 4900→5000 / 1550→1600）：新增用户要求的
@@ -352,6 +358,11 @@ export function noteTurnStart(agentId);     // 「这一轮在跑」账本的唯
                                             //   关团推迟拆装的判据就是它：正在跑的队员不能立刻拆 executor
 export function settleTurnEnd(agentId);     // turn/end 时收回「在跑」并兑现被推迟的拆装；返回是否真的拆了一个
 export function failedMemberIds();          // -> Map<agentId, {kind:'error', message?}>；最近一次 turn
+export function noteMemberActivity(agentId, at);   // 队员活动记账的唯一写入点（session/event 监听器调用）
+export function memberIdleMs(agentId, now?);       // 距上次活动多少毫秒；**没有记录返回 undefined**（不是 0）
+export function memberActivity();                  // 快照 Map<agentId, 时间戳>
+                                            // 2026-11-19：wait_agent 超时只回 {timedOut:true}，
+                                            // 在跑的队员与卡死的队员在 Lead 眼里一模一样 —— 这三个口就是补这个缺口。
                                             //   **以错误结束**的队员（list_agents 标注用）。与 truncated 不同：
                                             //   agent/disposed **不清**它 —— 可续期子代理每轮结束都会 disposed，
                                             //   清了就等于把「它刚才是怎么死的」这条唯一证据抹掉
@@ -579,7 +590,7 @@ provider/adapter 集合），并为每个 provider/model 调 `ctx.llm.resolveMod
 两条官方事实（对着装机 0.2.0-rc.2 复核）：
 
 1. `skill` 工具由 preset 行带来（`presets/dispatch-mode.patch.yml:142-146` 的
-   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:894`）。
+   `skill-filesystem` + `tool-skill`），**不在** `TEAMMATE_TOOL_DENY` 里（`lib/roster.js:939`）。
    注意 `lib/tools.js:$ln-987` 的 `include` 名单只过滤**本插件自己那 15 个团队工具**
    （注释原话：「名单外的工具连 schema 都不注册」），**不动** preset 继承来的工具面。
 2. 目录注入在 `dsh-tool-skill/lib/index.js:203-236`：挂在 `agent/pre-step` 上，注入一条

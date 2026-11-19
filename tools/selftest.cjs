@@ -881,6 +881,96 @@ function functionBodyOf(source, needle) {
     assert.ok(sentence.length < 260, '这句话不该超过 260 字符（它是一句提醒，不是教程）：' + sentence.length);
   });
 
+  await check('进度提示必须用**投影前**的成员行取 id（modelMember 会丢掉 id）', () => {
+    // 真机踩坑（2026-11-19 本轮）：先把 rows2（projectMember 之后）传给 stillWorkingNote，
+    // 而 modelMember 的投影**不保留 id**（只留 target/role/status/diagnostics + 几个可选字段），
+    // 于是 row.id 永远是 undefined，idle 表查不到任何人 → 提示退化成
+    // 「N 名队员在跑（还没有活动记录）」。集成测试抓到后才改成传 rows。
+    const tools = readFileSync(path.join(PLUGIN_DIR, 'lib', 'tools.js'), 'utf8');
+    // 投影确实会丢 id —— 这是上面那条结论的**前提**，官方改口的话这条要重评。
+    const mm = /function modelMember\(member\) \{([\s\S]*?)\n\}/u.exec(tools);
+    assert.ok(mm !== null, '找不到 modelMember');
+    assert.ok(!/id:\s/.test(mm[1]), 'modelMember 现在会保留 id 了 —— 上面那条注释要更新');
+    // 因此调用点必须传 rows 而不是 rows2。
+    const call = /attachToLead\(stillWorkingNote\((\w+), idleById\)/u.exec(tools);
+    assert.ok(call !== null, '找不到 stillWorkingNote 的调用点');
+    assert.equal(call[1], 'rows', '必须传投影前的 rows（rows2 没有 id，查不到进度）：传的是 ' + call[1]);
+  });
+  await check('活动记账必须排在所有提前 return 之前（否则整轮只推理的队员永远显示没活动）', () => {
+    // 这条钉的是**接线位置**，不是文案。session/event 监听器里 llm/retry / turn/start /
+    // turn/end 三条分支都会提前 return；把 noteMemberActivity 放在它们任何一个之后，
+    // 「一整轮只在推理、没有工具调用」的队员就永远不会被记为活动 —— 而那种队员恰恰
+    // 是最容易被误判成「卡住」的（2026-11-19 session-9677126a 的 frontier-auditor 就是这样）。
+    const runtime = readFileSync(path.join(PLUGIN_DIR, 'lib', 'runtime.js'), 'utf8');
+    const start = runtime.indexOf("target.on('session/event'");
+    assert.ok(start >= 0, '找不到 session/event 监听器');
+    const block = runtime.slice(start, runtime.indexOf('state.watch = disposers', start));
+    const activityAt = block.indexOf('noteMemberActivity(agentId, event.time)');
+    assert.ok(activityAt >= 0, 'session/event 监听器里没有调用 noteMemberActivity —— 进度账本永远是空的');
+    for (const marker of ["if (event.type === 'llm/retry')", "if (event.type === 'turn/start')", "if (event.type === 'turn/end')"]) {
+      const at = block.indexOf(marker);
+      assert.ok(at >= 0, '找不到分支：' + marker);
+      assert.ok(activityAt < at, 'noteMemberActivity 排在了 ' + marker + ' 之后 —— 那条分支会提前 return，活动就漏记了');
+    }
+  });
+  await check('进度账本：只前进不后退、未知≠刚动过、快照是副本（2026-11-19 session-9677126a）', async () => {
+    // 这是 wait_agent 那句「仍在活动 N 分钟前」的唯一数据源。它算错 = Lead 又会被误导。
+    const rt = await load('runtime.js');
+    const id = 'selftest-progress-member';
+    // ① 「没有记录」必须返回 undefined，不能返回 0 —— 0 会被渲染成「刚动过」，
+    //    而真实情况是「不知道」，那比没有更糟（会让 Lead 以为它在高速产出）。
+    assert.equal(rt.memberIdleMs(id, 5000), undefined, '没有活动记录时必须返回 undefined（不是 0）');
+    // ② 正常推进
+    rt.noteMemberActivity(id, 1000);
+    assert.equal(rt.memberIdleMs(id, 4000), 3000);
+    // ③ 只前进不后退：并发/恢复的会话可能乱序到达，旧时间戳不许把「刚动过」覆盖成「很久没动」
+    rt.noteMemberActivity(id, 3000);
+    assert.equal(rt.memberIdleMs(id, 4000), 1000);
+    rt.noteMemberActivity(id, 2000);
+    assert.equal(rt.memberIdleMs(id, 4000), 1000, '乱序的旧时间戳把账本推回去了');
+    // ④ 坏时间戳不许丢掉整条记录（否则那个队员又变成「不知道」）
+    const id2 = 'selftest-progress-nan';
+    rt.noteMemberActivity(id2, NaN);
+    assert.notEqual(rt.memberIdleMs(id2), undefined, 'NaN 时间戳把整条记录丢了（应退回当前时间）');
+    // ⑤ 空 id 不许记账（会把无主事件堆进同一格）
+    rt.noteMemberActivity('', 1);
+    assert.equal(rt.memberActivity().has(''), false, '空 agent id 被记进了账本');
+    // ⑥ 快照必须是副本（调用方改它不能改坏内部账本）
+    const snap = rt.memberActivity();
+    snap.set('polluted', 1);
+    assert.equal(rt.memberActivity().has('polluted'), false, 'memberActivity() 返回的是内部 Map 本身');
+  });
+  await check('「仍在活动」提示：长跑不等于卡死（2026-11-19 session-9677126a）', () => {
+    // 真机：Lead 连续 8 次 wait_agent 只拿到 {timedOut:true}，把「跑得久」读成「卡住了」，
+    // interrupt 掉一个正在干活（1266 秒 / 96 次工具调用、死前还在取证）的队员。
+    // 用户原话：「为什么要中断那个智能体？？？你不要乱搞啊！！！」
+    // 根因是信息缺失：队员干活时不会往 Lead 收件箱塞消息，超时回执本来就不含进度。
+    const rows = [
+      { id: 'a', name: 'frontier-auditor-x', role: 'teammate', status: 'running' },
+      { id: 'b', name: 'scout-y', role: 'teammate', status: 'running' },
+      { id: 'c', name: 'builder-z', role: 'teammate', status: 'inactive' },
+      { id: 'lead', name: 'lead', role: 'lead', status: 'running' },
+    ];
+    const idle = new Map([['a', 42 * 1000], ['b', 5 * 60 * 1000], ['c', 60 * 60 * 1000]]);
+    const note = roster.stillWorkingNote(rows, idle);
+    assert.equal(typeof note, 'string', '有 running 队员时必须给出提示');
+    assert.ok(note.startsWith(roster.STILL_WORKING_PREFIX), '前缀必须是固定那句，前端/日志靠它识别：' + note.slice(0, 40));
+    // 秒/分钟两种量纲都要出现（42 秒、5 分钟），证明时间差真的被翻译了而不是写死。
+    assert.ok(note.includes('42 秒'), '短时间差没渲染成秒：' + note);
+    assert.ok(note.includes('5 分钟'), '长时间差没渲染成分钟：' + note);
+    // 只报在跑的：inactive 的 builder 不该出现（否则 Lead 会去等一个已经停了的人）。
+    assert.ok(!note.includes('builder-z'), 'inactive 的队员不该出现在「仍在活动」里：' + note);
+    // Lead 自己也不该出现（它是提问者）。
+    assert.ok(!/lead\b/u.test(note.replace('frontier-auditor-x', '')), 'Lead 自己不该被列进来：' + note);
+    // 关键语义：这句话必须明确否掉「卡住」这个误读，并给出可执行动作。
+    assert.ok(note.includes('没有卡住') || note.includes('不等于卡死'), '没有点明「没卡住」——那就等于没说：' + note);
+    assert.ok(note.includes('interrupt_agent'), '没有提醒中断的代价/时机，模型仍会随手中断：' + note);
+    // 没有 running 队员时**不许**编一条出来。
+    assert.equal(roster.stillWorkingNote([{ id: 'c', name: 'builder-z', role: 'teammate', status: 'inactive' }], idle), undefined, '没人跑的时候不该有这条提示');
+    // 「不知道」与「刚动过」必须分开：没有活动记录的队员不能被渲染成 0 秒前。
+    const unknownNote = roster.stillWorkingNote([{ id: 'n', name: 'no-record', role: 'teammate', status: 'running' }], new Map());
+    assert.ok(unknownNote !== undefined && unknownNote.includes('还没有活动记录'), '缺记录时要如实说不知道，不能编一个时间：' + String(unknownNote));
+  });
   await check('僵尸任务提示必须同时出现在 wait_agent（不是只有 list_agents）——第八轮收尾建议', () => {
     // 验收方第八轮的原话：「可以在 wait_agent 的 diagnostics 里把『已 claim 未交』拆成两类 ——
     // 『owner 还活着』vs『owner 已 failed』。现在它只报『已 claim 未交 N 条』，
@@ -1465,7 +1555,8 @@ function functionBodyOf(source, needle) {
       // 合并后仍超 10 字符，因为**新信息是真的**、且合并已到极限（没有被删掉的是信息不是冗余：
       // 「它对你不可用」与 team_task_update 这两个名字都被压缩事故闸门当场拦下过，已补回）。
       // 所以抬上限，而不是继续压缩。
-      PLAYBOOK: 4450,        // 调度模式方法论（Lead 与所有请求的前缀）
+      PLAYBOOK: 4650,        // 调度模式方法论（Lead 与所有请求的前缀）。2026-11-19 4450→4650：
+                       // 新增「长跑 ≠ 卡死」两条判据（来源是真机 session-9677126a：一个跑了 1266 秒、
       TEAM_POLICY: 880,      // 团队运行期事实（开后才有）
       TEAMMATE_CARD: 1560,   // 队员卡（每个队员的固定前缀）；留余量，避免再次为「贴边」删信息
     };
@@ -1482,7 +1573,9 @@ function functionBodyOf(source, needle) {
     );
     const lead = actual.PLAYBOOK + actual.TEAM_POLICY;
     const mate = actual.TEAMMATE_CARD + playbook.teammateBrief('scout', 'scout').length;
-    assert.ok(lead <= 5310, `Lead 侧提示词 ${lead} > 5310 字符`);
+    // 2026-11-19 5310→5510：PLAYBOOK 加了「长跑 ≠ 卡死」两条判据（真机 session-9677126a），
+  // 只动 PLAYBOOK，Lead 合计跟着 +200；其余分项一个字节都没变。
+  assert.ok(lead <= 5510, `Lead 侧提示词 ${lead} > 5510 字符`);
     // ── 2026-11-15：上限从 1800 抬到 1960（+160）───────────────────────────
     // 理由（真机 session-987dedcf 第五轮 seq 974）：队员被派去做「权限清点」时，
     // 把工具表里的 write/edit/pwsh 当成了「我被授予了写权限」，花整轮时间质疑、
